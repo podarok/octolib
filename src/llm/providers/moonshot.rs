@@ -363,8 +363,12 @@ fn k3_reasoning_effort(model: &str, effort: Option<ReasoningEffort>) -> Option<&
         return None;
     }
     match effort {
-        Some(ReasoningEffort::Low) | Some(ReasoningEffort::Medium) => Some("low"),
-        Some(ReasoningEffort::High) | Some(ReasoningEffort::XHigh) => Some("high"),
+        Some(ReasoningEffort::Off) | Some(ReasoningEffort::Low) | Some(ReasoningEffort::Medium) => {
+            Some("low")
+        }
+        Some(ReasoningEffort::On) | Some(ReasoningEffort::High) | Some(ReasoningEffort::XHigh) => {
+            Some("high")
+        }
         Some(ReasoningEffort::Max) => Some("max"),
         None => None,
     }

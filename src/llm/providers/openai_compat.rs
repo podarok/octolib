@@ -42,6 +42,25 @@ fn reasoning_effort_value(
     effort: crate::llm::types::ReasoningEffort,
 ) -> &'static str {
     match effort {
+        // LM Studio's REST layer validates `reasoning_effort` against a fixed
+        // set — "none, minimal, low, medium, high, xhigh" (confirmed via a
+        // 400 `invalid_value` response; anything outside that set, including
+        // a literal "off", is rejected outright). "none" actually disables
+        // thinking (verified: `reasoning_tokens: 0`, immediate content) —
+        // graded values like "low"/"medium" pass validation but some
+        // checkpoints (observed on a Qwen3-VL-derived 27B model) warn and
+        // silently coerce any of them to their own "on" state instead of
+        // scaling depth. So for `local`, `Off` must map to "none" specifically
+        // (not "off") and `On` to a value guaranteed to mean "reasoning on"
+        // ("high") rather than one that risks being ignored.
+        crate::llm::types::ReasoningEffort::Off if provider_name.eq_ignore_ascii_case("local") => {
+            "none"
+        }
+        crate::llm::types::ReasoningEffort::On if provider_name.eq_ignore_ascii_case("local") => {
+            "high"
+        }
+        crate::llm::types::ReasoningEffort::Off => "low",
+        crate::llm::types::ReasoningEffort::On => "high",
         crate::llm::types::ReasoningEffort::Low => "low",
         crate::llm::types::ReasoningEffort::Medium => "medium",
         crate::llm::types::ReasoningEffort::High => "high",

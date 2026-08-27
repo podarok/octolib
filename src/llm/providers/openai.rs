@@ -624,8 +624,10 @@ impl AiProvider for OpenAiProvider {
             || params.model.starts_with("gpt-5")
         {
             let effort = match params.reasoning_effort {
+                Some(ReasoningEffort::Off) => "low",
                 Some(ReasoningEffort::Low) => "low",
                 Some(ReasoningEffort::Medium) => "medium",
+                Some(ReasoningEffort::On) => "high",
                 Some(ReasoningEffort::High) => "high",
                 Some(ReasoningEffort::XHigh) => "xhigh",
                 Some(ReasoningEffort::Max) if params.model.starts_with("gpt-5.6") => "max",

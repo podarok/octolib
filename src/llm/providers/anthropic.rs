@@ -228,8 +228,15 @@ fn calculate_anthropic_cost(
 fn effort_value(model: &str, effort: ReasoningEffort, supports_adaptive: bool) -> &'static str {
     let supports_xhigh = model.contains("opus-5") || model.contains("opus-4-7");
     match effort {
+        // Anthropic thinking has no literal "off" budget tier at this call
+        // site (disabling thinking entirely is a caller-side decision made
+        // before reaching here) — map the binary on/off knob (meaningful for
+        // `local`-provider servers with only a binary toggle) onto the
+        // nearest graded equivalent so Anthropic keeps its existing behavior.
+        ReasoningEffort::Off => "low",
         ReasoningEffort::Low => "low",
         ReasoningEffort::Medium => "medium",
+        ReasoningEffort::On => "high",
         ReasoningEffort::High => "high",
         ReasoningEffort::XHigh if supports_xhigh => "xhigh",
         ReasoningEffort::Max if supports_adaptive => "max",
@@ -532,9 +539,10 @@ impl AiProvider for AnthropicProvider {
                 } else {
                     // Manual: budget_tokens must be < max_tokens. Clamp if needed.
                     let mut budget: u32 = match effort {
+                        ReasoningEffort::Off => 1_024,
                         ReasoningEffort::Low => 2_048,
                         ReasoningEffort::Medium => 8_192,
-                        ReasoningEffort::High => 16_384,
+                        ReasoningEffort::On | ReasoningEffort::High => 16_384,
                         ReasoningEffort::XHigh => 32_768,
                         ReasoningEffort::Max => 65_536,
                     };

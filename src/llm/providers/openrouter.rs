@@ -252,8 +252,10 @@ impl AiProvider for OpenRouterProvider {
         // Pass-through reasoning_effort (OpenRouter forwards it to the underlying provider).
         if let Some(effort) = params.reasoning_effort {
             let s = match effort {
+                crate::llm::types::ReasoningEffort::Off => "off",
                 crate::llm::types::ReasoningEffort::Low => "low",
                 crate::llm::types::ReasoningEffort::Medium => "medium",
+                crate::llm::types::ReasoningEffort::On => "on",
                 crate::llm::types::ReasoningEffort::High => "high",
                 crate::llm::types::ReasoningEffort::XHigh => "high",
                 crate::llm::types::ReasoningEffort::Max => "high",

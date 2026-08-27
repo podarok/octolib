@@ -915,11 +915,20 @@ pub struct EffectiveSamplingParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    /// Explicit "reasoning disabled" — distinct from `Low`. Some local
+    /// OpenAI-compat servers (observed on LM Studio serving a Qwen3-VL-derived
+    /// checkpoint) expose only a binary on/off reasoning knob and warn +
+    /// silently fall back to "on" for any other value ("low"/"medium"/"high"
+    /// included), so a graded `Low` cannot reliably turn reasoning off there.
+    Off,
     Low,
     Medium,
     High,
     XHigh,
     Max,
+    /// Explicit "reasoning enabled, provider picks depth" — the on/off
+    /// counterpart to `Off` for providers with only a binary knob.
+    On,
 }
 
 #[derive(Clone)]

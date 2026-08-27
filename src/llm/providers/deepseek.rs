@@ -104,8 +104,12 @@ fn map_reasoning_effort(
 ) -> Option<&'static str> {
     use crate::llm::types::ReasoningEffort;
     match effort {
-        Some(ReasoningEffort::Low) | Some(ReasoningEffort::Medium) => Some("low"),
-        Some(ReasoningEffort::High) | Some(ReasoningEffort::XHigh) => Some("high"),
+        Some(ReasoningEffort::Off) | Some(ReasoningEffort::Low) | Some(ReasoningEffort::Medium) => {
+            Some("low")
+        }
+        Some(ReasoningEffort::On) | Some(ReasoningEffort::High) | Some(ReasoningEffort::XHigh) => {
+            Some("high")
+        }
         Some(ReasoningEffort::Max) => Some("max"),
         None => None,
     }
