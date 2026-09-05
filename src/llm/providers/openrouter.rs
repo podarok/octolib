@@ -206,6 +206,10 @@ impl AiProvider for OpenRouterProvider {
 
     async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
         let api_key = self.get_api_key()?;
+        let requested_schema = params
+            .response_format
+            .as_ref()
+            .and_then(|format| format.schema.clone());
 
         // Convert messages to OpenRouter format (same as OpenAI)
         let messages = convert_messages(&params.messages)?;
@@ -346,7 +350,11 @@ impl AiProvider for OpenRouterProvider {
         )
         .await?;
 
-        Ok(response)
+        if let Some(schema) = requested_schema {
+            crate::llm::schema_enforcement::validate_response(response, &schema, "openrouter")
+        } else {
+            Ok(response)
+        }
     }
 }
 
@@ -629,7 +637,7 @@ async fn execute_openrouter_request(
             let openrouter_app_title =
                 std::env::var("OPENROUTER_APP_TITLE").unwrap_or_else(|_| "octolib".to_string());
             let openrouter_http_referer = std::env::var("OPENROUTER_HTTP_REFERER")
-                .unwrap_or_else(|_| "https://octolib.muvon.io".to_string());
+                .unwrap_or_else(|_| "https://octomind.run/product/octolib".to_string());
 
             Box::pin(async move {
                 let req = client
@@ -831,91 +839,5 @@ async fn execute_openrouter_request(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_supports_model() {
-        let provider = OpenRouterProvider::new();
-
-        // OpenRouter supports many models
-        assert!(provider.supports_model("anthropic/claude-3.5-sonnet"));
-        assert!(provider.supports_model("openai/gpt-4o"));
-        assert!(provider.supports_model("meta/llama-3.1-70b"));
-        assert!(provider.supports_model("deepseek-chat"));
-
-        // Should accept any non-empty model string as fallback
-        assert!(provider.supports_model("any-model-name"));
-    }
-
-    #[test]
-    fn test_supports_model_case_insensitive() {
-        let provider = OpenRouterProvider::new();
-
-        // Test uppercase
-        assert!(provider.supports_model("ANTHROPIC/CLAUDE-3.5-SONNET"));
-        assert!(provider.supports_model("OPENAI/GPT-4O"));
-        assert!(provider.supports_model("META/LLAMA-3.1-70B"));
-        // Test mixed case
-        assert!(provider.supports_model("Anthropic/Claude-3.5-Sonnet"));
-        assert!(provider.supports_model("DEEPSEEK-CHAT"));
-    }
-
-    #[test]
-    fn test_supports_vision_case_insensitive() {
-        let provider = OpenRouterProvider::new();
-
-        // Test lowercase
-        assert!(provider.supports_vision("gpt-4o"));
-        assert!(provider.supports_vision("claude-3-haiku"));
-
-        // Test uppercase
-        assert!(provider.supports_vision("GPT-4O"));
-        assert!(provider.supports_vision("CLAUDE-3-HAIKU"));
-        // Test mixed case
-        assert!(provider.supports_vision("Gemini-1.5-Pro"));
-    }
-
-    #[test]
-    fn test_supports_caching_case_insensitive() {
-        let provider = OpenRouterProvider::new();
-
-        // Test lowercase
-        assert!(provider.supports_caching("anthropic/claude-3.5-sonnet"));
-        assert!(provider.supports_caching("claude-3-haiku"));
-
-        // Test uppercase
-        assert!(provider.supports_caching("ANTHROPIC/CLAUDE-3.5-SONNET"));
-        assert!(provider.supports_caching("CLAUDE-3-HAIKU"));
-    }
-
-    #[test]
-    fn test_anthropic_fast_route_doubles_pricing() {
-        let provider = OpenRouterProvider::new();
-        let base = provider
-            .get_model_pricing("anthropic/claude-opus-5")
-            .unwrap();
-        let fast = provider
-            .get_model_pricing("anthropic/claude-opus-5-fast")
-            .unwrap();
-        assert_eq!(fast.input_price_per_1m, base.input_price_per_1m * 2.0);
-        assert_eq!(fast.output_price_per_1m, base.output_price_per_1m * 2.0);
-        assert_eq!(
-            fast.cache_write_price_per_1m,
-            base.cache_write_price_per_1m * 2.0
-        );
-        assert_eq!(
-            fast.cache_read_price_per_1m,
-            base.cache_read_price_per_1m * 2.0
-        );
-    }
-
-    #[test]
-    fn test_schema_enforcement_proxy_policy() {
-        let provider = OpenRouterProvider::new();
-        assert!(provider.enforces_response_schema("deepseek-v4-pro"));
-        assert!(provider.enforces_response_schema("openai/gpt-4o"));
-        assert!(provider.enforces_response_schema("unknown/provider-model"));
-        assert!(!provider.enforces_response_schema("mistral-7b"));
-    }
-}
+#[path = "openrouter_tests.rs"]
+mod tests;

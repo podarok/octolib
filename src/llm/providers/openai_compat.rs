@@ -15,9 +15,10 @@
 use super::shared;
 use crate::errors::ProviderError;
 use crate::llm::retry;
+use crate::llm::traits::AiProvider;
 use crate::llm::types::{
     ChatCompletionParams, Message, ProviderExchange, ProviderResponse, SamplingSupport,
-    ThinkingBlock, TokenUsage, ToolCall,
+    ThinkingBlock, TokenUsage, ToolCall, ToolChoice,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,8 @@ pub(crate) struct OpenAiCompatConfig {
     pub provider_name: &'static str,
     pub usage_fallback_cost: Option<f64>,
     pub use_response_cost: bool,
+    pub enforces_response_schema: bool,
+    pub supports_required_tool_choice: bool,
 }
 
 pub(crate) fn get_optional_api_key(env_name: &str) -> String {
@@ -42,10 +45,30 @@ fn reasoning_effort_value(
     model: &str,
     effort: crate::llm::types::ReasoningEffort,
 ) -> &'static str {
+    if is_alibaba_deepseek_v4(provider_name, model) {
+        use crate::llm::types::ReasoningEffort;
+
+        // Model Studio accepts the OpenAI-standard five values for DeepSeek V4
+        // and owns the model-specific collapse between them. Preserve the
+        // caller's level verbatim instead of applying the generic high ceiling.
+        return match effort {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::XHigh => "xhigh",
+            ReasoningEffort::Max => "max",
+        };
+    }
+
     match effort {
         crate::llm::types::ReasoningEffort::Low => "low",
         crate::llm::types::ReasoningEffort::Medium => "medium",
         crate::llm::types::ReasoningEffort::High => "high",
+        // Meta Model API accepts "xhigh" as its ceiling ("none" is a 400):
+        // map XHigh through instead of the generic downgrade.
+        crate::llm::types::ReasoningEffort::XHigh if provider_name.eq_ignore_ascii_case("meta") => {
+            "xhigh"
+        }
         crate::llm::types::ReasoningEffort::XHigh => "high",
         crate::llm::types::ReasoningEffort::Max if provider_name.eq_ignore_ascii_case("ollama") => {
             "max"
@@ -59,7 +82,28 @@ fn reasoning_effort_value(
         {
             "max"
         }
+        // Meta has no level above xhigh; collapse Max onto that ceiling.
+        crate::llm::types::ReasoningEffort::Max if provider_name.eq_ignore_ascii_case("meta") => {
+            "xhigh"
+        }
         crate::llm::types::ReasoningEffort::Max => "high",
+    }
+}
+
+fn is_alibaba_deepseek_v4(provider_name: &str, model: &str) -> bool {
+    provider_name.eq_ignore_ascii_case("alibaba")
+        && crate::llm::utils::contains_ignore_ascii_case(model, "deepseek-v4")
+}
+
+pub(crate) fn openai_tool_choice_value(choice: Option<&ToolChoice>) -> serde_json::Value {
+    match choice {
+        Some(ToolChoice::Required) => serde_json::json!("required"),
+        Some(ToolChoice::None) => serde_json::json!("none"),
+        Some(ToolChoice::Function(name)) => serde_json::json!({
+            "type": "function",
+            "function": {"name": name}
+        }),
+        Some(ToolChoice::Auto) | None => serde_json::json!("auto"),
     }
 }
 
@@ -80,6 +124,84 @@ pub(crate) async fn chat_completion_with_sampling(
     sampling: SamplingSupport,
     api_key: String,
     api_url: String,
+    params: ChatCompletionParams,
+) -> Result<ProviderResponse> {
+    crate::llm::schema_enforcement::chat_completion_enforced(
+        &OpenAiCompatTransport {
+            config,
+            sampling,
+            api_key,
+            api_url,
+        },
+        params,
+    )
+    .await
+}
+
+struct OpenAiCompatTransport {
+    config: OpenAiCompatConfig,
+    sampling: SamplingSupport,
+    api_key: String,
+    api_url: String,
+}
+
+#[async_trait::async_trait]
+impl AiProvider for OpenAiCompatTransport {
+    fn name(&self) -> &str {
+        self.config.provider_name
+    }
+
+    fn supports_model(&self, model: &str) -> bool {
+        !model.is_empty()
+    }
+
+    fn get_api_key(&self) -> Result<String> {
+        Ok(self.api_key.clone())
+    }
+
+    fn enforces_response_schema(&self, _model: &str) -> bool {
+        self.config.enforces_response_schema
+    }
+
+    fn supports_required_tool_choice(&self, _model: &str) -> bool {
+        self.config.supports_required_tool_choice
+    }
+
+    async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
+        chat_completion_raw(
+            self.config,
+            self.sampling,
+            self.api_key.clone(),
+            self.api_url.clone(),
+            None,
+            params,
+        )
+        .await
+    }
+
+    async fn chat_completion_with_tool_choice(
+        &self,
+        params: ChatCompletionParams,
+        tool_choice: ToolChoice,
+    ) -> Result<ProviderResponse> {
+        chat_completion_raw(
+            self.config,
+            self.sampling,
+            self.api_key.clone(),
+            self.api_url.clone(),
+            Some(tool_choice),
+            params,
+        )
+        .await
+    }
+}
+
+async fn chat_completion_raw(
+    config: OpenAiCompatConfig,
+    sampling: SamplingSupport,
+    api_key: String,
+    api_url: String,
+    tool_choice: Option<ToolChoice>,
     params: ChatCompletionParams,
 ) -> Result<ProviderResponse> {
     let messages = convert_messages(&params.messages, config.provider_name, &params.model);
@@ -115,6 +237,15 @@ pub(crate) async fn chat_completion_with_sampling(
         request_body["reasoning_effort"] = serde_json::json!(s);
     }
 
+    // DeepSeek V4 is a hybrid-thinking family. An explicit effort means the
+    // caller selected thinking, so preserve that intent on Model Studio rather
+    // than relying only on the moving alias' current default.
+    if params.reasoning_effort.is_some()
+        && is_alibaba_deepseek_v4(config.provider_name, &params.model)
+    {
+        request_body["enable_thinking"] = serde_json::json!(true);
+    }
+
     if let Some(tools) = &params.tools {
         if !tools.is_empty() {
             let mut sorted_tools = tools.clone();
@@ -135,7 +266,7 @@ pub(crate) async fn chat_completion_with_sampling(
                 .collect::<Vec<_>>();
 
             request_body["tools"] = serde_json::json!(openai_tools);
-            request_body["tool_choice"] = serde_json::json!("auto");
+            request_body["tool_choice"] = openai_tool_choice_value(tool_choice.as_ref());
             // Explicit: ensures proxied backends honor parallel function calling
             // rather than falling back to their own defaults (which may differ).
             request_body["parallel_tool_calls"] = serde_json::json!(true);
@@ -143,58 +274,98 @@ pub(crate) async fn chat_completion_with_sampling(
     }
 
     if let Some(response_format) = &params.response_format {
-        // Ollama and local servers use a top-level "format" key instead of "response_format".
-        // "format": "json" for json_object mode, "format": <schema> for structured output.
-        let is_ollama_like = config.provider_name.eq_ignore_ascii_case("ollama")
-            || config.provider_name.eq_ignore_ascii_case("local");
-
-        match &response_format.format {
-            crate::llm::types::OutputFormat::Json => {
-                if is_ollama_like {
-                    request_body["format"] = serde_json::json!("json");
-                } else {
-                    request_body["response_format"] = serde_json::json!({
-                        "type": "json_object"
-                    });
-                }
-            }
-            crate::llm::types::OutputFormat::JsonSchema => {
-                if is_ollama_like {
-                    // Ollama accepts the JSON schema directly as the "format" value
-                    if let Some(schema) = &response_format.schema {
-                        request_body["format"] = schema.clone();
-                    } else {
-                        // No schema provided — fall back to plain JSON mode
-                        request_body["format"] = serde_json::json!("json");
-                    }
-                } else if let Some(schema) = &response_format.schema {
-                    // Strict structured outputs need additionalProperties:false on
-                    // every nested object (no-op unless mode is Strict).
-                    let schema =
-                        crate::llm::utils::normalize_strict_schema(schema, response_format.mode);
-
-                    let mut format_obj = serde_json::json!({
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "response",
-                            "schema": schema
-                        }
-                    });
-
-                    if matches!(
-                        response_format.mode,
-                        crate::llm::types::ResponseMode::Strict
-                    ) {
-                        format_obj["json_schema"]["strict"] = serde_json::json!(true);
-                    }
-
-                    request_body["response_format"] = format_obj;
-                }
-            }
-        }
+        apply_response_format(
+            &mut request_body,
+            config.provider_name,
+            &params.model,
+            response_format,
+        );
     }
 
     execute_request(config, api_key, api_url, request_body, params).await
+}
+
+fn apply_response_format(
+    request_body: &mut serde_json::Value,
+    provider_name: &str,
+    model: &str,
+    response_format: &crate::llm::types::StructuredOutputRequest,
+) {
+    // Ollama and local servers use a top-level "format" key instead of
+    // "response_format": "json" for object mode, or the schema itself.
+    let is_ollama_like =
+        provider_name.eq_ignore_ascii_case("ollama") || provider_name.eq_ignore_ascii_case("local");
+
+    match &response_format.format {
+        crate::llm::types::OutputFormat::Json => {
+            if is_ollama_like {
+                request_body["format"] = serde_json::json!("json");
+            } else {
+                request_body["response_format"] = serde_json::json!({
+                    "type": "json_object"
+                });
+                // Model Studio rejects json_object requests unless the word
+                // "JSON" appears somewhere in the messages.
+                if provider_name.eq_ignore_ascii_case("alibaba") {
+                    if let Some(messages) = request_body["messages"].as_array_mut() {
+                        messages.push(serde_json::json!({
+                            "role": "system",
+                            "content": "Respond with a single JSON object."
+                        }));
+                    }
+                }
+            }
+        }
+        crate::llm::types::OutputFormat::JsonSchema => {
+            if is_ollama_like {
+                if let Some(schema) = &response_format.schema {
+                    request_body["format"] = schema.clone();
+                } else {
+                    request_body["format"] = serde_json::json!("json");
+                }
+            } else if is_alibaba_deepseek_v4(provider_name, model) {
+                // Model Studio exposes JSON Object, not JSON Schema, for
+                // DeepSeek V4. Keep the requested schema in prompt guidance;
+                // schema_enforcement validates it locally and falls back to the
+                // synthetic schema tool when guidance is ignored.
+                if let Some(schema) = &response_format.schema {
+                    request_body["response_format"] = serde_json::json!({
+                        "type": "json_object"
+                    });
+                    if let Some(messages) = request_body["messages"].as_array_mut() {
+                        messages.push(serde_json::json!({
+                            "role": "system",
+                            "content": format!(
+                                "When you produce the final answer, return one JSON object that conforms exactly to this JSON schema, with no markdown fences or trailing prose:\n{schema}"
+                            )
+                        }));
+                    }
+                }
+            } else if let Some(schema) = &response_format.schema {
+                // Strict structured outputs need additionalProperties:false on
+                // every nested object (no-op unless mode is Strict).
+                let schema =
+                    crate::llm::utils::normalize_strict_schema(schema, response_format.mode);
+
+                let mut format_obj = serde_json::json!({
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "response",
+                        "schema": schema
+                    }
+                });
+
+                if matches!(
+                    response_format.mode,
+                    crate::llm::types::ResponseMode::Strict
+                ) {
+                    format_obj["json_schema"]["strict"] = serde_json::json!(true);
+                }
+
+                request_body["response_format"] = format_obj;
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -732,210 +903,5 @@ async fn execute_request(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_gemini_thought_signature_round_trip() {
-        // Response side: extra_content survives deserialization
-        let call: OpenAiCompatToolCall = serde_json::from_value(serde_json::json!({
-            "id": "call_1",
-            "type": "function",
-            "function": {"name": "search", "arguments": "{}"},
-            "extra_content": {"google": {"thought_signature": "sig123"}}
-        }))
-        .unwrap();
-        assert!(call.extra_content.is_some());
-
-        // Replay side: meta.extra_content is emitted back on the tool call
-        let tool_calls_json = serde_json::to_value(vec![crate::llm::tool_calls::GenericToolCall {
-            id: "call_1".to_string(),
-            name: "search".to_string(),
-            arguments: serde_json::json!({}),
-            meta: serde_json::json!({
-                "extra_content": {"google": {"thought_signature": "sig123"}}
-            })
-            .as_object()
-            .cloned(),
-        }])
-        .unwrap();
-
-        let msg = Message {
-            role: "assistant".to_string(),
-            content: String::new(),
-            timestamp: 0,
-            cached: false,
-            cache_ttl: None,
-            tool_call_id: None,
-            name: None,
-            tool_calls: Some(tool_calls_json),
-            images: None,
-            videos: None,
-            thinking: None,
-            id: None,
-        };
-        let converted = convert_messages(std::slice::from_ref(&msg), "local", "test-model");
-        let json = serde_json::to_value(&converted[0]).unwrap();
-        assert_eq!(
-            json["tool_calls"][0]["extra_content"]["google"]["thought_signature"],
-            "sig123"
-        );
-
-        // Tool calls without meta must not gain an extra_content field
-        let plain = serde_json::to_value(vec![crate::llm::tool_calls::GenericToolCall {
-            id: "call_2".to_string(),
-            name: "search".to_string(),
-            arguments: serde_json::json!({}),
-            meta: None,
-        }])
-        .unwrap();
-        let msg_plain = Message {
-            tool_calls: Some(plain),
-            ..msg
-        };
-        let converted = convert_messages(std::slice::from_ref(&msg_plain), "local", "test-model");
-        let json = serde_json::to_value(&converted[0]).unwrap();
-        assert!(json["tool_calls"][0].get("extra_content").is_none());
-    }
-
-    #[test]
-    fn test_ollama_reasoning_is_stored_and_replayed() {
-        let response_message: OpenAiCompatResponseMessage =
-            serde_json::from_value(serde_json::json!({
-                "content": "I need the repository state.",
-                "reasoning": "The first step is to inspect git status.",
-                "tool_calls": [{
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": "git_status", "arguments": "{}"}
-                }]
-            }))
-            .unwrap();
-
-        let thinking = extract_thinking(&response_message).expect("reasoning must be stored");
-        assert_eq!(thinking.content, "The first step is to inspect git status.");
-
-        let tool_calls = serde_json::to_value(vec![crate::llm::tool_calls::GenericToolCall {
-            id: "call_1".to_string(),
-            name: "git_status".to_string(),
-            arguments: serde_json::json!({}),
-            meta: None,
-        }])
-        .unwrap();
-        let history = Message {
-            role: "assistant".to_string(),
-            content: "I need the repository state.".to_string(),
-            timestamp: 0,
-            cached: false,
-            cache_ttl: None,
-            tool_call_id: None,
-            name: None,
-            tool_calls: Some(tool_calls),
-            images: None,
-            videos: None,
-            thinking: Some(thinking),
-            id: None,
-        };
-
-        let converted = convert_messages(&[history], "ollama", "glm-5.2");
-        let json = serde_json::to_value(&converted[0]).unwrap();
-        assert_eq!(
-            json.get("reasoning").and_then(serde_json::Value::as_str),
-            Some("The first step is to inspect git status.")
-        );
-    }
-
-    #[test]
-    fn test_ollama_reasoning_replays_only_on_last_assistant() {
-        let assistant = |text: &str| Message {
-            role: "assistant".to_string(),
-            content: text.to_string(),
-            timestamp: 0,
-            cached: false,
-            cache_ttl: None,
-            tool_call_id: None,
-            name: None,
-            tool_calls: None,
-            images: None,
-            videos: None,
-            thinking: Some(ThinkingBlock {
-                content: format!("thinking for {text}"),
-                tokens: 4,
-            }),
-            id: None,
-        };
-        let messages = [assistant("one"), assistant("two")];
-
-        let converted = convert_messages(&messages, "ollama", "glm-5.2");
-        assert!(converted[0].reasoning.is_none());
-        assert_eq!(converted[1].reasoning.as_deref(), Some("thinking for two"));
-
-        // Kimi preserve-thinking models keep reasoning on every assistant turn.
-        let converted = convert_messages(&messages, "ollama", "kimi-k2.7-code");
-        assert_eq!(converted[0].reasoning.as_deref(), Some("thinking for one"));
-        assert_eq!(converted[1].reasoning.as_deref(), Some("thinking for two"));
-    }
-
-    #[test]
-    fn test_openai_compat_reasoning_field_variants_are_stored() {
-        for (field, value) in [
-            ("reasoning_content", "reasoning-content trace"),
-            ("reasoning", "reasoning trace"),
-            ("thinking", "native Ollama trace"),
-        ] {
-            let mut json = serde_json::json!({"content": "answer"});
-            json[field] = serde_json::json!(value);
-            let message: OpenAiCompatResponseMessage = serde_json::from_value(json).unwrap();
-            assert_eq!(
-                extract_thinking(&message).map(|thinking| thinking.content),
-                Some(value.to_string())
-            );
-        }
-    }
-
-    #[test]
-    fn test_ollama_max_reasoning_effort_is_not_downgraded() {
-        assert_eq!(
-            reasoning_effort_value("ollama", "qwen3", crate::llm::types::ReasoningEffort::Max),
-            "max"
-        );
-        assert_eq!(
-            reasoning_effort_value(
-                "nvidia",
-                "nemotron",
-                crate::llm::types::ReasoningEffort::Max
-            ),
-            "high"
-        );
-    }
-
-    #[test]
-    fn test_opencode_kimi_k3_max_reasoning_effort_is_kept() {
-        // OpenCode forwards verbatim to Moonshot: kimi-k3's top tier is "max"
-        assert_eq!(
-            reasoning_effort_value(
-                "opencode-go",
-                "kimi-k3",
-                crate::llm::types::ReasoningEffort::Max
-            ),
-            "max"
-        );
-        assert_eq!(
-            reasoning_effort_value(
-                "opencode-zen",
-                "kimi-k3",
-                crate::llm::types::ReasoningEffort::Max
-            ),
-            "max"
-        );
-        // Non-Kimi models through OpenCode keep the generic downgrade
-        assert_eq!(
-            reasoning_effort_value(
-                "opencode-go",
-                "gpt-5.5",
-                crate::llm::types::ReasoningEffort::Max
-            ),
-            "high"
-        );
-    }
-}
+#[path = "openai_compat_tests.rs"]
+mod tests;

@@ -100,6 +100,8 @@ const PRICING: &[PricingTuple] = &[
     ),
     ("@cf/qwen/qwen3.8-27b", 0.450, 3.200, 0.450, 0.450),
     ("@cf/zai-org/glm-5.2", 1.400, 4.400, 1.400, 0.260),
+    ("@cf/zai-org/glm-5.3-flash", 0.150, 0.500, 0.150, 0.030),
+    ("@cf/zai-org/glm-5.3", 1.400, 4.400, 1.400, 0.260),
     ("@cf/zai-org/glm-4.7-flash", 0.060, 0.400, 0.060, 0.060),
     (
         "@cf/nvidia/nemotron-3-120b-a12b",
@@ -108,6 +110,7 @@ const PRICING: &[PricingTuple] = &[
         0.500,
         0.500,
     ),
+    ("@cf/moonshotai/kimi-k2.5", 0.600, 3.000, 0.600, 0.100),
     ("@cf/moonshotai/kimi-k2.7-code", 0.950, 4.000, 0.950, 0.190),
     ("@cf/moonshotai/kimi-k2.6", 0.950, 4.000, 0.950, 0.160),
     ("@cf/openai/gpt-oss-120b", 0.350, 0.750, 0.350, 0.350),
@@ -201,6 +204,8 @@ impl AiProvider for CloudflareWorkersAiProvider {
                 provider_name: "cloudflare",
                 usage_fallback_cost: None,
                 use_response_cost: true,
+                enforces_response_schema: true,
+                supports_required_tool_choice: false,
             },
             api_key,
             api_url,
@@ -226,51 +231,5 @@ impl AiProvider for CloudflareWorkersAiProvider {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_supports_model() {
-        let provider = CloudflareWorkersAiProvider::new();
-
-        // Cloudflare Workers AI accepts any non-empty model identifier
-        assert!(provider.supports_model("llama-3.1-70b-instruct"));
-        assert!(provider.supports_model("@cf/meta/llama-3.1-70b-instruct"));
-        assert!(provider.supports_model("@hf/meta/llama-3.1-8b-instruct"));
-        assert!(provider.supports_model("mistral-7b-instruct-v0.1"));
-        assert!(provider.supports_model("gemma-2-27b-it"));
-        assert!(provider.supports_model("gpt-4"));
-        assert!(provider.supports_model("claude-3"));
-        assert!(!provider.supports_model(""));
-    }
-
-    #[test]
-    fn test_supports_model_case_insensitive() {
-        let provider = CloudflareWorkersAiProvider::new();
-
-        // Test uppercase
-        assert!(provider.supports_model("LLAMA-3.1-70B-INSTRUCT"));
-        assert!(provider.supports_model("MISTRAL-7B-INSTRUCT-V0.1"));
-        // Test mixed case
-        assert!(provider.supports_model("Llama-3.1-70B-Instruct"));
-        assert!(provider.supports_model("GEMMA-2-27B-IT"));
-    }
-
-    #[test]
-    fn current_workers_ai_models_use_cloudflare_prices() {
-        let provider = CloudflareWorkersAiProvider::new();
-
-        let deepseek = provider
-            .get_model_pricing("@cf/deepseek-ai/deepseek-v4-flash-0731")
-            .unwrap();
-        assert_eq!(deepseek.input_price_per_1m, 0.440);
-        assert_eq!(deepseek.cache_read_price_per_1m, 0.014);
-        assert_eq!(deepseek.output_price_per_1m, 1.320);
-        assert!(provider.supports_caching("@cf/deepseek-ai/deepseek-v4-flash-0731"));
-
-        let qwen = provider.get_model_pricing("@cf/qwen/qwen3.8-27b").unwrap();
-        assert_eq!(qwen.input_price_per_1m, 0.450);
-        assert_eq!(qwen.output_price_per_1m, 3.200);
-        assert!(!provider.supports_caching("@cf/qwen/qwen3.8-27b"));
-    }
-}
+#[path = "cloudflare_tests.rs"]
+mod tests;

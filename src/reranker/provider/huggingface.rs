@@ -142,7 +142,7 @@ impl CrossEncoderModel {
     async fn load(model_name: &str) -> Result<Self> {
         let device = Device::Cpu;
 
-        let cache_dir = crate::storage::get_huggingface_cache_dir()
+        let cache_dir = crate::storage::get_model_cache_dir()
             .context("Failed to get HuggingFace cache directory")?;
         std::env::set_var("HF_HOME", &cache_dir);
 
@@ -437,29 +437,5 @@ impl HuggingFaceReranker {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_huggingface_reranker_creation() {
-        #[cfg(feature = "huggingface")]
-        {
-            assert!(HuggingFaceReranker::new("cross-encoder/ms-marco-MiniLM-L-6-v2").is_ok());
-            assert!(HuggingFaceReranker::new("BAAI/bge-reranker-base").is_ok());
-            assert!(HuggingFaceReranker::new("jinaai/jina-reranker-v2-base-multilingual").is_ok());
-            assert!(HuggingFaceReranker::new("").is_err());
-        }
-    }
-
-    #[test]
-    fn test_recommended_models_not_empty() {
-        #[cfg(feature = "huggingface")]
-        {
-            let models = HuggingFaceReranker::recommended_models();
-            assert!(!models.is_empty());
-            assert!(models.contains(&"cross-encoder/ms-marco-MiniLM-L-6-v2"));
-            assert!(models.contains(&"BAAI/bge-reranker-v2-m3"));
-            assert!(models.contains(&"jinaai/jina-reranker-v2-base-multilingual"));
-        }
-    }
-}
+#[path = "huggingface_tests.rs"]
+mod tests;

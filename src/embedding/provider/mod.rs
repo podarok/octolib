@@ -18,6 +18,7 @@
 //! Each provider can be optionally compiled based on cargo features.
 
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use reqwest::Client;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -25,8 +26,13 @@ use std::time::Duration;
 use super::pricing::EmbeddingUsage;
 use super::types::{EmbeddingProviderType, InputType};
 
-// Shared HTTP client with connection pooling for optimal performance
-static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
+// Shared HTTP client with connection pooling. It is swappable because Tokio
+// tests create independent runtimes; a pooled connection must not retain the
+// dispatcher of a runtime that has already been dropped.
+static HTTP_CLIENT: LazyLock<ArcSwap<Client>> =
+    LazyLock::new(|| ArcSwap::from_pointee(build_http_client()));
+
+fn build_http_client() -> Client {
     Client::builder()
         .pool_max_idle_per_host(10)
         .pool_idle_timeout(Duration::from_secs(30))
@@ -34,7 +40,11 @@ static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
         .connect_timeout(Duration::from_secs(10))
         .build()
         .expect("Failed to create HTTP client")
-});
+}
+
+fn http_client() -> Client {
+    (*HTTP_CLIENT.load_full()).clone()
+}
 
 // Feature-specific provider modules
 #[cfg(feature = "fastembed")]
@@ -85,6 +95,19 @@ pub trait EmbeddingProvider: Send + Sync {
     fn is_model_supported(&self) -> bool {
         true
     }
+
+    /// Identity of the loaded weights (HF commit sha) for in-process models.
+    /// `None` for API providers, whose model versions are not observable.
+    async fn model_revision(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// The model's own tokenizer for in-process models, so callers can count
+    /// and split tokens exactly as the model does. `None` for API providers.
+    #[cfg(feature = "huggingface")]
+    async fn tokenizer(&self) -> Result<Option<std::sync::Arc<tokenizers::Tokenizer>>> {
+        Ok(None)
+    }
 }
 
 /// Create an embedding provider from provider type and model
@@ -127,4 +150,5 @@ pub async fn create_embedding_provider_from_parts(
 }
 
 #[cfg(test)]
-mod mod_test;
+#[path = "mod_tests.rs"]
+mod tests;

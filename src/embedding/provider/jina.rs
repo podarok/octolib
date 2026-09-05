@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 
 use super::super::types::InputType;
 use super::super::EmbeddingUsage;
-use super::{EmbeddingProvider, HTTP_CLIENT};
+use super::{http_client, EmbeddingProvider};
 
 /// Jina provider implementation for trait
 pub struct JinaProviderImpl {
@@ -173,7 +173,7 @@ impl JinaProvider {
         let jina_api_key =
             std::env::var("JINA_API_KEY").context("JINA_API_KEY environment variable not set")?;
 
-        let response = HTTP_CLIENT
+        let response = http_client()
             .post("https://api.jina.ai/v1/embeddings")
             .header("Authorization", format!("Bearer {}", jina_api_key))
             .json(&json!({
@@ -207,101 +207,5 @@ impl JinaProvider {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_jina_provider_creation() {
-        // Test valid models
-        assert!(JinaProviderImpl::new("jina-embeddings-v4").is_ok());
-        assert!(JinaProviderImpl::new("jina-embeddings-v3").is_ok());
-        assert!(JinaProviderImpl::new("jina-clip-v2").is_ok());
-        assert!(JinaProviderImpl::new("jina-colbert-v2").is_ok());
-        assert!(JinaProviderImpl::new("jina-code-embeddings-0.5b").is_ok());
-
-        // Test invalid model
-        assert!(JinaProviderImpl::new("invalid-model").is_err());
-    }
-
-    #[test]
-    fn test_jina_model_dimensions() {
-        assert_eq!(
-            JinaProviderImpl::new("jina-embeddings-v4")
-                .unwrap()
-                .get_dimension(),
-            2048
-        );
-        assert_eq!(
-            JinaProviderImpl::new("jina-embeddings-v3")
-                .unwrap()
-                .get_dimension(),
-            1024
-        );
-        assert_eq!(
-            JinaProviderImpl::new("jina-clip-v2")
-                .unwrap()
-                .get_dimension(),
-            1024
-        );
-        assert_eq!(
-            JinaProviderImpl::new("jina-embeddings-v2-small-en")
-                .unwrap()
-                .get_dimension(),
-            512
-        );
-        assert_eq!(
-            JinaProviderImpl::new("jina-colbert-v2")
-                .unwrap()
-                .get_dimension(),
-            128
-        );
-        assert_eq!(
-            JinaProviderImpl::new("jina-colbert-v2-96")
-                .unwrap()
-                .get_dimension(),
-            96
-        );
-        assert_eq!(
-            JinaProviderImpl::new("jina-colbert-v2-64")
-                .unwrap()
-                .get_dimension(),
-            64
-        );
-        assert_eq!(
-            JinaProviderImpl::new("jina-code-embeddings-0.5b")
-                .unwrap()
-                .get_dimension(),
-            896
-        );
-        assert_eq!(
-            JinaProviderImpl::new("jina-code-embeddings-1.5b")
-                .unwrap()
-                .get_dimension(),
-            1536
-        );
-    }
-
-    #[test]
-    fn test_jina_model_validation() {
-        let models = [
-            "jina-embeddings-v5-text-small",
-            "jina-embeddings-v5-text-nano",
-            "jina-embeddings-v5-omni-small",
-            "jina-embeddings-v5-omni-nano",
-            "jina-embeddings-v4",
-            "jina-embeddings-v3",
-            "jina-clip-v2",
-            "jina-clip-v1",
-            "jina-embeddings-v2-small-en",
-            "jina-colbert-v2",
-            "jina-colbert-v2-96",
-            "jina-colbert-v2-64",
-            "jina-code-embeddings-0.5b",
-            "jina-code-embeddings-1.5b",
-        ];
-        for model in models {
-            let provider = JinaProviderImpl::new(model).unwrap();
-            assert!(provider.is_model_supported());
-        }
-    }
-}
+#[path = "jina_tests.rs"]
+mod tests;

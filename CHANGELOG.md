@@ -1,5 +1,120 @@
 # Changelog
 
+## [0.35.4] - 2026-09-05
+
+### 📋 Release Summary
+
+This release fixes an issue in the ZAI provider to ensure images are preserved in chat messages (47b167e8).
+
+
+### 🐛 Bug Fixes & Stability
+
+- **zai**: preserve images in chat messages `47b167e8`
+
+## [0.35.3] - 2026-09-04
+
+### 📋 Release Summary
+
+This release adds support for Gemini 3.8 Flash models (79ce03fa). Dependency updates and improved CI run management enhance overall maintenance and reliability (f0f4edf5, 1e18ba63).
+
+
+### ✨ New Features & Enhancements
+
+- **llm**: support Gemini 3.8 Flash models `79ce03fa`
+
+### 🔧 Improvements & Optimizations
+
+- **workflow**: cancel superseded CI runs `1e18ba63`
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
+## [0.35.2] - 2026-09-04
+
+### 📋 Release Summary
+
+This release adds support for GPT-6 models in the OpenAI provider (40a99f1f).
+
+
+### ✨ New Features & Enhancements
+
+- **openai**: support GPT-6 models `40a99f1f`
+
+## [0.35.1] - 2026-09-03
+
+### 📋 Release Summary
+
+This release adds support for Meta’s Model API provider, expanding octolib’s multi-provider capabilities (c4bed667). Embedding tests are now more resilient when Hugging Face model downloads are unavailable (80ea7e95).
+
+
+### ✨ New Features & Enhancements
+
+- **llm**: add Meta Model API provider `c4bed667`
+
+### 🔧 Improvements & Optimizations
+
+- **embedding**: skip unavailable HuggingFace downloads `80ea7e95`
+
+## [0.35.0] - 2026-09-02
+
+### 📋 Release Summary
+
+Hugging Face model state handling has been reorganized, which may require compatibility updates (61eddf07). Support for Claude 5.1 models has been added through Anthropic (f3137847). Model caching and app attribution have been improved across providers, and Octolib product URLs have been updated (26dddd32, 3dff660c, 5c152b14, 85e464ae).
+
+
+### 🚨 Breaking Changes
+
+⚠️ **Important**: This release contains breaking changes that may require code updates.
+
+- **huggingface**: centralize model state `61eddf07`
+
+### ✨ New Features & Enhancements
+
+- **anthropic**: support Claude 5.1 models `f3137847`
+
+### 🔧 Improvements & Optimizations
+
+- **links**: update Octolib product URLs `85e464ae`
+
+### 🐛 Bug Fixes & Stability
+
+- **storage**: share model cache across providers `26dddd32`
+- **storage**: share HuggingFace model cache directory `3dff660c`
+- **octohub**: forward app attribution headers `5c152b14`
+
+## [0.34.8] - 2026-08-31
+
+### 📋 Release Summary
+
+This release expands model metadata coverage and adds response schema enforcement for more reliable structured outputs (d49aceb7, 013d4322). Provider and DeepSeek compatibility, schema validation diagnostics and usage reporting, and embedding runtime stability have been improved (cc16ef63, 31896474, 508f4f51, 90a9d450, 2d451fb5, 235fda22, 76da6adb).
+
+
+### ✨ New Features & Enhancements
+
+- **llm**: expand model metadata coverage `d49aceb7`
+- **llm**: enforce response schemas `013d4322`
+
+### 🔧 Improvements & Optimizations
+
+- **coverage**: configure llvm-cov coverage reporting `7d773ac8`
+- **tests**: extract tests into modules `2cbd3e96`
+- **llm**: unify schema enforcement `3ce46f0a`
+
+### 🐛 Bug Fixes & Stability
+
+- **llm**: align provider model handling `cc16ef63`
+- **deepseek**: align thinking request format `31896474`
+- **llm**: handle Alibaba DeepSeek schemas `508f4f51`
+- **llm**: log failed schema validation output `90a9d450`
+- **llm**: aggregate usage across schema attempts `2d451fb5`
+- **embedding**: refresh HTTP client runtimes `235fda22`
+- **llm**: fail closed on structured output `76da6adb`
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.34.7] - 2026-08-29
 
 ### 📋 Release Summary

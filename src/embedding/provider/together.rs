@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use std::env;
 
-use super::{EmbeddingProvider, HTTP_CLIENT};
+use super::{http_client, EmbeddingProvider};
 use crate::embedding::types::InputType;
 use crate::embedding::EmbeddingUsage;
 
@@ -107,7 +107,7 @@ impl TogetherProvider {
             )
         })?;
 
-        let response = HTTP_CLIENT
+        let response = http_client()
             .post(TOGETHER_EMBEDDING_URL)
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
@@ -151,7 +151,7 @@ impl TogetherProvider {
             )
         })?;
 
-        let response = HTTP_CLIENT
+        let response = http_client()
             .post(TOGETHER_EMBEDDING_URL)
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
@@ -217,35 +217,5 @@ struct TogetherEmbeddingData {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_provider_creation() {
-        // Test valid models
-        let provider = TogetherProviderImpl::new("intfloat/multilingual-e5-large-instruct");
-        assert!(provider.is_ok());
-        assert_eq!(provider.unwrap().get_dimension(), 1024);
-
-        // Test invalid model
-        let invalid = TogetherProviderImpl::new("invalid-model");
-        assert!(invalid.is_err());
-    }
-
-    #[test]
-    fn test_model_dimensions() {
-        let provider =
-            TogetherProviderImpl::new("intfloat/multilingual-e5-large-instruct").unwrap();
-        assert_eq!(provider.get_dimension(), 1024);
-    }
-
-    #[test]
-    fn test_model_validation() {
-        let provider_valid =
-            TogetherProviderImpl::new("intfloat/multilingual-e5-large-instruct").unwrap();
-        assert!(provider_valid.is_model_supported());
-
-        let provider_invalid = TogetherProviderImpl::new("unknown-model");
-        assert!(provider_invalid.is_err());
-    }
-}
+#[path = "together_tests.rs"]
+mod tests;

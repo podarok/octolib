@@ -211,18 +211,29 @@ impl ModelArchitecture {
     }
 }
 
+/// Architecture-specific network. Tokenizer and device are shared by every
+/// architecture and live on [`HuggingFaceModel`].
+#[cfg(feature = "huggingface")]
+enum Backend {
+    Bert(BertModel),
+    Roberta(XLMRobertaModel),
+    JinaBert(JinaBertModel),
+    // Qwen2Model::forward takes &mut self, so wrap in Mutex for shared access
+    Qwen2(std::sync::Mutex<Qwen2Model>),
+    // Qwen3 maintains a KV cache during inference. Clone its empty base per input.
+    Qwen3(Qwen3Model),
+    JinaCodeBert(JinaCodeBertModel),
+    MPNet(MPNetModel),
+}
+
 #[cfg(feature = "huggingface")]
 /// HuggingFace model instance supporting multiple architectures
-pub enum HuggingFaceModel {
-    Bert(BertModel, Tokenizer, Device),
-    Roberta(XLMRobertaModel, Tokenizer, Device),
-    JinaBert(JinaBertModel, Tokenizer, Device),
-    // Qwen2Model::forward takes &mut self, so wrap in Mutex for shared access
-    Qwen2(std::sync::Mutex<Qwen2Model>, Tokenizer, Device),
-    // Qwen3 maintains a KV cache during inference. Clone its empty base per input.
-    Qwen3(Qwen3Model, Tokenizer, Device),
-    JinaCodeBert(JinaCodeBertModel, Tokenizer, Device),
-    MPNet(MPNetModel, Tokenizer, Device),
+pub struct HuggingFaceModel {
+    backend: Backend,
+    tokenizer: Arc<Tokenizer>,
+    device: Device,
+    /// HF commit sha of the snapshot the weights were loaded from.
+    revision: String,
 }
 
 #[cfg(feature = "huggingface")]
@@ -239,7 +250,7 @@ impl HuggingFaceModel {
 
         // Use our custom cache directory for consistency with FastEmbed
         // Set HF_HOME environment variable to control where models are downloaded
-        let cache_dir = crate::storage::get_huggingface_cache_dir()
+        let cache_dir = crate::storage::get_model_cache_dir()
             .context("Failed to get HuggingFace cache directory")?;
 
         // Set the HuggingFace cache directory via environment variable
@@ -260,6 +271,21 @@ impl HuggingFaceModel {
             .get("config.json")
             .await
             .with_context(|| format!("Failed to download config.json for model: {}", model_name))?;
+
+        // hf_hub materializes every file under `snapshots/<commit sha>/`, so the
+        // parent dir of any fetched file names the exact revision being loaded.
+        let revision = config_path
+            .parent()
+            .and_then(|dir| dir.file_name())
+            .and_then(|sha| sha.to_str())
+            .map(str::to_owned)
+            .with_context(|| {
+                format!(
+                    "Unexpected hf_hub cache layout for model {}: {}",
+                    model_name,
+                    config_path.display()
+                )
+            })?;
 
         // Load tokenizer - try different formats
         let tokenizer = if let Ok(tokenizer_json_path) = repo.get("tokenizer.json").await {
@@ -384,59 +410,74 @@ impl HuggingFaceModel {
         let var_builder = VarBuilder::from_tensors(weights, DType::F32, &device);
 
         // Create model based on detected architecture
-        let model = match architecture {
+        let backend = match architecture {
             ModelArchitecture::Bert => {
                 let config: BertConfig = serde_json::from_str(&config_content)
                     .with_context(|| "Failed to parse config.json as BERT config")?;
                 let model = BertModel::load(var_builder, &config)
                     .with_context(|| "Failed to load BERT model")?;
-                HuggingFaceModel::Bert(model, tokenizer, device)
+                Backend::Bert(model)
             }
             ModelArchitecture::Roberta => {
                 let config: XLMRobertaConfig = serde_json::from_str(&config_content)
                     .with_context(|| "Failed to parse config.json as RoBERTa config")?;
                 let model = XLMRobertaModel::new(&config, var_builder)
                     .with_context(|| "Failed to load RoBERTa model")?;
-                HuggingFaceModel::Roberta(model, tokenizer, device)
+                Backend::Roberta(model)
             }
             ModelArchitecture::JinaBert => {
                 let config: JinaBertConfig = serde_json::from_str(&config_content)
                     .with_context(|| "Failed to parse config.json as JinaBert config")?;
                 let model = JinaBertModel::new(var_builder, &config)
                     .with_context(|| "Failed to load JinaBert model")?;
-                HuggingFaceModel::JinaBert(model, tokenizer, device)
+                Backend::JinaBert(model)
             }
             ModelArchitecture::JinaCodeBert => {
                 let config: JinaBertConfig = serde_json::from_str(&config_content)
                     .with_context(|| "Failed to parse config.json as JinaBert config")?;
                 let model = JinaCodeBertModel::new(var_builder, &config)
                     .with_context(|| "Failed to load JinaCodeBert (QK-post-norm) model")?;
-                HuggingFaceModel::JinaCodeBert(model, tokenizer, device)
+                Backend::JinaCodeBert(model)
             }
             ModelArchitecture::Qwen2 => {
                 let config: Qwen2Config = serde_json::from_str(&config_content)
                     .with_context(|| "Failed to parse config.json as Qwen2 config")?;
                 let model = Qwen2Model::new(&config, var_builder)
                     .with_context(|| "Failed to load Qwen2 model")?;
-                HuggingFaceModel::Qwen2(std::sync::Mutex::new(model), tokenizer, device)
+                Backend::Qwen2(std::sync::Mutex::new(model))
             }
             ModelArchitecture::Qwen3 => {
                 let config: Qwen3Config = serde_json::from_str(&config_content)
                     .with_context(|| "Failed to parse config.json as Qwen3 config")?;
                 let model = Qwen3Model::new(&config, var_builder)
                     .with_context(|| "Failed to load Qwen3 model")?;
-                HuggingFaceModel::Qwen3(model, tokenizer, device)
+                Backend::Qwen3(model)
             }
             ModelArchitecture::MPNet => {
                 let config: MPNetConfig = serde_json::from_str(&config_content)
                     .with_context(|| "Failed to parse config.json as MPNet config")?;
                 let model = MPNetModel::new(var_builder, &config)
                     .with_context(|| "Failed to load MPNet model")?;
-                HuggingFaceModel::MPNet(model, tokenizer, device)
+                Backend::MPNet(model)
             }
         };
 
-        Ok(model)
+        Ok(Self {
+            backend,
+            tokenizer: Arc::new(tokenizer),
+            device,
+            revision,
+        })
+    }
+
+    /// HF commit sha of the loaded weights.
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    /// The tokenizer the model was loaded with.
+    pub fn tokenizer(&self) -> &Arc<Tokenizer> {
+        &self.tokenizer
     }
 
     /// Generate embeddings for a single text
@@ -448,10 +489,12 @@ impl HuggingFaceModel {
     /// Generate embeddings for multiple texts
     pub fn encode_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut all_embeddings = Vec::new();
+        let tokenizer = &*self.tokenizer;
+        let device = &self.device;
 
         for text in texts {
-            let embedding = match self {
-                HuggingFaceModel::Bert(model, tokenizer, device) => {
+            let embedding = match &self.backend {
+                Backend::Bert(model) => {
                     let encoding = tokenizer
                         .encode(text.as_str(), true)
                         .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
@@ -464,7 +507,7 @@ impl HuggingFaceModel {
                         model.forward(&token_ids, &token_type_ids, Some(&attention_mask))?;
                     Self::mean_pool_and_normalize(&output, &attention_mask)?
                 }
-                HuggingFaceModel::Roberta(model, tokenizer, device) => {
+                Backend::Roberta(model) => {
                     let encoding = tokenizer
                         .encode(text.as_str(), true)
                         .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
@@ -484,7 +527,7 @@ impl HuggingFaceModel {
                     let attention_mask_u8 = Tensor::ones((1, tokens.len()), DType::U8, device)?;
                     Self::mean_pool_and_normalize(&output, &attention_mask_u8)?
                 }
-                HuggingFaceModel::JinaBert(model, tokenizer, device) => {
+                Backend::JinaBert(model) => {
                     let encoding = tokenizer
                         .encode(text.as_str(), true)
                         .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
@@ -495,7 +538,7 @@ impl HuggingFaceModel {
                     let attention_mask = Tensor::ones((1, tokens.len()), DType::U8, device)?;
                     Self::mean_pool_and_normalize(&output, &attention_mask)?
                 }
-                HuggingFaceModel::JinaCodeBert(model, tokenizer, device) => {
+                Backend::JinaCodeBert(model) => {
                     let encoding = tokenizer
                         .encode(text.as_str(), true)
                         .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
@@ -506,7 +549,7 @@ impl HuggingFaceModel {
                     let attention_mask = Tensor::ones((1, tokens.len()), DType::U8, device)?;
                     Self::mean_pool_and_normalize(&output, &attention_mask)?
                 }
-                HuggingFaceModel::Qwen2(model, tokenizer, device) => {
+                Backend::Qwen2(model) => {
                     let encoding = tokenizer
                         .encode(text.as_str(), true)
                         .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
@@ -520,7 +563,7 @@ impl HuggingFaceModel {
                     let attention_mask = Tensor::ones((1, tokens.len()), DType::U8, device)?;
                     Self::mean_pool_and_normalize(&output, &attention_mask)?
                 }
-                HuggingFaceModel::Qwen3(model, tokenizer, device) => {
+                Backend::Qwen3(model) => {
                     let encoding = tokenizer
                         .encode(text.as_str(), true)
                         .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
@@ -529,7 +572,7 @@ impl HuggingFaceModel {
                     let output = model.clone().forward(&token_ids, 0)?;
                     Self::last_token_pool_and_normalize(&output)?
                 }
-                HuggingFaceModel::MPNet(model, tokenizer, device) => {
+                Backend::MPNet(model) => {
                     let encoding = tokenizer
                         .encode(text.as_str(), true)
                         .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
@@ -648,11 +691,6 @@ impl HuggingFaceProvider {
         }
 
         Ok(model_arc)
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn get_model_for_test(model_name: &str) -> Result<Arc<HuggingFaceModel>> {
-        Self::get_model(model_name).await
     }
 
     /// Generate embeddings for a single text
@@ -904,6 +942,16 @@ impl EmbeddingProvider for HuggingFaceProviderImpl {
         self.dimension
     }
 
+    async fn model_revision(&self) -> Result<Option<String>> {
+        let model = HuggingFaceProvider::get_model(&self.model_name).await?;
+        Ok(Some(model.revision().to_owned()))
+    }
+
+    async fn tokenizer(&self) -> Result<Option<Arc<Tokenizer>>> {
+        let model = HuggingFaceProvider::get_model(&self.model_name).await?;
+        Ok(Some(model.tokenizer().clone()))
+    }
+
     fn is_model_supported(&self) -> bool {
         // For HuggingFace, we support many models, so return true for most cases
         // The actual validation happens when trying to load the model
@@ -912,108 +960,5 @@ impl EmbeddingProvider for HuggingFaceProviderImpl {
 }
 
 #[cfg(all(test, feature = "huggingface"))]
-mod tests {
-    use super::model_load_lock;
-    use std::sync::Arc;
-
-    #[tokio::test]
-    async fn test_model_load_locks_are_scoped_per_model() {
-        let first = model_load_lock("same-model").await;
-        let second = model_load_lock("same-model").await;
-        let other = model_load_lock("other-model").await;
-
-        assert!(Arc::ptr_eq(&first, &second));
-        assert!(!Arc::ptr_eq(&first, &other));
-
-        let first_guard = first.lock().await;
-        assert!(second.try_lock().is_err());
-        assert!(other.try_lock().is_ok());
-        drop(first_guard);
-        assert!(second.try_lock().is_ok());
-    }
-
-    #[test]
-    fn test_roberta_tokenizer_building() {
-        // Test that we can build a RoBERTa-style tokenizer using BPE::from_file approach
-        use tokenizers::{
-            models::bpe::BPE, pre_tokenizers::byte_level::ByteLevel,
-            processors::roberta::RobertaProcessing, Tokenizer,
-        };
-
-        // Create temporary files for testing
-        let vocab_file = std::env::temp_dir().join("test_vocab.json");
-        let merges_file = std::env::temp_dir().join("test_merges.txt");
-
-        // Write test vocab - must include all tokens used in merges
-        let vocab_content = r#"{"<s>":0,"<pad>":1,"</s>":2,"<unk>":3,"h":4,"e":5,"l":6,"o":7,"r":8,"he":9,"ll":10,"or":11,"hello":12,"world":13}"#;
-        std::fs::write(&vocab_file, vocab_content).expect("Failed to write vocab");
-
-        // Write test merges
-        let merges_content = "#version: 0.2\nh e\nl l\no r";
-        std::fs::write(&merges_file, merges_content).expect("Failed to write merges");
-
-        // Build BPE model using from_file
-        let bpe = BPE::from_file(vocab_file.to_str().unwrap(), merges_file.to_str().unwrap())
-            .unk_token("<unk>".to_string())
-            .build()
-            .expect("Failed to build BPE tokenizer");
-
-        let mut tokenizer = Tokenizer::new(bpe);
-
-        // Add ByteLevel pre-tokenizer (for RoBERTa)
-        tokenizer.with_pre_tokenizer(Some(ByteLevel::default()));
-
-        // Add RoBERTa post-processing
-        let post_processor = RobertaProcessing::new(
-            ("</s>".to_string(), 2), // SEP token
-            ("<s>".to_string(), 0),  // CLS token
-        )
-        .trim_offsets(false)
-        .add_prefix_space(true);
-        tokenizer.with_post_processor(Some(post_processor));
-
-        // Test that tokenizer works
-        let test_text = "hello world";
-        let encoding = tokenizer
-            .encode(test_text, false)
-            .expect("Failed to encode");
-
-        assert!(
-            !encoding.get_ids().is_empty(),
-            "Encoding should produce tokens"
-        );
-        println!("✓ RoBERTa-style tokenizer built successfully using BPE::from_file");
-
-        // Clean up
-        let _ = std::fs::remove_file(vocab_file);
-        let _ = std::fs::remove_file(merges_file);
-    }
-
-    #[test]
-    fn test_merges_parsing() {
-        // Test that we correctly parse merges.txt format
-        let merges_content = r#"#version: 0.2
-Ġ t
-Ġ a
-h e
-Ġt he
-i n"#;
-
-        let merges: Vec<(String, String)> = merges_content
-            .lines()
-            .skip(1) // Skip header line
-            .filter_map(|line| {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() == 2 {
-                    Some((parts[0].to_string(), parts[1].to_string()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        assert_eq!(merges.len(), 5);
-        assert_eq!(merges[0], ("Ġ".to_string(), "t".to_string()));
-        println!("✓ Merges parsing works correctly");
-    }
-}
+#[path = "mod_tests.rs"]
+mod tests;

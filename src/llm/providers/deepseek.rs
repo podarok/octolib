@@ -36,7 +36,7 @@
 //! (<https://api-docs.deepseek.com/news/news260821/>).
 //!
 //! Legacy aliases deepseek-chat / deepseek-reasoner were removed by DeepSeek
-//! on 2026-07-24 15:59 UTC per <https://api-docs.deepseek.com/updates>.
+//! on 2026-07-24 per <https://api-docs.deepseek.com/updates>.
 //!
 //! Thinking is enabled by default (effort "high"); effort is controlled via
 //! the top-level `reasoning_effort` field: "low" | "high" | "max"
@@ -96,9 +96,11 @@ fn pricing_table_at(time: std::time::SystemTime) -> &'static [PricingTuple] {
 }
 
 /// Map generic ReasoningEffort to DeepSeek's `reasoning_effort` string.
-/// DeepSeek supports only "low" / "high" / "max" (default "high" when the
-/// field is omitted, thinking enabled by default), so intermediate levels
-/// floor to the nearest supported lower effort.
+/// DeepSeek's canonical values are "low" / "high" / "max" (default "high"
+/// when omitted, thinking enabled by default); the API also accepts "medium"
+/// and "xhigh" but maps both UP to "high". Intermediate internal levels
+/// instead floor to the nearest lower tier so the adapter never increases
+/// effort (Medium → "low", deviating from the API's own medium → "high").
 fn map_reasoning_effort(
     effort: Option<crate::llm::types::ReasoningEffort>,
 ) -> Option<&'static str> {
@@ -128,17 +130,6 @@ fn calculate_cost_with_cache(
     let output_cost = (completion_tokens as f64 / 1_000_000.0) * output_price;
 
     Some(regular_input_cost + cache_hit_cost + output_cost)
-}
-
-/// Calculate cost for DeepSeek models without cache
-#[cfg(test)]
-fn calculate_cost(
-    pricing: &[PricingTuple],
-    model: &str,
-    input_tokens: u64,
-    completion_tokens: u64,
-) -> Option<f64> {
-    calculate_cost_with_cache(pricing, model, input_tokens, 0, completion_tokens)
 }
 
 /// Split a usage report into (cache-miss, cache-hit) prompt tokens.
@@ -191,8 +182,6 @@ struct DeepSeekRequest {
     model: String,
     messages: Vec<DeepSeekMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
@@ -201,9 +190,14 @@ struct DeepSeekRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<DeepSeekTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'static str>,
+    thinking: DeepSeekThinking,
+}
+
+#[derive(Serialize, Debug, Clone)]
+struct DeepSeekThinking {
+    #[serde(rename = "type")]
+    thinking_type: &'static str,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -303,12 +297,14 @@ struct DeepSeekToolFunction {
 
 /// Convert generic Messages into DeepSeek's wire format.
 ///
-/// DeepSeek thinking-mode rule (per /guides/thinking_mode): when an assistant turn
-/// produced tool_calls, its reasoning_content MUST be replayed in subsequent
-/// requests — otherwise the API returns 400. For assistant turns without
-/// tool_calls (and for all other roles), reasoning_content is ignored and is
-/// omitted here.
-fn convert_messages(messages: &[crate::llm::types::Message]) -> Vec<DeepSeekMessage> {
+/// DeepSeek thinking-mode rule (per /guides/thinking_mode): whenever the current
+/// request carries tools, every prior assistant turn's complete reasoning_content
+/// MUST be replayed, including turns that did not call a tool. Without tools the
+/// API ignores historical reasoning, so it is omitted.
+fn convert_messages(
+    messages: &[crate::llm::types::Message],
+    has_tools: bool,
+) -> Vec<DeepSeekMessage> {
     messages
         .iter()
         .map(|msg| {
@@ -330,10 +326,7 @@ fn convert_messages(messages: &[crate::llm::types::Message]) -> Vec<DeepSeekMess
                     })
             });
 
-            let reasoning_content = if msg.role == "assistant" && tool_calls.is_some() {
-                // Only replay actual thinking content — omit field entirely if no thinking was present.
-                // DeepSeek requires reasoning_content when replaying tool-call turns that had thinking,
-                // but unlike Moonshot it does NOT require an empty string when there was none.
+            let reasoning_content = if has_tools && msg.role == "assistant" {
                 msg.thinking.as_ref().map(|t| t.content.clone())
             } else {
                 None
@@ -352,8 +345,6 @@ fn convert_messages(messages: &[crate::llm::types::Message]) -> Vec<DeepSeekMess
                     serde_json::json!({"type": "image_url", "image_url": {"url": url}})
                 }));
                 Some(serde_json::json!(parts))
-            } else if msg.content.is_empty() && tool_calls.is_some() {
-                None
             } else {
                 Some(serde_json::json!(msg.content))
             };
@@ -368,6 +359,44 @@ fn convert_messages(messages: &[crate::llm::types::Message]) -> Vec<DeepSeekMess
             }
         })
         .collect()
+}
+
+fn build_request(params: &ChatCompletionParams) -> DeepSeekRequest {
+    let has_tools = params.tools.as_ref().is_some_and(|tools| !tools.is_empty());
+    let messages = convert_messages(&params.messages, has_tools);
+    let response_format = params.response_format.as_ref().map(|_| {
+        // Preserve the existing native-wire behavior: DeepSeek exposes JSON
+        // Object mode here, not JSON Schema.
+        serde_json::json!({"type": "json_object"})
+    });
+    let tools = params.tools.as_ref().and_then(|tools| {
+        (!tools.is_empty()).then(|| {
+            tools
+                .iter()
+                .map(|tool| DeepSeekTool {
+                    tool_type: "function".to_string(),
+                    function: DeepSeekToolFunction {
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        parameters: tool.parameters.clone(),
+                    },
+                })
+                .collect()
+        })
+    });
+
+    DeepSeekRequest {
+        model: params.model.clone(),
+        messages,
+        max_tokens: Some(params.max_tokens),
+        stream: Some(false),
+        response_format,
+        tools,
+        reasoning_effort: map_reasoning_effort(params.reasoning_effort),
+        thinking: DeepSeekThinking {
+            thinking_type: "enabled",
+        },
+    }
 }
 
 #[async_trait::async_trait]
@@ -434,65 +463,14 @@ impl AiProvider for DeepSeekProvider {
     }
 
     fn supported_sampling_params(&self, _model: &str) -> SamplingSupport {
-        // DeepSeek API only supports temperature (no top_p, no top_k).
-        SamplingSupport {
-            temperature: true,
-            top_p: false,
-            top_k: false,
-        }
+        // All active native routes are V4 thinking models. DeepSeek documents
+        // sampling controls as unsupported in thinking mode (accepted but ignored).
+        SamplingSupport::NONE
     }
 
     async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
         let api_key = self.get_api_key()?;
-
-        let messages = convert_messages(&params.messages);
-
-        let mut request = DeepSeekRequest {
-            model: params.model.clone(),
-            messages,
-            temperature: self.effective_sampling_params(&params).temperature,
-            max_tokens: Some(params.max_tokens),
-            stream: Some(false), // We don't support streaming in octolib yet
-            response_format: None,
-            tools: None,
-            tool_choice: None,
-            reasoning_effort: map_reasoning_effort(params.reasoning_effort),
-        };
-
-        // Add structured output format if specified
-        if let Some(response_format) = &params.response_format {
-            match &response_format.format {
-                crate::llm::types::OutputFormat::Json => {
-                    request.response_format = Some(serde_json::json!({
-                        "type": "json_object"
-                    }));
-                }
-                crate::llm::types::OutputFormat::JsonSchema => {
-                    // DeepSeek supports JSON mode but not full JSON schema validation
-                    // Fall back to json_object mode
-                    request.response_format = Some(serde_json::json!({
-                        "type": "json_object"
-                    }));
-                }
-            }
-        }
-
-        // Add tools if specified
-        if let Some(tools) = &params.tools {
-            request.tools = Some(
-                tools
-                    .iter()
-                    .map(|tool| DeepSeekTool {
-                        tool_type: "function".to_string(),
-                        function: DeepSeekToolFunction {
-                            name: tool.name.clone(),
-                            description: tool.description.clone(),
-                            parameters: tool.parameters.clone(),
-                        },
-                    })
-                    .collect(),
-            );
-        }
+        let request = build_request(&params);
 
         let start_time = std::time::Instant::now();
         let request_timeout = params.request_timeout;
@@ -703,347 +681,5 @@ impl AiProvider for DeepSeekProvider {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_supports_model() {
-        let provider = DeepSeekProvider::new();
-        assert!(provider.supports_model("deepseek-v4-flash"));
-        assert!(provider.supports_model("deepseek-v4-pro"));
-        // Legacy aliases removed by DeepSeek 2026-07-24
-        assert!(!provider.supports_model("deepseek-chat"));
-        assert!(!provider.supports_model("deepseek-reasoner"));
-        assert!(!provider.supports_model("gpt-4"));
-        assert!(!provider.supports_model("deepseek-coder")); // Not in current API
-    }
-
-    #[test]
-    fn test_vision_route() {
-        use crate::llm::types::{ImageAttachment, ImageData, Message, SourceType};
-
-        let provider = DeepSeekProvider::new();
-        assert!(provider.supports_model("deepseek-v4-flash-vision-exp"));
-        assert!(provider.supports_vision("deepseek-v4-flash-vision-exp"));
-        assert!(!provider.supports_vision("deepseek-v4-flash"));
-        assert!(!provider.supports_vision("deepseek-v4-pro"));
-
-        // Vision route bills at v4-flash rates
-        assert_eq!(
-            calculate_cost(PRICING_PEAK, "deepseek-v4-flash-vision-exp", 1_000_000, 0),
-            calculate_cost(PRICING_PEAK, "deepseek-v4-flash", 1_000_000, 0)
-        );
-
-        let msg = Message::user("what is this?").with_images(vec![ImageAttachment {
-            data: ImageData::Base64("QUJD".to_string()),
-            media_type: "image/png".to_string(),
-            source_type: SourceType::Clipboard,
-            dimensions: None,
-            size_bytes: None,
-        }]);
-        let content = convert_messages(std::slice::from_ref(&msg))[0]
-            .content
-            .clone()
-            .unwrap();
-        assert_eq!(content[0]["text"], "what is this?");
-        assert_eq!(content[1]["type"], "image_url");
-        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,QUJD");
-
-        // Text-only turns keep the plain string shape
-        let plain = convert_messages(&[Message::user("hi")])[0].content.clone();
-        assert_eq!(plain, Some(serde_json::json!("hi")));
-    }
-
-    #[test]
-    fn test_supports_model_case_insensitive() {
-        let provider = DeepSeekProvider::new();
-        assert!(provider.supports_model("DEEPSEEK-V4-FLASH"));
-        assert!(provider.supports_model("DEEPSEEK-V4-PRO"));
-        assert!(provider.supports_model("DeepSeek-V4-Flash"));
-    }
-
-    #[test]
-    fn test_max_input_tokens() {
-        let provider = DeepSeekProvider::new();
-        assert_eq!(
-            provider.get_max_input_tokens("deepseek-v4-flash"),
-            1_000_000
-        );
-        assert_eq!(provider.get_max_input_tokens("deepseek-v4-pro"), 1_000_000);
-    }
-
-    #[test]
-    fn test_map_reasoning_effort() {
-        use crate::llm::types::ReasoningEffort;
-        assert_eq!(
-            map_reasoning_effort(Some(ReasoningEffort::Low)),
-            Some("low")
-        );
-        assert_eq!(
-            map_reasoning_effort(Some(ReasoningEffort::Medium)),
-            Some("low")
-        );
-        assert_eq!(
-            map_reasoning_effort(Some(ReasoningEffort::High)),
-            Some("high")
-        );
-        assert_eq!(
-            map_reasoning_effort(Some(ReasoningEffort::XHigh)),
-            Some("high")
-        );
-        assert_eq!(
-            map_reasoning_effort(Some(ReasoningEffort::Max)),
-            Some("max")
-        );
-        // None = provider default (thinking on, effort "high"); field omitted.
-        assert_eq!(map_reasoning_effort(None), None);
-    }
-
-    #[test]
-    fn test_tiered_pricing_peak_and_off_peak() {
-        // Peak: flash $0.44 in / $1.32 out per 1M
-        let peak = calculate_cost(PRICING_PEAK, "deepseek-v4-flash", 1_000_000, 500_000).unwrap();
-        assert!((peak - (0.44 + 0.5 * 1.32)).abs() < 0.01);
-
-        // Off-peak is exactly half of peak
-        let off_peak =
-            calculate_cost(PRICING_OFF_PEAK, "deepseek-v4-flash", 1_000_000, 500_000).unwrap();
-        assert!((off_peak - peak / 2.0).abs() < 0.01);
-
-        // Peak: pro $1.32 in / $3.96 out per 1M
-        let pro = calculate_cost(PRICING_PEAK, "deepseek-v4-pro", 1_000_000, 500_000).unwrap();
-        assert!((pro - (1.32 + 0.5 * 3.96)).abs() < 0.01);
-
-        // Peak cache-hit rate: flash $0.014/1M
-        let cached =
-            calculate_cost_with_cache(PRICING_PEAK, "deepseek-v4-flash", 0, 1_000_000, 0).unwrap();
-        assert!((cached - 0.014).abs() < 0.0001);
-    }
-
-    #[test]
-    fn test_pricing_table_at_selects_tier() {
-        use std::time::{Duration, SystemTime};
-
-        let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
-
-        // Monday 2026-08-17 00:00 UTC — walk a full weekday hour by hour.
-        let monday_midnight = 1_786_924_800_u64;
-        for hour in 0..24u64 {
-            let table = pricing_table_at(at(monday_midnight + hour * 3_600));
-            let expected = if is_peak_window(monday_midnight / 86_400, hour) {
-                PRICING_PEAK
-            } else {
-                PRICING_OFF_PEAK
-            };
-            assert_eq!(table, expected, "hour {} misclassified", hour);
-        }
-
-        // Saturday 2026-08-22 is off-peak for the entire day, including hours
-        // that would be peak on weekdays.
-        let saturday_midnight = monday_midnight + 5 * 86_400;
-        for hour in 0..24u64 {
-            assert_eq!(
-                pricing_table_at(at(saturday_midnight + hour * 3_600)),
-                PRICING_OFF_PEAK,
-                "Saturday hour {} must be off-peak",
-                hour
-            );
-        }
-    }
-
-    /// Deserializes real payload shapes on purpose: the bug this guards lived in
-    /// the `#[serde(default)]` fields, so constructing the struct by hand would
-    /// step right over it.
-    #[test]
-    fn test_split_prompt_tokens_handles_both_usage_shapes() {
-        let parse = |v: serde_json::Value| -> DeepSeekUsage { serde_json::from_value(v).unwrap() };
-
-        // Native shape — hit and miss both reported.
-        let native = parse(serde_json::json!({
-            "prompt_tokens": 1000, "completion_tokens": 10, "total_tokens": 1010,
-            "prompt_cache_hit_tokens": 400, "prompt_cache_miss_tokens": 600
-        }));
-        assert_eq!(split_prompt_tokens(&native), (600, 400));
-
-        // OpenAI-compatible shape — cached_tokens only, NO miss field anywhere.
-        // Reading the miss field directly yielded 0 here, so the whole uncached
-        // prompt was billed free and reported as 0 input tokens.
-        let compat = parse(serde_json::json!({
-            "prompt_tokens": 1000, "completion_tokens": 10, "total_tokens": 1010,
-            "prompt_tokens_details": {"cached_tokens": 400}
-        }));
-        assert_eq!(
-            split_prompt_tokens(&compat),
-            (600, 400),
-            "uncached prompt tokens must not bill as free"
-        );
-
-        // No cache information at all — every prompt token is a miss.
-        let plain = parse(serde_json::json!({
-            "prompt_tokens": 1000, "completion_tokens": 10, "total_tokens": 1010
-        }));
-        assert_eq!(split_prompt_tokens(&plain), (1000, 0));
-
-        // Inconsistent provider data must saturate, never underflow into a
-        // near-u64::MAX token count and a catastrophic charge.
-        let bogus = parse(serde_json::json!({
-            "prompt_tokens": 100, "completion_tokens": 1, "total_tokens": 101,
-            "prompt_tokens_details": {"cached_tokens": 500}
-        }));
-        assert_eq!(split_prompt_tokens(&bogus), (0, 500));
-    }
-
-    #[test]
-    fn test_thinking_block_extraction() {
-        // Test with reasoning_content present
-        let message_with_thinking = DeepSeekMessage {
-            role: "assistant".to_string(),
-            content: Some(serde_json::json!("The answer is 9.11")),
-            reasoning_content: Some("Let me compare 9.11 and 9.8. Converting to same decimal places: 9.11 vs 9.80. Clearly 9.80 > 9.11.".to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        };
-
-        // Verify reasoning_content is properly stored
-        assert!(message_with_thinking.reasoning_content.is_some());
-        let reasoning = message_with_thinking.reasoning_content.as_ref().unwrap();
-        assert_eq!(reasoning, "Let me compare 9.11 and 9.8. Converting to same decimal places: 9.11 vs 9.80. Clearly 9.80 > 9.11.");
-
-        // Test token estimation (length / 4)
-        let estimated_tokens = (reasoning.len() / 4) as u64;
-        assert!(estimated_tokens > 0);
-
-        // Test without reasoning_content
-        let message_without_thinking = DeepSeekMessage {
-            role: "assistant".to_string(),
-            content: Some(serde_json::json!("Hello")),
-            reasoning_content: None,
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        };
-
-        assert!(message_without_thinking.reasoning_content.is_none());
-
-        // Test with empty reasoning_content
-        let message_empty_thinking = DeepSeekMessage {
-            role: "assistant".to_string(),
-            content: Some(serde_json::json!("Hello")),
-            reasoning_content: Some("".to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        };
-
-        assert!(message_empty_thinking.reasoning_content.is_some());
-        assert!(message_empty_thinking
-            .reasoning_content
-            .as_ref()
-            .unwrap()
-            .is_empty());
-
-        // Test with null content (tool call response)
-        let message_tool_call = DeepSeekMessage {
-            role: "assistant".to_string(),
-            content: None,
-            reasoning_content: None,
-            tool_calls: Some(vec![DeepSeekToolCall {
-                id: "call_123".to_string(),
-                tool_type: "function".to_string(),
-                function: DeepSeekFunction {
-                    name: "get_weather".to_string(),
-                    arguments: "{}".to_string(),
-                },
-            }]),
-            tool_call_id: None,
-            name: None,
-        };
-
-        assert!(message_tool_call.content.is_none());
-        assert!(message_tool_call.tool_calls.is_some());
-    }
-
-    #[test]
-    fn test_convert_messages_reasoning_content_replay() {
-        use crate::llm::tool_calls::GenericToolCall;
-        use crate::llm::types::{Message, ThinkingBlock};
-
-        let tool_calls_json = serde_json::to_value(vec![GenericToolCall {
-            id: "call_123".to_string(),
-            name: "list_files".to_string(),
-            arguments: serde_json::json!({"path": "."}),
-            meta: None,
-        }])
-        .unwrap();
-
-        // Assistant turn with tool_calls + thinking → reasoning_content must be replayed.
-        let assistant_with_tools = Message {
-            role: "assistant".to_string(),
-            content: String::new(),
-            timestamp: 0,
-            cached: false,
-            cache_ttl: None,
-            tool_call_id: None,
-            name: None,
-            tool_calls: Some(tool_calls_json.clone()),
-            images: None,
-            videos: None,
-            thinking: Some(ThinkingBlock {
-                content: "I should list the files first.".to_string(),
-                tokens: 8,
-            }),
-            id: None,
-        };
-        let converted = convert_messages(std::slice::from_ref(&assistant_with_tools));
-        assert_eq!(converted.len(), 1);
-        assert_eq!(
-            converted[0].reasoning_content.as_deref(),
-            Some("I should list the files first.")
-        );
-        assert!(converted[0].tool_calls.is_some());
-        assert!(converted[0].content.is_none());
-
-        // Assistant turn with tool_calls but no stored thinking → field omitted entirely (None).
-        // DeepSeek does not require reasoning_content when there was no thinking; unlike
-        // Moonshot it does NOT require an empty string sentinel.
-        let assistant_tools_no_thinking = Message {
-            thinking: None,
-            ..assistant_with_tools.clone()
-        };
-        let converted = convert_messages(std::slice::from_ref(&assistant_tools_no_thinking));
-        assert!(converted[0].reasoning_content.is_none());
-
-        // Assistant turn without tool_calls → reasoning_content omitted (DeepSeek
-        // ignores it on non-tool turns; sending it is harmless but unnecessary).
-        let assistant_plain = Message::assistant("Hello").with_thinking(ThinkingBlock {
-            content: "trivial".to_string(),
-            tokens: 1,
-        });
-        let converted = convert_messages(std::slice::from_ref(&assistant_plain));
-        assert!(converted[0].reasoning_content.is_none());
-
-        // User / tool / system messages → never carry reasoning_content.
-        let user_msg = Message::user("hi");
-        let tool_msg = Message::tool("ok", "call_123", "list_files");
-        let system_msg = Message::system("be helpful");
-        for msg in [user_msg, tool_msg, system_msg] {
-            let converted = convert_messages(std::slice::from_ref(&msg));
-            assert!(converted[0].reasoning_content.is_none());
-        }
-
-        // Verify JSON serialization: None is omitted, Some("") is preserved.
-        let json =
-            serde_json::to_value(&convert_messages(std::slice::from_ref(&assistant_with_tools))[0])
-                .unwrap();
-        assert_eq!(
-            json.get("reasoning_content").and_then(|v| v.as_str()),
-            Some("I should list the files first.")
-        );
-
-        let json_plain =
-            serde_json::to_value(&convert_messages(std::slice::from_ref(&assistant_plain))[0])
-                .unwrap();
-        assert!(json_plain.get("reasoning_content").is_none());
-    }
-}
+#[path = "deepseek_tests.rs"]
+mod tests;

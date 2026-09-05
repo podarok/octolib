@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 
 use super::super::types::InputType;
 use super::super::EmbeddingUsage;
-use super::{EmbeddingProvider, HTTP_CLIENT};
+use super::{http_client, EmbeddingProvider};
 
 /// Cached set of valid embedding model IDs fetched from the OpenRouter API.
 /// Populated once on first use; subsequent calls reuse the cached value.
@@ -33,7 +33,7 @@ async fn fetch_supported_models() -> Vec<String> {
         return Vec::new();
     };
 
-    let Ok(response) = HTTP_CLIENT
+    let Ok(response) = http_client()
         .get("https://openrouter.ai/api/v1/embeddings/models")
         .header("Authorization", format!("Bearer {}", api_key))
         .send()
@@ -173,7 +173,7 @@ impl OpenRouterProvider {
             "encoding_format": "float"
         });
 
-        let response = HTTP_CLIENT
+        let response = http_client()
             .post("https://openrouter.ai/api/v1/embeddings")
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
@@ -210,27 +210,5 @@ impl OpenRouterProvider {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_openrouter_provider_dimension_probe() {
-        if std::env::var("OPENROUTER_API_KEY").is_err() {
-            return;
-        }
-        let provider = OpenRouterProviderImpl::new("qwen/qwen3-embedding-8b")
-            .await
-            .unwrap();
-        assert_eq!(provider.get_dimension(), 4096);
-        assert!(provider.is_model_supported());
-    }
-
-    #[tokio::test]
-    async fn test_openrouter_invalid_model_rejected() {
-        if std::env::var("OPENROUTER_API_KEY").is_err() {
-            return;
-        }
-        let result = OpenRouterProviderImpl::new("not/a-real-model-xyz").await;
-        assert!(result.is_err());
-    }
-}
+#[path = "openrouter_tests.rs"]
+mod tests;

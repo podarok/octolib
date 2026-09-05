@@ -61,8 +61,9 @@ impl GoogleVertexProvider {
 /// Matching is substring-based and first-match-wins: keep "-lite"/"-pro" variants
 /// before their shorter prefixes.
 pub(super) const PRICING: &[PricingTuple] = &[
-    // Gemini 3.7 / 3.6 series — introductory pricing through Dec 31, 2026;
+    // Gemini 3.8 / 3.7 / 3.6 series — introductory pricing through Dec 31, 2026;
     // standard rates from Jan 1, 2027: input $1.50, output $7.50, cache read $0.15
+    ("gemini-3.8-flash", 0.75, 3.75, 0.75, 0.075),
     ("gemini-3.7-flash", 0.75, 3.75, 0.75, 0.075),
     ("gemini-3.6-flash", 0.75, 3.75, 0.75, 0.075),
     // Gemini 3.5 series (gemini-flash-latest points here)
@@ -239,10 +240,13 @@ pub(super) fn gemini_max_input_tokens(model: &str) -> usize {
 }
 
 /// Sampling-parameter support for Gemini models (shared with the google-studio
-/// provider). Gemini 3.6/3.7 dropped temperature/top_p/top_k support.
+/// provider). Gemini 3.6/3.7/3.8 dropped temperature/top_p/top_k support.
 pub(super) fn gemini_sampling_support(model: &str) -> SamplingSupport {
     let normalized = normalize_model_name(model);
-    if normalized.contains("gemini-3.6") || normalized.contains("gemini-3.7") {
+    if normalized.contains("gemini-3.6")
+        || normalized.contains("gemini-3.7")
+        || normalized.contains("gemini-3.8")
+    {
         SamplingSupport::NONE
     } else {
         SamplingSupport::ALL
@@ -470,6 +474,8 @@ impl AiProvider for GoogleVertexProvider {
                 provider_name: "google-vertex",
                 usage_fallback_cost: None,
                 use_response_cost: true,
+                enforces_response_schema: true,
+                supports_required_tool_choice: false,
             },
             self.supported_sampling_params(&params.model),
             api_key,
@@ -481,95 +487,5 @@ impl AiProvider for GoogleVertexProvider {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_supports_model_before_cache() {
-        let provider = GoogleVertexProvider::new();
-
-        // Before cache is populated, accept any non-empty model
-        assert!(provider.supports_model("gemini-1.5-pro"));
-        assert!(provider.supports_model("gemini-2.0-flash"));
-        assert!(provider.supports_model("anything-goes"));
-        assert!(!provider.supports_model(""));
-    }
-
-    #[test]
-    fn test_supports_caching() {
-        let provider = GoogleVertexProvider::new();
-        assert!(provider.supports_caching("gemini-3-flash"));
-        assert!(provider.supports_caching("gemini-2.5-pro"));
-        assert!(provider.supports_caching("gemini-2.5-flash"));
-        assert!(!provider.supports_caching("gemini-2.0-flash"));
-        assert!(!provider.supports_caching("gemini-1.5-pro"));
-    }
-
-    #[test]
-    fn test_model_pricing() {
-        let provider = GoogleVertexProvider::new();
-
-        let p = provider.get_model_pricing("gemini-3.1-pro").unwrap();
-        assert_eq!(p.input_price_per_1m, 2.00);
-        assert_eq!(p.output_price_per_1m, 12.00);
-
-        let p = provider.get_model_pricing("gemini-3.5-flash").unwrap();
-        assert_eq!(p.input_price_per_1m, 1.50);
-        assert_eq!(p.output_price_per_1m, 9.00);
-
-        let p = provider.get_model_pricing("gemini-3.7-flash").unwrap();
-        assert_eq!(p.input_price_per_1m, 0.75);
-        assert_eq!(p.output_price_per_1m, 3.75);
-
-        // Intro rate applies to 3.6 Flash too, through Dec 31, 2026
-        let p = provider.get_model_pricing("gemini-3.6-flash").unwrap();
-        assert_eq!(p.input_price_per_1m, 0.75);
-        assert_eq!(p.output_price_per_1m, 3.75);
-
-        let p = provider.get_model_pricing("gemini-2.5-flash").unwrap();
-        assert_eq!(p.input_price_per_1m, 0.30);
-        assert_eq!(p.output_price_per_1m, 2.50);
-
-        // "-lite" variants must not be shadowed by their shorter prefixes
-        let p = provider.get_model_pricing("gemini-3.1-flash-lite").unwrap();
-        assert_eq!(p.input_price_per_1m, 0.25);
-        assert_eq!(p.output_price_per_1m, 1.50);
-
-        let p = provider.get_model_pricing("gemini-3.5-flash-lite").unwrap();
-        assert_eq!(p.input_price_per_1m, 0.30);
-        assert_eq!(p.output_price_per_1m, 2.50);
-
-        // Unknown models return None (no fallback to zero)
-        assert!(provider.get_model_pricing("gemma-3-27b").is_none());
-    }
-
-    #[test]
-    fn test_max_input_tokens_fallback() {
-        let provider = GoogleVertexProvider::new();
-        assert_eq!(provider.get_max_input_tokens("gemini-3-flash"), 1_048_576);
-        assert_eq!(provider.get_max_input_tokens("gemini-2.5-pro"), 1_048_576);
-        assert_eq!(provider.get_max_input_tokens("gemini-1.5-pro"), 1_000_000);
-        assert_eq!(provider.get_max_input_tokens("text-bison"), 8_192);
-    }
-
-    #[test]
-    fn test_sampling_params() {
-        let provider = GoogleVertexProvider::new();
-        assert_eq!(
-            provider.supported_sampling_params("gemini-3.7-flash"),
-            SamplingSupport::NONE
-        );
-        assert_eq!(
-            provider.supported_sampling_params("gemini-3.6-flash"),
-            SamplingSupport::NONE
-        );
-        assert_eq!(
-            provider.supported_sampling_params("gemini-3.5-flash"),
-            SamplingSupport::ALL
-        );
-        assert_eq!(
-            provider.supported_sampling_params("gemini-2.5-pro"),
-            SamplingSupport::ALL
-        );
-    }
-}
+#[path = "google_vertex_tests.rs"]
+mod tests;
