@@ -118,6 +118,7 @@ pub(crate) enum ModelArchitecture {
 pub(crate) struct ModelConfig {
 	pub(crate) architectures: Option<Vec<String>>,
 	pub(crate) position_embedding_type: Option<String>,
+	pub(crate) max_position_embeddings: Option<usize>,
 	#[serde(rename = "_name_or_path")]
 	pub(crate) name_or_path: Option<String>,
 }
@@ -240,11 +241,24 @@ impl HuggingFaceModel {
 	pub async fn load(model_name: &str) -> Result<Self> {
 		let load_lock = model_load_lock(model_name).await;
 		let _load_guard = load_lock.lock().await;
-		Self::load_inner(model_name).await
+		Self::load_inner(model_name, false).await
 	}
 
-	async fn load_inner(model_name: &str) -> Result<Self> {
+	/// Like [`Self::load`], but weights and compute in f16 when the device is Metal (half the
+	/// memory, faster matmuls); on CPU it stays f32. Pooling and the output are always f32.
+	pub async fn load_f16(model_name: &str) -> Result<Self> {
+		let load_lock = model_load_lock(model_name).await;
+		let _load_guard = load_lock.lock().await;
+		Self::load_inner(model_name, true).await
+	}
+
+	async fn load_inner(model_name: &str, f16: bool) -> Result<Self> {
 		let device = embedding_device()?;
+		let dtype = if f16 && device.is_metal() {
+			DType::F16
+		} else {
+			DType::F32
+		};
 
 		// Use our custom cache directory for consistency with FastEmbed
 		// Set HF_HOME environment variable to control where models are downloaded
@@ -360,6 +374,24 @@ impl HuggingFaceModel {
 
 		let architecture = ModelArchitecture::from_config(&model_config)?;
 
+		// Absolute-position encoders fail on inputs past their position table, so cap the
+		// tokenizer the way `transformers` does (`truncation=True`), unless tokenizer.json sets it.
+		// RoBERTa / XLM-R offset positions by padding_idx + 1, which costs two slots.
+		let mut tokenizer = tokenizer;
+		let max_tokens = match (&architecture, model_config.max_position_embeddings) {
+			(ModelArchitecture::Roberta, Some(n)) => Some(n.saturating_sub(2)),
+			(ModelArchitecture::Bert, Some(n)) => Some(n),
+			_ => None,
+		};
+		if let (Some(max_length), None) = (max_tokens, tokenizer.get_truncation()) {
+			tokenizer
+				.with_truncation(Some(tokenizers::TruncationParams {
+					max_length,
+					..Default::default()
+				}))
+				.map_err(|e| anyhow::anyhow!("Failed to set tokenizer truncation: {}", e))?;
+		}
+
 		// Load model weights - only support safetensors for now
 		let mut weights = if weights_path.to_string_lossy().ends_with(".safetensors") {
 			candle_core::safetensors::load(&weights_path, &device)?
@@ -398,7 +430,19 @@ impl HuggingFaceModel {
 			}
 		}
 
-		let var_builder = VarBuilder::from_tensors(weights, DType::F32, &device);
+		// Older BERT-family exports (e.g. multilingual-e5 derivatives) name LayerNorm params
+		// gamma/beta; candle's layer_norm loads weight/bias.
+		if weights
+			.keys()
+			.any(|k| k.ends_with("LayerNorm.gamma") || k.ends_with("LayerNorm.beta"))
+		{
+			weights = weights
+				.into_iter()
+				.map(|(k, v)| (rename_legacy_layer_norm(&k), v))
+				.collect();
+		}
+
+		let var_builder = VarBuilder::from_tensors(weights, dtype, &device);
 
 		// Create model based on detected architecture
 		let backend = match architecture {
@@ -575,6 +619,8 @@ impl HuggingFaceModel {
 		// candle's mul requires exact shape match (no implicit broadcasting), so we expand the mask
 		// to (batch, seq_len, hidden_size) before multiplying with hidden_states.
 		// We keep the unexpanded mask to compute the token count for mean pooling.
+		// Pool in f32 even when the model runs in f16 (sums over 512 tokens overflow f16 range).
+		let hidden_states = &hidden_states.to_dtype(DType::F32)?;
 		let mask_f32 = attention_mask.to_dtype(DType::F32)?; // (batch, seq_len)
 		let mask_expanded = mask_f32
 			.unsqueeze(2)? // (batch, seq_len, 1)
@@ -595,7 +641,9 @@ impl HuggingFaceModel {
 	/// Qwen3 Embedding uses the final hidden state, followed by L2 normalization.
 	fn last_token_pool_and_normalize(hidden_states: &Tensor) -> Result<Vec<f32>> {
 		let (_, sequence_length, _) = hidden_states.dims3()?;
-		let last_token = hidden_states.narrow(1, sequence_length.saturating_sub(1), 1)?;
+		let last_token = hidden_states
+			.narrow(1, sequence_length.saturating_sub(1), 1)?
+			.to_dtype(DType::F32)?;
 		let norm = last_token.sqr()?.sum_keepdim(2)?.sqrt()?;
 		Ok(last_token
 			.broadcast_div(&norm)?
@@ -654,7 +702,7 @@ impl HuggingFaceProvider {
 			}
 		}
 
-		let model = HuggingFaceModel::load_inner(model_name)
+		let model = HuggingFaceModel::load_inner(model_name, false)
 			.await
 			.with_context(|| format!("Failed to load HuggingFace model: {}", model_name))?;
 
@@ -911,6 +959,17 @@ impl EmbeddingProvider for HuggingFaceProviderImpl {
 		// For HuggingFace, we support many models, so return true for most cases
 		// The actual validation happens when trying to load the model
 		true
+	}
+}
+
+#[cfg(feature = "huggingface")]
+fn rename_legacy_layer_norm(key: &str) -> String {
+	if let Some(p) = key.strip_suffix("LayerNorm.gamma") {
+		format!("{p}LayerNorm.weight")
+	} else if let Some(p) = key.strip_suffix("LayerNorm.beta") {
+		format!("{p}LayerNorm.bias")
+	} else {
+		key.to_string()
 	}
 }
 
