@@ -1,16 +1,3 @@
-// Copyright 2026 Muvon Un Limited
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 
 //! Encoder-only XLM-RoBERTa for embeddings.
 //!
@@ -45,8 +32,6 @@ impl Embeddings {
 
 	fn forward(&self, input_ids: &Tensor, token_type_ids: &Tensor) -> Result<Tensor> {
 		let x = (self.word.forward(input_ids)? + self.token_type.forward(token_type_ids)?)?;
-		// Positions count real tokens from padding_idx + 1; pads keep padding_idx (HF
-		// create_position_ids_from_input_ids). Counted in u32/f32, exact at any length.
 		let real = input_ids.ne(self.padding_idx)?.to_dtype(DType::F32)?;
 		let pos = ((real.cumsum(1)? * &real)? + self.padding_idx as f64)?.to_dtype(DType::U32)?;
 		self.layer_norm.forward(&x.broadcast_add(&self.position.forward(&pos)?)?)
@@ -98,7 +83,6 @@ impl Layer {
 		let v = self.split_heads(&self.value.forward(x)?)?;
 		let scale = 1.0 / (self.head_dim as f64).sqrt();
 		let ctx = if x.device().is_metal() {
-			// Fused Metal kernel; the mask is a stride-0 view, never materialised per head.
 			let mask = bias.broadcast_as((b, self.heads, l, l))?;
 			candle_nn::ops::sdpa(&q, &k, &v, Some(&mask), false, scale as f32, 1.0)?
 		} else {

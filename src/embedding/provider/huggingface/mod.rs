@@ -1,45 +1,3 @@
-// Copyright 2026 Muvon Un Limited
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-/*!
- * HuggingFace Provider Implementation
- *
- * This module provides local embedding generation using HuggingFace models via the Candle library.
- * It supports multiple model architectures with safetensors format from the HuggingFace Hub.
- *
- * Supported architectures:
- * - BERT: Standard BERT models (bert-base-uncased, sentence-transformers/all-MiniLM-L6-v2)
- * - RoBERTa: RoBERTa/XLM-RoBERTa models (microsoft/codebert-base, xlm-roberta-base)
- * - MPNet: MPNet models with relative position bias (sentence-transformers/all-mpnet-base-v2)
- * - JinaBert: Jina embedding models with ALiBi position embeddings (jinaai/jina-embeddings-v2-base-*)
- * - Qwen2: Qwen2 decoder models for embeddings (jinaai/jina-code-embeddings-1.5b)
- *
- * Key features:
- * - Automatic architecture detection from config.json
- * - Automatic model downloading and caching
- * - Local CPU-based inference (GPU support can be added)
- * - Thread-safe model cache for efficient reuse
- * - Mean pooling and L2 normalization for sentence embeddings
- * - Full compatibility with provider:model syntax
- *
- * Usage:
- * - Set provider: `octocode config --embedding-provider huggingface`
- * - Set models: `octocode config --code-embedding-model "huggingface:jinaai/jina-embeddings-v2-base-code"`
- * - Popular models: jinaai/jina-embeddings-v2-base-code, jinaai/jina-code-embeddings-1.5b
- *
- * Models are automatically downloaded to the system cache directory and reused across sessions.
- */
 
 mod jina_code_bert;
 mod mpnet;
@@ -141,7 +99,6 @@ impl ModelArchitecture {
 
 		let arch = &architectures[0];
 		match arch.as_str() {
-            // BERT variants — check position_embedding_type to distinguish Jina (ALiBi) from standard BERT
             "BertModel"
             | "BertForMaskedLM"
             | "BertForSequenceClassification"
@@ -152,7 +109,6 @@ impl ModelArchitecture {
                     .map(|t| t == "alibi")
                     .unwrap_or(false)
                 {
-                    // Distinguish QK-post-norm variant (e.g. jina-embeddings-v2-base-code)
                     if config
                         .name_or_path
                         .as_deref()
@@ -168,7 +124,6 @@ impl ModelArchitecture {
                 }
             }
 
-            // RoBERTa / XLM-RoBERTa variants
             "RobertaModel"
             | "RobertaForMaskedLM"
             | "RobertaForSequenceClassification"
@@ -176,11 +131,9 @@ impl ModelArchitecture {
             | "XLMRobertaForMaskedLM"
             | "XLMRobertaForSequenceClassification" => Ok(Self::Roberta),
 
-            // Jina BERT variants (explicit Jina architecture names)
             "JinaBertModel"
             | "JinaBertForMaskedLM"
             | "JinaBertForSequenceClassification" => {
-                // Explicit Jina architecture — also check for QK-post-norm
                 if config
                     .name_or_path
                     .as_deref()
@@ -193,13 +146,10 @@ impl ModelArchitecture {
                 }
             }
 
-            // Qwen2 variants
             "Qwen2ForCausalLM" | "Qwen2Model" | "Qwen2ForSequenceClassification" => Ok(Self::Qwen2),
 
-            // Qwen3 variants
             "Qwen3ForCausalLM" | "Qwen3Model" | "Qwen3ForSequenceClassification" => Ok(Self::Qwen3),
 
-            // MPNet variants
             "MPNetModel"
             | "MPNetForMaskedLM"
             | "MPNetForSequenceClassification"
@@ -220,9 +170,7 @@ enum Backend {
 	Bert(BertModel),
 	Roberta(XLMRobertaEncoder),
 	JinaBert(JinaBertModel),
-	// Qwen2Model::forward takes &mut self, so wrap in Mutex for shared access
 	Qwen2(std::sync::Mutex<Qwen2Model>),
-	// Qwen3 maintains a KV cache during inference. Clone its empty base per input.
 	Qwen3(Qwen3Model),
 	JinaCodeBert(JinaCodeBertModel),
 	MPNet(MPNetModel),
@@ -263,31 +211,21 @@ impl HuggingFaceModel {
 			DType::F32
 		};
 
-		// Use our custom cache directory for consistency with FastEmbed
-		// Set HF_HOME environment variable to control where models are downloaded
 		let cache_dir = crate::storage::get_model_cache_dir().context("Failed to get HuggingFace cache directory")?;
 
-		// Set the HuggingFace cache directory via environment variable
 		std::env::set_var("HF_HOME", &cache_dir);
 
-		// Download model files from HuggingFace Hub with proper error handling.
-		// Disable progress bars — callers wrap downloads in their own UI
-		// (octomind shows a generic "Working …" spinner; we don't want
-		// hf-hub's indicatif bar fighting with it for the terminal).
 		let api = ApiBuilder::new()
 			.with_progress(false)
 			.build()
 			.context("Failed to initialize HuggingFace API")?;
 		let repo = api.repo(Repo::new(model_name.to_string(), RepoType::Model));
 
-		// Download required files with enhanced error handling
 		let config_path = repo
 			.get("config.json")
 			.await
 			.with_context(|| format!("Failed to download config.json for model: {}", model_name))?;
 
-		// hf_hub materializes every file under `snapshots/<commit sha>/`, so the
-		// parent dir of any fetched file names the exact revision being loaded.
 		let revision = config_path
 			.parent()
 			.and_then(|dir| dir.file_name())
@@ -301,21 +239,15 @@ impl HuggingFaceModel {
 				)
 			})?;
 
-		// Load tokenizer - try different formats
 		let tokenizer = if let Ok(tokenizer_json_path) = repo.get("tokenizer.json").await {
-			// Direct tokenizer.json file (most models)
 			Tokenizer::from_file(tokenizer_json_path).map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?
 		} else {
-			// Try to build tokenizer from components (for models like microsoft/codebert-base)
-			// Check for RoBERTa-style tokenizer (vocab.json + merges.txt)
 			if let (Ok(vocab_path), Ok(merges_path)) = (repo.get("vocab.json").await, repo.get("merges.txt").await) {
-				// Build RoBERTa/GPT2-style BPE tokenizer using BPE::from_file
 				use tokenizers::{
 					models::bpe::BPE, normalizers, pre_tokenizers::byte_level::ByteLevel,
 					processors::roberta::RobertaProcessing,
 				};
 
-				// Use BPE::from_file which handles the vocab and merges loading
 				let bpe = BPE::from_file(
 					vocab_path
 						.to_str()
@@ -330,19 +262,16 @@ impl HuggingFaceModel {
 
 				let mut tokenizer = Tokenizer::new(bpe);
 
-				// Add ByteLevel pre-tokenizer (for RoBERTa)
 				tokenizer.with_pre_tokenizer(Some(ByteLevel::default()));
 
-				// Add RoBERTa post-processing
 				let post_processor = RobertaProcessing::new(
-					("</s>".to_string(), 2), // SEP token
-					("<s>".to_string(), 0),  // CLS token
+					("</s>".to_string(), 2),
+					("<s>".to_string(), 0),
 				)
 				.trim_offsets(false)
 				.add_prefix_space(true);
 				tokenizer.with_post_processor(Some(post_processor));
 
-				// Add normalizer
 				let normalizer = normalizers::Sequence::new(vec![normalizers::Strip::new(true, true).into()]);
 				tokenizer
 					.with_normalizer(Some(normalizer))
@@ -359,7 +288,6 @@ impl HuggingFaceModel {
 			}
 		};
 
-		// Try different weight file formats
 		let weights_path = if let Ok(path) = repo.get("model.safetensors").await {
 			path
 		} else if let Ok(path) = repo.get("pytorch_model.bin").await {
@@ -370,16 +298,12 @@ impl HuggingFaceModel {
 			));
 		};
 
-		// Load configuration and detect architecture
 		let config_content = std::fs::read_to_string(&config_path)?;
 		let model_config: ModelConfig = serde_json::from_str(&config_content)
 			.with_context(|| "Failed to parse config.json for architecture detection")?;
 
 		let architecture = ModelArchitecture::from_config(&model_config)?;
 
-		// Absolute-position encoders fail on inputs past their position table, so cap the
-		// tokenizer the way `transformers` does (`truncation=True`), unless tokenizer.json sets it.
-		// RoBERTa / XLM-R offset positions by padding_idx + 1, which costs two slots.
 		let mut tokenizer = tokenizer;
 		let max_tokens = match (&architecture, model_config.max_position_embeddings) {
 			(ModelArchitecture::Roberta, Some(n)) => Some(n.saturating_sub(2)),
@@ -395,7 +319,6 @@ impl HuggingFaceModel {
 				.map_err(|e| anyhow::anyhow!("Failed to set tokenizer truncation: {}", e))?;
 		}
 
-		// Load model weights - only support safetensors for now
 		let mut weights = if weights_path.to_string_lossy().ends_with(".safetensors") {
 			candle_core::safetensors::load(&weights_path, &device)?
 		} else {
@@ -404,7 +327,6 @@ impl HuggingFaceModel {
 			));
 		};
 
-		// Qwen decoder models may omit Candle's required `model.` prefix.
 		if matches!(architecture, ModelArchitecture::Qwen2 | ModelArchitecture::Qwen3) {
 			let needs_prefix = weights
 				.keys()
@@ -418,9 +340,6 @@ impl HuggingFaceModel {
 			}
 		}
 
-		// For MPNet models, strip "mpnet." prefix if present
-		// sentence-transformers models store weights as "mpnet.embeddings.*", "mpnet.encoder.*"
-		// but our MPNetModel expects "embeddings.*", "encoder.*"
 		if matches!(architecture, ModelArchitecture::MPNet) {
 			let has_prefix = weights.keys().any(|k| k.starts_with("mpnet."));
 			if has_prefix {
@@ -433,8 +352,6 @@ impl HuggingFaceModel {
 			}
 		}
 
-		// Older BERT-family exports (e.g. multilingual-e5 derivatives) name LayerNorm params
-		// gamma/beta; candle's layer_norm loads weight/bias.
 		if weights
 			.keys()
 			.any(|k| k.ends_with("LayerNorm.gamma") || k.ends_with("LayerNorm.beta"))
@@ -447,7 +364,6 @@ impl HuggingFaceModel {
 
 		let var_builder = VarBuilder::from_tensors(weights, dtype, &device);
 
-		// Create model based on detected architecture
 		let backend = match architecture {
 			ModelArchitecture::Bert => {
 				let config: BertConfig = serde_json::from_str(&config_content)
@@ -537,7 +453,6 @@ impl HuggingFaceModel {
 						.map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 					let tokens = encoding.get_ids();
 					let token_ids = Tensor::new(tokens, device)?.unsqueeze(0)?;
-					// BertModel.forward: (input_ids, token_type_ids, attention_mask)
 					let token_type_ids = Tensor::zeros_like(&token_ids)?;
 					let attention_mask = Tensor::ones((1, tokens.len()), DType::U8, device)?;
 					let output = model.forward(&token_ids, &token_type_ids, Some(&attention_mask))?;
@@ -550,7 +465,6 @@ impl HuggingFaceModel {
 						.map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 					let tokens = encoding.get_ids();
 					let token_ids = Tensor::new(tokens, device)?.unsqueeze(0)?;
-					// JinaBertModel.forward: (input_ids) only
 					let output = model.forward(&token_ids)?;
 					let attention_mask = Tensor::ones((1, tokens.len()), DType::U8, device)?;
 					Self::mean_pool_and_normalize(&output, &attention_mask)?
@@ -561,7 +475,6 @@ impl HuggingFaceModel {
 						.map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 					let tokens = encoding.get_ids();
 					let token_ids = Tensor::new(tokens, device)?.unsqueeze(0)?;
-					// JinaCodeBertModel.forward: (input_ids) only — same interface as JinaBert
 					let output = model.forward(&token_ids)?;
 					let attention_mask = Tensor::ones((1, tokens.len()), DType::U8, device)?;
 					Self::mean_pool_and_normalize(&output, &attention_mask)?
@@ -572,7 +485,6 @@ impl HuggingFaceModel {
 						.map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 					let tokens = encoding.get_ids();
 					let token_ids = Tensor::new(tokens, device)?.unsqueeze(0)?;
-					// Qwen2Model.forward takes &mut self, so lock the mutex
 					let output = model
 						.lock()
 						.map_err(|e| anyhow::anyhow!("Qwen2 model mutex poisoned: {}", e))?
@@ -595,7 +507,6 @@ impl HuggingFaceModel {
 						.map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 					let tokens = encoding.get_ids();
 					let token_ids = Tensor::new(tokens, device)?.unsqueeze(0)?;
-					// MPNetModel.forward: (input_ids) only — position bias computed internally
 					let output = model.forward(&token_ids)?;
 					let attention_mask = Tensor::ones((1, tokens.len()), DType::U8, device)?;
 					Self::mean_pool_and_normalize(&output, &attention_mask)?
@@ -654,23 +565,16 @@ impl HuggingFaceModel {
 
 	/// Mean pooling + L2 normalization, one vector per batch row
 	fn mean_pool_batch(hidden_states: &Tensor, attention_mask: &Tensor) -> Result<Vec<Vec<f32>>> {
-		// Convert attention mask to f32.
-		// candle's mul requires exact shape match (no implicit broadcasting), so we expand the mask
-		// to (batch, seq_len, hidden_size) before multiplying with hidden_states.
-		// We keep the unexpanded mask to compute the token count for mean pooling.
-		// Pool in f32 even when the model runs in f16 (sums over 512 tokens overflow f16 range).
 		let hidden_states = &hidden_states.to_dtype(DType::F32)?;
-		let mask_f32 = attention_mask.to_dtype(DType::F32)?; // (batch, seq_len)
+		let mask_f32 = attention_mask.to_dtype(DType::F32)?;
 		let mask_expanded = mask_f32
-			.unsqueeze(2)? // (batch, seq_len, 1)
-			.expand(hidden_states.shape())?; // (batch, seq_len, hidden_size)
+			.unsqueeze(2)?
+			.expand(hidden_states.shape())?;
 		let masked = hidden_states.mul(&mask_expanded)?;
-		let sum_hidden = masked.sum(1)?; // (batch, hidden_size)
-								   // sum_mask is (batch, 1) — use broadcast_div since candle's Div requires exact shape match
-		let sum_mask = mask_f32.sum_keepdim(1)?; // (batch, 1)
-		let mean_pooled = sum_hidden.broadcast_div(&sum_mask)?; // (batch, hidden_size)
+		let sum_hidden = masked.sum(1)?;
+		let sum_mask = mask_f32.sum_keepdim(1)?;
+		let mean_pooled = sum_hidden.broadcast_div(&sum_mask)?;
 
-		// L2 normalize — norm is (batch, 1), broadcast_div handles the shape mismatch
 		let norm = mean_pooled.sqr()?.sum_keepdim(1)?.sqrt()?;
 		let normalized = mean_pooled.broadcast_div(&norm)?;
 
@@ -729,11 +633,9 @@ impl HuggingFaceProvider {
 			}
 		}
 
-		// Coordinate the first load per model. Different models can still load in parallel.
 		let load_lock = model_load_lock(model_name).await;
 		let _load_guard = load_lock.lock().await;
 
-		// Another request may have populated the cache while this one was waiting.
 		{
 			let cache = MODEL_CACHE.read().await;
 			if let Some(model) = cache.get(model_name) {
@@ -747,7 +649,6 @@ impl HuggingFaceProvider {
 
 		let model_arc = Arc::new(model);
 
-		// Add to cache
 		{
 			let mut cache = MODEL_CACHE.write().await;
 			cache.insert(model_name.to_string(), model_arc.clone());
@@ -760,7 +661,6 @@ impl HuggingFaceProvider {
 	pub async fn generate_embeddings(contents: &str, model: &str) -> Result<Vec<f32>> {
 		let model_instance = Self::get_model(model).await?;
 
-		// Run encoding in a blocking task to avoid blocking async runtime
 		let contents = contents.to_string();
 		let result = tokio::task::spawn_blocking(move || model_instance.encode(&contents)).await??;
 
@@ -771,14 +671,12 @@ impl HuggingFaceProvider {
 	pub async fn generate_embeddings_batch(texts: Vec<String>, model: &str) -> Result<Vec<Vec<f32>>> {
 		let model_instance = Self::get_model(model).await?;
 
-		// Run encoding in a blocking task to avoid blocking async runtime
 		let result = tokio::task::spawn_blocking(move || model_instance.encode_batch(&texts)).await??;
 
 		Ok(result)
 	}
 }
 
-// Stubs for when huggingface feature is disabled
 #[cfg(not(feature = "huggingface"))]
 use anyhow::Result;
 
@@ -836,10 +734,8 @@ impl HuggingFaceProviderImpl {
 	/// Get model dimension using Candle config structs (like examples)
 	#[cfg(feature = "huggingface")]
 	async fn get_dimension_from_config(model_name: &str) -> Result<usize> {
-		// Download config.json
 		let config_json = Self::download_config_direct(model_name).await?;
 
-		// Try different Candle config types - JinaBert first, then standard Bert
 		if let Ok(config) = Self::parse_as_jina_bert_config(&config_json) {
 			return Ok(config.hidden_size);
 		}
@@ -848,7 +744,6 @@ impl HuggingFaceProviderImpl {
 			return Ok(config.hidden_size);
 		}
 
-		// Fallback to JSON parsing
 		Self::parse_hidden_size_from_json(&config_json, model_name)
 	}
 
@@ -875,7 +770,6 @@ impl HuggingFaceProviderImpl {
 		let config: Value = serde_json::from_str(config_json)
 			.with_context(|| format!("Failed to parse config.json as JSON for model: {}", model_name))?;
 
-		// Try different field names that contain embedding dimensions
 		let dimension_fields = ["hidden_size", "d_model", "embedding_size", "dim"];
 
 		for field in &dimension_fields {
@@ -907,12 +801,10 @@ impl HuggingFaceProviderImpl {
 	async fn download_config_direct(model_name: &str) -> Result<String> {
 		use reqwest;
 
-		// Construct direct URL to config.json
 		let config_url = format!("https://huggingface.co/{}/raw/main/config.json", model_name);
 
 		tracing::debug!("Downloading config from: {}", config_url);
 
-		// Use reqwest for direct HTTP download
 		let client = reqwest::Client::new();
 		let response = client
 			.get(&config_url)
@@ -947,7 +839,6 @@ impl HuggingFaceProviderImpl {
 #[async_trait::async_trait]
 impl EmbeddingProvider for HuggingFaceProviderImpl {
 	async fn generate_embedding(&self, text: &str) -> Result<(Vec<f32>, EmbeddingUsage)> {
-		// In-process, local, always unpriced → cost None; tokens estimated (tiktoken).
 		let input_tokens = super::super::count_tokens(text) as u64;
 		let vector = HuggingFaceProvider::generate_embeddings(text, &self.model_name).await?;
 		Ok((
@@ -964,7 +855,6 @@ impl EmbeddingProvider for HuggingFaceProviderImpl {
 		texts: Vec<String>,
 		input_type: InputType,
 	) -> Result<(Vec<Vec<f32>>, EmbeddingUsage)> {
-		// Apply prefix manually for HuggingFace (doesn't support input_type API)
 		let processed_texts: Vec<String> = texts.into_iter().map(|text| input_type.apply_prefix(&text)).collect();
 		let input_tokens: u64 = processed_texts
 			.iter()
@@ -995,8 +885,6 @@ impl EmbeddingProvider for HuggingFaceProviderImpl {
 	}
 
 	fn is_model_supported(&self) -> bool {
-		// For HuggingFace, we support many models, so return true for most cases
-		// The actual validation happens when trying to load the model
 		true
 	}
 }
