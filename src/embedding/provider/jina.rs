@@ -19,56 +19,53 @@ use serde_json::{json, Value};
 
 use super::super::types::InputType;
 use super::super::EmbeddingUsage;
-use super::{EmbeddingProvider, HTTP_CLIENT};
+use super::{http_client, EmbeddingProvider};
 
 /// Jina provider implementation for trait
 pub struct JinaProviderImpl {
-    model_name: String,
-    dimension: usize,
+	model_name: String,
+	dimension: usize,
 }
 
 impl JinaProviderImpl {
-    pub fn new(model: &str) -> Result<Self> {
-        // Validate model first - fail fast if unsupported
-        let supported_models = [
-            "jina-embeddings-v5-text-small",
-            "jina-embeddings-v5-text-nano",
-            "jina-embeddings-v5-omni-small",
-            "jina-embeddings-v5-omni-nano",
-            "jina-embeddings-v4",
-            "jina-clip-v2",
-            "jina-embeddings-v3",
-            "jina-clip-v1",
-            "jina-embeddings-v2-base-es",
-            "jina-embeddings-v2-base-code",
-            "jina-embeddings-v2-base-de",
-            "jina-embeddings-v2-base-zh",
-            "jina-embeddings-v2-base-en",
-            "jina-embeddings-v2-small-en",
-            "jina-colbert-v2",
-            "jina-colbert-v2-96",
-            "jina-colbert-v2-64",
-            "jina-code-embeddings-0.5b",
-            "jina-code-embeddings-1.5b",
-        ];
+	pub fn new(model: &str) -> Result<Self> {
+		// Validate model first - fail fast if unsupported
+		let supported_models = [
+			"jina-embeddings-v5-text-small",
+			"jina-embeddings-v5-text-nano",
+			"jina-embeddings-v5-omni-small",
+			"jina-embeddings-v5-omni-nano",
+			"jina-embeddings-v4",
+			"jina-clip-v2",
+			"jina-embeddings-v3",
+			"jina-clip-v1",
+			"jina-embeddings-v2-base-es",
+			"jina-embeddings-v2-base-code",
+			"jina-embeddings-v2-base-de",
+			"jina-embeddings-v2-base-zh",
+			"jina-embeddings-v2-base-en",
+			"jina-colbert-v2",
+			"jina-code-embeddings-0.5b",
+			"jina-code-embeddings-1.5b",
+		];
 
-        if !supported_models.contains(&model) {
-            return Err(anyhow::anyhow!(
-                "Unsupported Jina model: '{}'. Supported models: {:?}",
-                model,
-                supported_models
-            ));
-        }
+		if !supported_models.contains(&model) {
+			return Err(anyhow::anyhow!(
+				"Unsupported Jina model: '{}'. Supported models: {:?}",
+				model,
+				supported_models
+			));
+		}
 
-        let dimension = Self::get_model_dimension(model);
-        Ok(Self {
-            model_name: model.to_string(),
-            dimension,
-        })
-    }
+		let dimension = Self::get_model_dimension(model);
+		Ok(Self {
+			model_name: model.to_string(),
+			dimension,
+		})
+	}
 
-    fn get_model_dimension(model: &str) -> usize {
-        match model {
+	fn get_model_dimension(model: &str) -> usize {
+		match model {
             // v5: Matryoshka-truncatable down to 32d, these are the API defaults.
             "jina-embeddings-v5-text-small" => 1024,
             "jina-embeddings-v5-text-nano" => 768,
@@ -83,225 +80,107 @@ impl JinaProviderImpl {
             "jina-embeddings-v2-base-de" => 768,
             "jina-embeddings-v2-base-zh" => 768,
             "jina-embeddings-v2-base-en" => 768,
-            "jina-embeddings-v2-small-en" => 512,
             "jina-colbert-v2" => 128,
-            "jina-colbert-v2-96" => 96,
-            "jina-colbert-v2-64" => 64,
             // Qwen2 hidden sizes: 0.5B -> 896, 1.5B -> 1536 (api.jina.ai/v1/models).
             "jina-code-embeddings-0.5b" => 896,
             "jina-code-embeddings-1.5b" => 1536,
             _ => unreachable!("Invalid Jina model '{}' passed to get_model_dimension - this is a bug as model should be validated in new()", model),
         }
-    }
+	}
 }
 
 #[async_trait::async_trait]
 impl EmbeddingProvider for JinaProviderImpl {
-    async fn generate_embedding(&self, text: &str) -> Result<(Vec<f32>, EmbeddingUsage)> {
-        JinaProvider::generate_embeddings(text, &self.model_name).await
-    }
+	async fn generate_embedding(&self, text: &str) -> Result<(Vec<f32>, EmbeddingUsage)> {
+		JinaProvider::generate_embeddings(text, &self.model_name).await
+	}
 
-    async fn generate_embeddings_batch(
-        &self,
-        texts: Vec<String>,
-        input_type: InputType,
-    ) -> Result<(Vec<Vec<f32>>, EmbeddingUsage)> {
-        // Apply prefix manually for Jina (doesn't support input_type API)
-        let processed_texts: Vec<String> = texts
-            .into_iter()
-            .map(|text| input_type.apply_prefix(&text))
-            .collect();
-        JinaProvider::generate_embeddings_batch(processed_texts, &self.model_name).await
-    }
+	async fn generate_embeddings_batch(
+		&self,
+		texts: Vec<String>,
+		input_type: InputType,
+	) -> Result<(Vec<Vec<f32>>, EmbeddingUsage)> {
+		// Apply prefix manually for Jina (doesn't support input_type API)
+		let processed_texts: Vec<String> = texts.into_iter().map(|text| input_type.apply_prefix(&text)).collect();
+		JinaProvider::generate_embeddings_batch(processed_texts, &self.model_name).await
+	}
 
-    fn get_dimension(&self) -> usize {
-        self.dimension
-    }
+	fn get_dimension(&self) -> usize {
+		self.dimension
+	}
 
-    fn is_model_supported(&self) -> bool {
-        // REAL validation - only support actual Jina models
-        matches!(
-            self.model_name.as_str(),
-            "jina-embeddings-v5-text-small"
-                | "jina-embeddings-v5-text-nano"
-                | "jina-embeddings-v5-omni-small"
-                | "jina-embeddings-v5-omni-nano"
-                | "jina-embeddings-v4"
-                | "jina-clip-v2"
-                | "jina-embeddings-v3"
-                | "jina-clip-v1"
-                | "jina-embeddings-v2-base-es"
-                | "jina-embeddings-v2-base-code"
-                | "jina-embeddings-v2-base-de"
-                | "jina-embeddings-v2-base-zh"
-                | "jina-embeddings-v2-base-en"
-                | "jina-embeddings-v2-small-en"
-                | "jina-colbert-v2"
-                | "jina-colbert-v2-96"
-                | "jina-colbert-v2-64"
-                | "jina-code-embeddings-0.5b"
-                | "jina-code-embeddings-1.5b"
-        )
-    }
+	fn is_model_supported(&self) -> bool {
+		// REAL validation - only support actual Jina models
+		matches!(
+			self.model_name.as_str(),
+			"jina-embeddings-v5-text-small"
+				| "jina-embeddings-v5-text-nano"
+				| "jina-embeddings-v5-omni-small"
+				| "jina-embeddings-v5-omni-nano"
+				| "jina-embeddings-v4"
+				| "jina-clip-v2"
+				| "jina-embeddings-v3"
+				| "jina-clip-v1"
+				| "jina-embeddings-v2-base-es"
+				| "jina-embeddings-v2-base-code"
+				| "jina-embeddings-v2-base-de"
+				| "jina-embeddings-v2-base-zh"
+				| "jina-embeddings-v2-base-en"
+				| "jina-colbert-v2"
+				| "jina-code-embeddings-0.5b"
+				| "jina-code-embeddings-1.5b"
+		)
+	}
 }
 
 /// Jina provider implementation
 pub struct JinaProvider;
 
 impl JinaProvider {
-    pub async fn generate_embeddings(
-        contents: &str,
-        model: &str,
-    ) -> Result<(Vec<f32>, EmbeddingUsage)> {
-        let (vectors, usage) =
-            Self::generate_embeddings_batch(vec![contents.to_string()], model).await?;
-        let first = vectors
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("No embeddings found"))?;
-        Ok((first, usage))
-    }
+	pub async fn generate_embeddings(contents: &str, model: &str) -> Result<(Vec<f32>, EmbeddingUsage)> {
+		let (vectors, usage) = Self::generate_embeddings_batch(vec![contents.to_string()], model).await?;
+		let first = vectors
+			.into_iter()
+			.next()
+			.ok_or_else(|| anyhow::anyhow!("No embeddings found"))?;
+		Ok((first, usage))
+	}
 
-    pub async fn generate_embeddings_batch(
-        texts: Vec<String>,
-        model: &str,
-    ) -> Result<(Vec<Vec<f32>>, EmbeddingUsage)> {
-        let est_tokens: u64 = texts
-            .iter()
-            .map(|t| crate::embedding::count_tokens(t) as u64)
-            .sum();
-        let jina_api_key =
-            std::env::var("JINA_API_KEY").context("JINA_API_KEY environment variable not set")?;
+	pub async fn generate_embeddings_batch(texts: Vec<String>, model: &str) -> Result<(Vec<Vec<f32>>, EmbeddingUsage)> {
+		let est_tokens: u64 = texts.iter().map(|t| crate::embedding::count_tokens(t) as u64).sum();
+		let jina_api_key = std::env::var("JINA_API_KEY").context("JINA_API_KEY environment variable not set")?;
 
-        let response = HTTP_CLIENT
-            .post("https://api.jina.ai/v1/embeddings")
-            .header("Authorization", format!("Bearer {}", jina_api_key))
-            .json(&json!({
-                "input": texts,
-                "model": model,
-            }))
-            .send()
-            .await?;
+		let response = http_client()
+			.post("https://api.jina.ai/v1/embeddings")
+			.header("Authorization", format!("Bearer {}", jina_api_key))
+			.json(&json!({
+				"input": texts,
+				"model": model,
+			}))
+			.send()
+			.await?;
 
-        let response_json: Value = response.json().await?;
+		let response_json: Value = response.json().await?;
 
-        let embeddings = response_json["data"]
-            .as_array()
-            .context("Failed to get embeddings array")?
-            .iter()
-            .map(|data| {
-                data["embedding"]
-                    .as_array()
-                    .unwrap_or(&Vec::new())
-                    .iter()
-                    .map(|v| v.as_f64().unwrap_or_default() as f32)
-                    .collect()
-            })
-            .collect();
+		let embeddings = response_json["data"]
+			.as_array()
+			.context("Failed to get embeddings array")?
+			.iter()
+			.map(|data| {
+				data["embedding"]
+					.as_array()
+					.unwrap_or(&Vec::new())
+					.iter()
+					.map(|v| v.as_f64().unwrap_or_default() as f32)
+					.collect()
+			})
+			.collect();
 
-        let input_tokens = response_json["usage"]["total_tokens"]
-            .as_u64()
-            .unwrap_or(est_tokens);
-        Ok((embeddings, EmbeddingUsage::from_tokens(model, input_tokens)))
-    }
+		let input_tokens = response_json["usage"]["total_tokens"].as_u64().unwrap_or(est_tokens);
+		Ok((embeddings, EmbeddingUsage::from_tokens(model, input_tokens)))
+	}
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_jina_provider_creation() {
-        // Test valid models
-        assert!(JinaProviderImpl::new("jina-embeddings-v4").is_ok());
-        assert!(JinaProviderImpl::new("jina-embeddings-v3").is_ok());
-        assert!(JinaProviderImpl::new("jina-clip-v2").is_ok());
-        assert!(JinaProviderImpl::new("jina-colbert-v2").is_ok());
-        assert!(JinaProviderImpl::new("jina-code-embeddings-0.5b").is_ok());
-
-        // Test invalid model
-        assert!(JinaProviderImpl::new("invalid-model").is_err());
-    }
-
-    #[test]
-    fn test_jina_model_dimensions() {
-        assert_eq!(
-            JinaProviderImpl::new("jina-embeddings-v4")
-                .unwrap()
-                .get_dimension(),
-            2048
-        );
-        assert_eq!(
-            JinaProviderImpl::new("jina-embeddings-v3")
-                .unwrap()
-                .get_dimension(),
-            1024
-        );
-        assert_eq!(
-            JinaProviderImpl::new("jina-clip-v2")
-                .unwrap()
-                .get_dimension(),
-            1024
-        );
-        assert_eq!(
-            JinaProviderImpl::new("jina-embeddings-v2-small-en")
-                .unwrap()
-                .get_dimension(),
-            512
-        );
-        assert_eq!(
-            JinaProviderImpl::new("jina-colbert-v2")
-                .unwrap()
-                .get_dimension(),
-            128
-        );
-        assert_eq!(
-            JinaProviderImpl::new("jina-colbert-v2-96")
-                .unwrap()
-                .get_dimension(),
-            96
-        );
-        assert_eq!(
-            JinaProviderImpl::new("jina-colbert-v2-64")
-                .unwrap()
-                .get_dimension(),
-            64
-        );
-        assert_eq!(
-            JinaProviderImpl::new("jina-code-embeddings-0.5b")
-                .unwrap()
-                .get_dimension(),
-            896
-        );
-        assert_eq!(
-            JinaProviderImpl::new("jina-code-embeddings-1.5b")
-                .unwrap()
-                .get_dimension(),
-            1536
-        );
-    }
-
-    #[test]
-    fn test_jina_model_validation() {
-        let models = [
-            "jina-embeddings-v5-text-small",
-            "jina-embeddings-v5-text-nano",
-            "jina-embeddings-v5-omni-small",
-            "jina-embeddings-v5-omni-nano",
-            "jina-embeddings-v4",
-            "jina-embeddings-v3",
-            "jina-clip-v2",
-            "jina-clip-v1",
-            "jina-embeddings-v2-small-en",
-            "jina-colbert-v2",
-            "jina-colbert-v2-96",
-            "jina-colbert-v2-64",
-            "jina-code-embeddings-0.5b",
-            "jina-code-embeddings-1.5b",
-        ];
-        for model in models {
-            let provider = JinaProviderImpl::new(model).unwrap();
-            assert!(provider.is_model_supported());
-        }
-    }
-}
+#[path = "jina_tests.rs"]
+mod tests;

@@ -1,12 +1,14 @@
 #! Octolib — AI Provider Library Guide
 
-Rust library providing a unified interface to multiple AI providers (OpenAI, Anthropic, OpenRouter, NVIDIA, Ollama, Google Vertex, Google Studio, Amazon, Cloudflare, DeepSeek, Moonshot, Z.ai, BytePlus, Alibaba, Groq, Cerebras, Together, Featherless, Fireworks, Hetzner, OpenCode Zen/Go, OctoHub, CLI proxies). Handles chat completions, embeddings, reranking, cost tracking, caching, structured output, vision, and tool calls. No panics, no `println!`, always `Result`. Copyright year is **2026**.
+Rust library providing a unified interface to multiple AI providers (OpenAI, Anthropic, OpenRouter, NVIDIA, Ollama, Google Vertex, Google Studio, Amazon, Cloudflare, DeepSeek, Moonshot, Z.ai, BytePlus, Alibaba, Groq, Cerebras, Together, Featherless, Fireworks, Hetzner, Inception, Isoquant, Reflection, OpenCode Zen/Go, OctoHub, CLI proxies). Handles chat completions, embeddings, reranking, cost tracking, caching, structured output, vision, and tool calls. No panics, no `println!`, always `Result`. Copyright year is **2026**.
 
 ## Project Structure
 
 ```
 src/
 ├── lib.rs                          → Public re-exports (all public types live here)
+├── evaluation/factory.rs           → EvaluationProviderFactory::provider_setup_info() lists providers, credential variables, and callable model IDs
+├── terminal.rs                     → Opt-in `terminal` feature with a fuzzy list picker and hidden input
 ├── errors.rs                       → ProviderError, ConfigError, MessageError, ToolCallError + ErrorContext trait
 ├── storage.rs                      → Cache dirs for FastEmbed/HuggingFace models
 ├── llm/
@@ -22,7 +24,8 @@ src/
 │   ├── reference_capabilities.rs   → Baseline capabilities (vision, video, structured_output, context window)
 │   └── providers/
 │       ├── openai_compat.rs        → Shared OpenAI-compatible request/response layer; auto-passes reasoning_effort; also OpenAiCompatConfig, get_optional_api_key, get_api_url (internal, not pub)
-│       ├── shared.rs               → HTTP client (arc-swap pool), cache control helpers, tool call parsers
+│       ├── shared.rs               → Shared HTTP client access, cache control helpers, tool call parsers
+│       ├── streaming.rs            → Internal SSE framing and Chat/Messages/Responses accumulation
 │       ├── openai.rs               → Native — PRICING table, Responses API, OAuth support
 │       ├── anthropic.rs            → Native — PRICING table, caching, thinking blocks, OAuth support
 │       ├── google_vertex.rs        → Vertex AI — service-account auth, delegates to openai_compat; shared Gemini PRICING table + model-cache helpers
@@ -38,13 +41,17 @@ src/
 │       ├── nvidia.rs               → Proxy — delegates to openai_compat, reference pricing
 │       ├── cerebras.rs             → Proxy — delegates to openai_compat, reference pricing
 │       ├── together.rs             → Proxy — delegates to openai_compat, reference pricing
-│       ├── ollama.rs               → Proxy — delegates to openai_compat, reference pricing
+│       ├── ollama.rs               → Proxy — delegates to openai_compat, own PRICING for cloud rates with reference fallback, keep_alive pre-warm
 │       ├── local.rs                → Proxy — delegates to openai_compat, reference pricing
 │       ├── cloudflare.rs           → Proxy — delegates to openai_compat
 │       ├── openrouter.rs           → Proxy — delegates to openai_compat
 │       ├── octohub.rs              → Proxy — delegates to openai_compat
 │       ├── featherless.rs          → Proxy — delegates to openai_compat
 │       ├── hetzner.rs              → Proxy — delegates to openai_compat (free, experimental, fixed MODELS table)
+│       ├── inception.rs           → Native — PRICING table (Mercury diffusion LLMs, strict catalogue)
+│       ├── isoquant.rs             → Proxy — delegates to openai_compat (models read from `/v1/models`, zero data retention required)
+│       ├── reflection.rs           → Native — PRICING table (Beam, always reasons, strict catalogue)
+│       ├── tinker.rs               → Proxy — delegates to openai_compat (Inkling family + sampler checkpoints)
 │       ├── opencode.rs             → Proxy — Zen + Go providers, delegates to openai_compat (shared OPENCODE_API_KEY)
 │       ├── fireworks.rs            → Proxy — delegates to openai_compat (auto prefix-cache)
 │       └── cli/                    → CLI proxy: claude, codex, cursor, gemini, generic backends
@@ -61,6 +68,10 @@ src/
 examples/                           → One file per feature — use as integration test templates
 ```
 
+Sibling `*_tests.rs` files contain unit tests for each source module. Production
+files declare them with `#[cfg(test)]`, `#[path = "<name>_tests.rs"]`, and
+`mod tests;`; `mod.rs` uses `mod_tests.rs`.
+
 ## Where to Look
 
 | Task | Start here |
@@ -75,27 +86,145 @@ examples/                           → One file per feature — use as integrat
 | Fix capabilities (vision/context/structured) | `src/llm/reference_capabilities.rs` for proxies; override trait methods for native |
 | Add structured output to a provider | `supports_structured_output()` + `response_format` in request + parse `structured_output` |
 | Add caching to a provider | `supports_caching()` + cache headers in request + parse cache token fields |
+| Set or measure a provider's cache lifetime | `cache_lifetime()` in the provider file; see "Cache lifetime: measure it live" |
 | Configure reasoning / thinking effort | `src/llm/types.rs` → `ReasoningEffort` enum; per-provider mapping inside each `chat_completion()` |
 | Tool call handling | `src/llm/strategies.rs` → `AnthropicStrategy` / `OpenAIStrategy` |
 | Shared HTTP / cache helpers | `src/llm/providers/shared.rs` |
+| Internal upstream streaming | `src/llm/providers/streaming.rs`; provider defaults in `openai_compat::configure_streaming` |
 | Model format parsing | `src/llm/factory.rs` → `ProviderFactory::parse_model()` |
 | Public API surface | `src/lib.rs` re-exports |
 | Model name normalization | `src/llm/utils.rs` → `normalize_model_name`, `sanitize_model_name` |
+| Add or update unit tests | Sibling `<module>_tests.rs`; never put test bodies inline in production files |
+
+## Test Layout
+
+- Unit-test bodies must live in sibling files suffixed `_tests.rs`.
+- For `foo.rs`, use `foo_tests.rs` and declare it at the end of `foo.rs`:
+  ```rust
+  #[cfg(test)]
+  #[path = "foo_tests.rs"]
+  mod tests;
+  ```
+- For directory modules (`mod.rs`), use `mod_tests.rs` with the same declaration pattern.
+- If one source file needs multiple test modules, use descriptive names such as
+  `types_token_usage_split_tests.rs`; preserve the original module name in the declaration.
+- Keep `use super::*;` in the sibling module when tests need private implementation details.
+- `tests/` is reserved for cross-crate integration tests that use only the public API.
+- Test-only support helpers may remain `#[cfg(test)]` in a production module only when sibling
+  test modules need parent-level access; actual `#[test]`/`#[tokio::test]` functions never remain inline.
+- Every extracted or new `.rs` test file uses the standard 2026 copyright header.
 
 ## How Things Work
 
+### HTTP and internal streaming
+
+Reviewed against provider documentation on **2026-10-30**. Documentation support
+is not a live account/endpoint probe; custom base URLs and plan endpoints still
+need their own verification. Do not infer streaming support from a Cloudflare
+header or from the words "OpenAI compatible" alone.
+
+- Chat requests use the process-wide reqwest pool in `src/http.rs`: HTTP/1.1 or
+  negotiated HTTP/2, rustls, 20-second connect timeout, TCP keepalive, and a
+  15-second **idle pool** timeout. The idle pool timeout does not limit an active
+  response. Keep HTTP/2 PINGs disabled unless a specific host's policy warrants
+  them. Rebuild only for configuration changes, never after request errors.
+- Streaming is an **upstream transport detail**. `AiProvider::chat_completion`
+  still returns one accumulated `ProviderResponse`; OctoHub's public API and
+  `octohub:` adapter remain buffered. Internal SSE does not keep the separate
+  client-to-OctoHub HTTP response alive.
+- Supported paths send `stream: true`. `providers/streaming.rs` reads SSE
+  incrementally and assembles the normal response JSON for existing parsers.
+  Chat Completions uses indexed deltas and `[DONE]`; Messages uses content
+  blocks, cumulative usage, and `message_stop`; Responses uses the complete
+  `response.completed` or `response.incomplete` object. Preserve reasoning,
+  signatures, parallel tool arguments, cache tokens, IDs, costs and stop reasons.
+- A complete JSON response from a compatible endpoint is selected by its HTTP
+  Content-Type. Never recover from malformed SSE by trying JSON or resending
+  with streaming disabled. Reject malformed events, unfinished blocks/tools,
+  missing terminal events, and in-band errors; never return partial success.
+  Frames are bounded at 16 MiB and accumulated event data at 256 MiB per attempt.
+- Keep body reading and accumulation inside retry/cancellation boundaries.
+  Transport interruption and typed transient upstream errors may retry according
+  to caller settings; malformed streams and permanent upstream errors stop.
+  Preserve credential redaction. A configured request timeout covers connection,
+  headers and the entire body; `None` deliberately has no total deadline.
+- Request final usage only on endpoints that support the option. Usage updates
+  are snapshots, not counters to add. A `finish_reason` chunk can precede a
+  separate usage chunk: consume through `[DONE]`, including OpenRouter's repeated
+  finish reason on its accounting chunk.
+
+[Reqwest 0.12.28](https://docs.rs/reqwest/0.12.28/reqwest/struct.ClientBuilder.html)
+distinguishes total, read, connect and idle-pool timeouts.
+[Cloudflare's current limits](https://developers.cloudflare.com/fundamentals/reference/connection-limits/)
+list a 125-second origin proxy read timeout and 30-second write timeout. SSE
+helps only when the upstream actually emits timely data or heartbeat comments;
+TCP keepalive does not supply HTTP response bytes. This is not evidence that
+every provider is behind Cloudflare, nor a guarantee against slow time-to-first-byte.
+
+| Provider / current adapter | Default and provider evidence |
+|---|---|
+| OpenAI | Responses SSE; [terminal response events](https://developers.openai.com/api/reference/resources/responses/streaming-events) include full output and usage. |
+| xAI | Responses SSE; [streaming guide](https://docs.x.ai/developers/model-capabilities/text/streaming). Preserve encrypted reasoning and continuation IDs. |
+| Anthropic | Messages SSE; [streaming protocol](https://platform.claude.com/docs/en/build-with-claude/streaming), including cumulative usage, input JSON, thinking and signature deltas. |
+| MiniMax | Messages SSE on the existing Anthropic endpoint; [Anthropic compatibility](https://platform.minimax.io/docs/api-reference/text-anthropic-api). |
+| DeepSeek | Chat SSE with `stream_options.include_usage`; [Chat API](https://api-docs.deepseek.com/api/create-chat-completion). |
+| Moonshot/Kimi | Chat SSE with `stream_options.include_usage`; [Chat API](https://platform.kimi.ai/docs/api/chat). |
+| Z.ai | Chat SSE; [Chat API](https://docs.z.ai/api-reference/llm/chat-completion) documents `[DONE]`; do not add undocumented `stream_options`. |
+| OpenRouter | Chat SSE; final usage is automatic, existing `usage.include` retained; [comments, final usage and in-band errors](https://openrouter.ai/docs/api_reference/streaming). |
+| Together | Chat SSE with final usage; [Chat API](https://docs.together.ai/reference/chat-completions). Uses the common strict accumulator, not a lossy line parser. |
+| Alibaba | Chat SSE with requested usage; [streaming output](https://www.alibabacloud.com/help/en/model-studio/stream). |
+| Amazon Bedrock | The adapter uses **OpenAI Chat Completions**, not binary ConverseStream; [Bedrock Chat API](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-chat-completions.html). Chat SSE with requested usage. |
+| BytePlus | Chat SSE with requested usage; [Chat API](https://docs.byteplus.com/en/docs/modelark/chat-api). |
+| NVIDIA | Chat SSE with requested usage; [NIM API](https://docs.api.nvidia.com/nim/reference/minimaxai-minimax-m3-1-flash-infer). Model-specific endpoints can differ. |
+| Google AI Studio | Chat SSE with requested usage; [OpenAI compatibility](https://ai.google.dev/gemini-api/docs/openai). |
+| Google Vertex | Chat SSE with requested usage on its OpenAI adapter; [OpenAI compatibility](https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/call-gemini-using-openai-library). |
+| Groq | Chat SSE with requested usage; **`json_schema` stays non-streaming**, per [Structured Outputs limitations](https://console.groq.com/docs/structured-outputs); [Chat API](https://console.groq.com/docs/api-reference). |
+| Cerebras | Chat SSE without `stream_options`; **`json_object` stays non-streaming**, per [Chat API](https://inference-docs.cerebras.ai/api-reference/chat-completions). `json_schema` can stream. |
+| Fireworks | Chat SSE with requested usage; [Chat API](https://docs.fireworks.ai/api-reference/post-chatcompletions). |
+| Featherless | Chat SSE; final usage is automatic, including cost where billed per request; [completion protocol](https://featherless.ai/docs/completions). |
+| Inception | Chat SSE with requested usage; [Chat API](https://docs.inceptionlabs.ai/api-reference/chat/create-a-chat-completion). Do not enable the separate diffusion-preview mode. |
+| Isoquant | Chat SSE with requested usage; [API reference](https://isoquant.ai/docs) lists `stream_options.include_usage` and `[DONE]`; verified live on both models (2026-11-07). |
+| Reflection | Chat SSE with requested usage; [streaming guide](https://developers.reflection.ai/streaming.md) documents `include_usage`, `[DONE]`, in-band errors and padding; verified live on Beam (2026-11-07). |
+| Meta | Chat SSE with requested usage; [streaming and usage recipe](https://dev.meta.ai/docs/cookbook/streaming-responses). |
+| Xiaomi | Chat SSE without undocumented `stream_options`; [Chat API](https://mimo.mi.com/docs/en-US/api/chat/openai-api) specifies streamed usage. |
+| Ollama | Chat SSE with requested usage on `/v1/chat/completions`; [OpenAI compatibility](https://docs.ollama.com/api/openai-compatibility). A native `/api/chat` URL override stays non-streaming because its protocol is NDJSON. |
+| Local | Same OpenAI Chat SSE contract as Ollama/other compatible local servers; native `/api/chat` overrides stay buffered. Custom servers must support the requested protocol. |
+| OpenCode Zen / Go | Chat SSE with requested usage; [inference API](https://opencode.ai/v2/docs/console/api/inference/) describes terminal usage and cost. Existing configured base URLs are retained. |
+| ChatGPT | Already defaults to HTTP/SSE with its own terminal-event/retry/session handling; optional WebSocket transport unchanged. |
+| Tinker | Buffered: [compatible-API docs](https://tinker-docs.thinkingmachines.ai/tinker/compatible-apis/openai/) did not establish a streaming contract in this review. |
+| Hetzner | Buffered: [experimental docs](https://experiments.hetzner.com/docs/inference) require JavaScript and did not yield a verifiable stream/usage contract. |
+| WebWright | Buffered: [public API overview](https://webwright.ai/about) establishes compatibility, but the linked quickstart could not be retrieved; stream/usage behavior remains unverified. |
+| OctoHub | Existing `/v1/completions` JSON contract in `octohub.rs`; unchanged. |
+| CLI backends | Subprocess transports, not these HTTP adapters; unchanged. |
+
+Embedding and reranking endpoints remain JSON requests with their own shared
+pools (10 idle connections per host, 30-second idle timeout, 10-second connect
+and 120-second total timeout). Media submission/polling uses the shared client;
+artifact downloads deliberately use a separate redirect-disabled pool.
+HuggingFace's direct config-download helper currently creates a separate client;
+it is model setup, not the per-completion request path.
+
+When adding a chat provider, register its streaming policy explicitly in
+`openai_compat::configure_streaming` or select its native stream format. Cite
+provider evidence, preserve documented feature exceptions, and test fragmented
+text/tools, usage, errors, truncation and cancellation with local HTTP fixtures.
+Do not add a generic retry-to-non-streaming fallback.
+
 ### Provider Shape: Native vs. Proxy
 
-**Native** (OpenAI, Anthropic, Amazon, DeepSeek, Moonshot, MiniMax, Z.ai, BytePlus, Alibaba, Groq):
+**Native** (OpenAI, Anthropic, Amazon, DeepSeek, Moonshot, MiniMax, Z.ai, BytePlus, Alibaba, Groq, Inception, Reflection):
 - Own `PRICING` const table in the provider file — `(model, input, output, cache_write, cache_read)` per 1M tokens
 - Own `chat_completion()` implementation with provider-specific request/response structs
 - Override `supports_caching()`, `supports_vision()`, `get_max_input_tokens()`, `supports_structured_output()` directly
 - `get_model_pricing()` reads from the local `PRICING` table via `get_model_pricing()` from `utils.rs`
 - `supports_model()` uses `is_model_in_pricing_table()` — strict, unknown models rejected
 
-**Proxy / OpenAI-compatible** (NVIDIA, Cerebras, Together, Ollama, Local, Cloudflare, OpenRouter, OctoHub, Featherless, Hetzner, OpenCode Zen/Go, Google Vertex, Google Studio):
-- Delegates to `openai_compat_chat_completion(OpenAiCompatConfig { provider_name, usage_fallback_cost, use_response_cost }, api_key, api_url, params)`
+**Proxy / OpenAI-compatible** (NVIDIA, Cerebras, Ollama, Local, Cloudflare, Featherless, Hetzner, Isoquant, OpenCode Zen/Go, Google Vertex, Google Studio, plus provider-owned adapters such as Alibaba/Amazon/BytePlus/Groq):
+- Delegates to `openai_compat_chat_completion(OpenAiCompatConfig { provider_name, usage_fallback_cost, use_response_cost, enforces_response_schema, supports_required_tool_choice, supports_parallel_tool_calls }, api_key, api_url, params)`
 - `OpenAiCompatConfig.use_response_cost = true` → use cost from API response if present; `usage_fallback_cost` → fixed fallback cost (rarely used)
+- `enforces_response_schema` describes upstream constrained decoding; all responses are still validated locally.
+- `supports_required_tool_choice` is true only with provider evidence; otherwise schema repair uses auto tool choice plus prompt guidance.
+- `supports_parallel_tool_calls` controls whether tool requests send `parallel_tool_calls: true`; set false only for hosts that reject the parameter (WebWright).
 - `supports_model()` returns `!model.is_empty()` — accepts anything
 - `get_model_pricing()` → `reference_pricing::get_reference_pricing(model)` (trait default already does this; explicit override is optional)
 - After the call: if `usage.cost.is_none()`, fill it via `reference_pricing::calculate_reference_cost(&model, input_tokens, output_tokens)`
@@ -110,14 +239,18 @@ fn supports_model(&self, model: &str) -> bool
 fn get_api_key(&self) -> Result<String>
 async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse>
 
+// Default accepts Auto and rejects stronger policies; override only when supported:
+async fn chat_completion_with_tool_choice(&self, params: ChatCompletionParams, choice: ToolChoice) -> Result<ProviderResponse>
+
 // Override for native providers (defaults use reference tables):
 fn supports_caching(&self, model: &str) -> bool          // default: false
 fn supports_vision(&self, model: &str) -> bool            // default: reference_capabilities lookup
 fn supports_video(&self, model: &str) -> bool             // default: reference_capabilities lookup
 fn supports_structured_output(&self, model: &str) -> bool // default: reference_capabilities lookup
+fn enforces_response_schema(&self, model: &str) -> bool   // default: supports_structured_output
+fn supports_required_tool_choice(&self, model: &str) -> bool // default: false
 fn get_max_input_tokens(&self, model: &str) -> usize      // default: reference_capabilities lookup (8192 fallback)
 fn get_model_pricing(&self, model: &str) -> Option<ModelPricing> // default: reference_pricing lookup
-fn supported_sampling_params(&self, model: &str) -> SamplingSupport // default: ALL
 ```
 
 ### Reference Tables
@@ -129,9 +262,9 @@ fn supported_sampling_params(&self, model: &str) -> SamplingSupport // default: 
 
 ### Model Format
 
-Always `provider:model` — e.g., `openai:gpt-4o`, `anthropic:claude-opus-4`, `ollama:llama3.2`.
+Always `provider:model` — e.g., `openai:gpt-4o`, `anthropic:claude-opus-5-5`, `ollama:llama3.2`.
 
-CLI provider uses `cli:backend/model` — e.g., `cli:codex/gpt-5.2-codex`, `cli:claude/claude-opus-4`.
+CLI provider uses `cli:backend/model` — e.g., `cli:codex/gpt-5.2-codex`, `cli:claude/claude-opus-5-5`.
 
 `ProviderFactory::get_provider_for_model("provider:model")` → `(Box<dyn AiProvider>, String)`.
 
@@ -166,20 +299,12 @@ Per-provider mapping:
 - **Z.ai** → binary `thinking: { "type": "enabled" }` for any non-None effort (no budget knob)
 - **Codex CLI** → `model_reasoning_effort` config (accepts `low` / `medium` / `high` only)
 
-### Sampling Parameters
-
-Use `SamplingSupport` constants to declare what a model accepts:
-- `SamplingSupport::ALL` — temperature + top_p + top_k
-- `SamplingSupport::TEMPERATURE_AND_TOP_P` — no top_k (most OpenAI-compat APIs)
-- `SamplingSupport::TEMPERATURE_ONLY`
-- `SamplingSupport::NONE` — reasoning models (o1, o3, claude-opus-4-7, etc.)
-
 ### Error Handling
 
 ```rust
 // ✅ Return typed errors
 Err(ProviderError::UnsupportedProvider(name.to_string()).into())
-Err(ProviderError::MissingApiKey("OPENAI_API_KEY".to_string()).into())
+Err(missing_api_key("openai", "OPENAI_API_KEY").into())   // ProviderError::ApiKeyNotFound
 
 // ✅ Use ErrorContext trait for context
 some_result.with_provider_context("openai")?
@@ -207,11 +332,14 @@ println!()  eprintln!()
 ### API Keys
 
 ```rust
-// ✅ Always from environment
+// ✅ Always from environment; missing key → ProviderError::ApiKeyNotFound via the helper
 fn get_api_key(&self) -> Result<String> {
-    std::env::var("PROVIDER_API_KEY")
-        .map_err(|_| ProviderError::MissingApiKey("PROVIDER_API_KEY".to_string()).into())
+    env::var(PROVIDER_API_KEY_ENV)
+        .map_err(|_| crate::errors::missing_api_key("provider", PROVIDER_API_KEY_ENV).into())
 }
+// The first argument matches `name()`. Never hand-roll `anyhow!("... not found ...")`.
+// Exception: providers with several credential paths or setup steps (Anthropic/OpenAI
+// OAuth, Amazon, Cloudflare, Google Vertex/Studio, Meta) keep their custom messages.
 
 // For optional keys (Ollama, local):
 fn get_api_key(&self) -> Result<String> {
@@ -228,7 +356,7 @@ Every `.rs` file must start with:
 // Licensed under the Apache License, Version 2.0 (the "License");
 // ...
 ```
-Files still showing `Copyright 2025` (`src/errors.rs`, `src/storage.rs`, `src/llm/strategies.rs`, `src/llm/config.rs`, `src/embedding/constants.rs`, `src/embedding/mod_test.rs`, `examples/structured_output.rs`, `examples/test_structured_output.rs`) must be updated when touched.
+Files still showing `Copyright 2025` (`src/storage.rs`, `src/embedding/constants.rs`, `examples/structured_output.rs`, `examples/test_structured_output.rs`) must be updated when touched.
 
 ## Adding a New LLM Provider
 
@@ -242,6 +370,9 @@ Files still showing `Copyright 2025` (`src/errors.rs`, `src/storage.rs`, `src/ll
 6. Add to `ProviderFactory::supported_providers()` list in `factory.rs`
 7. Re-export from `src/lib.rs`
 8. Add example in `examples/`
+9. Do "Every new model or maker: routers must price it too" below for each model
+10. Do "Structured output: prove it live" below
+11. If the provider caches, do "Cache lifetime: measure it live" below
 
 ### OpenAI-Compatible Proxy
 
@@ -251,6 +382,94 @@ Files still showing `Copyright 2025` (`src/errors.rs`, `src/storage.rs`, `src/ll
 4. In `chat_completion()`: call `openai_compat_chat_completion(OpenAiCompatConfig { provider_name: "newprovider", usage_fallback_cost: None, use_response_cost: true }, api_key, api_url, params).await?`, then if `response.exchange.usage.cost.is_none()` fill it via `calculate_reference_cost(&params.model, usage.input_tokens, usage.cache_read_tokens, usage.billable_output_tokens())` — see the `nvidia.rs` cost block
 5. Add missing model families to `reference_pricing.rs` and `reference_capabilities.rs` if needed
 6. Register in `providers/mod.rs`, `factory.rs`, `lib.rs`; add example
+7. Do "Structured output: prove it live" below
+8. If the provider caches, do "Cache lifetime: measure it live" below
+
+### Every new model or maker: routers must price it too
+
+A model reaches users through more than its maker's provider: OpenRouter and the
+proxies (together, ollama, nvidia, cerebras, ...) serve it under their own ids, and
+each of them must return a price, or callers that estimate cost before a call get
+`None` (octomind logs `Fold economics: no pricing for openrouter:<id> — using
+default ratios` and its compression decisions run on guesses).
+
+1. Add a `ReferenceModelEntry` for the model in `src/llm/reference_models.rs` with
+   both `capabilities` and `pricing` — proxies and `OpenRouterProvider::get_model_pricing`
+   fall back to it. Specific patterns first (`mimo-v2.6-pro-ultraspeed` before
+   `mimo-v2.6-pro`).
+2. When the maker has a native provider, its `PRICING` row and the reference row must
+   agree, unless a comment says why they differ.
+3. If OpenRouter's catalog id needs a family-specific route in
+   `openrouter.rs::get_model_pricing` (a `-fast` variant, a delegated maker table),
+   add it there; otherwise the reference fallback covers it.
+4. Pin it with a test: `OpenRouterProvider::new().get_model_pricing("<org>/<model>")`
+   is `Some` with the expected rates (see `openrouter_tests.rs`), plus a
+   `reference_models_tests.rs` row.
+
+### Structured output: prove it live
+
+OctoHub routes `json_schema` requests only to providers whose `enforces_response_schema`
+is true; the rest go through the forced-tool path in `schema_enforcement.rs`. A wrong
+`true` hands typed callers JSON of the wrong shape; a wrong `false` drops a working
+provider from the schema pool. Provider docs are often silent or wrong, and subscription
+endpoints (Token / Coding Plan) can behave differently from pay-as-you-go, so declare each
+mode only from a live probe:
+
+1. Send a strict `json_schema` (an object schema with `additionalProperties: false`) with a
+   prompt that demands something else, e.g. "Reply ONLY with a JSON array of three color
+   names". Enforced means the object comes back on every call; the array means the schema
+   was ignored.
+2. Send `json_object` with the same prompt. A bare array or prose means JSON mode is
+   ignored too.
+3. Repeat for each model family and on every endpoint the provider can be pointed at
+   (pay-as-you-go and plan base URLs via `*_API_URL`).
+4. Set `supports_structured_output`, `enforces_response_schema`, the matching
+   `OpenAiCompatConfig` field and the reference row's `structured_output` from the result.
+   Above the override, cite the probe: models, call count, endpoint, date.
+5. If the endpoint ignores `response_format`, do not send it: leave
+   `supports_structured_output` false so the forced-tool path takes over (MiniMax).
+
+### Cache lifetime: measure it live
+
+`AiProvider::cache_lifetime(model, use_long_cache)` is how long a written prompt cache is
+known to survive without use. Octomind uses it twice: keepalive pings fire just before it
+runs out, and idle compaction folds history on the next user message once the idle gap
+passes it. A value that is too long skips compaction, so the next request re-writes a
+cold cache at full input price. A value that is too short wastes pings and folds a cache
+that was still warm. Return `None` when the lifetime is unknown; callers then do nothing.
+
+The value is a floor: the cache is known to survive at least this long. Docs usually give
+an upper bound ("up to 24 hours", "cleared after 2 hours without use") or nothing at all
+("no fixed validity period"), and neither is a floor. Lifetimes also differ by model on
+one host: on Alibaba's Token Plan endpoint on 2026-11-07, `qwen3.7-plus` lost its cache
+after about 60 seconds while `qwen3.8-flash` still hit after 7 minutes. So measure each
+model family. `examples/cache_lifetime_probe.rs` does the steps below through octolib's own
+provider code; add each new model to its `TARGETS` list and run it filtered, e.g.
+`cargo run --example cache_lifetime_probe -- alibaba` (keys from the usual `*_API_KEY`
+variables; models without a key are skipped).
+
+1. Build a prompt of several thousand tokens, above the provider's minimum cacheable
+   size, with a unique run stamp in the text so no earlier request can have cached it.
+2. Send it once (the seed), wait a fixed delay with no other traffic on that prompt, then
+   send it again (the probe). Read the cached-token counter from the probe's usage:
+   `prompt_tokens_details.cached_tokens`, `cache_read_input_tokens` or
+   `input_tokens_details.cached_tokens`.
+3. Run two samples per delay, all in parallel, with delays spread over the range you care
+   about (1, 3, 5, 7, 10, 15, 20, 30, 45 and 60 minutes). Both samples missing means the
+   cache expired; one miss among hits is usually routing, not expiry.
+4. Run again with delays between the last delay where every sample hit and the first
+   where every sample missed, to narrow the boundary.
+5. Send the request the way octolib does: the same endpoint (pay-as-you-go or the plan URL
+   from `*_API_URL`), the same cache markers and TTL, the same thinking setting.
+6. Return a lifetime at or below the last delay where every sample hit. A provider whose
+   results depend on routing gets `None` (MiniMax), and so does one whose cache is too
+   short to keep alive or compact for.
+7. Above the `cache_lifetime` override, record the evidence: date, endpoint, models,
+   delays, hit counts, and the doc quote if there is one. Pin the value in
+   `<provider>_tests.rs`.
+
+The probe measures an unused cache. Whether a hit restarts the clock is a separate
+question; take it from the docs, or probe with an extra hit partway through the delay.
 
 ### Embedding Provider
 
@@ -276,9 +495,11 @@ Files still showing `Copyright 2025` (`src/errors.rs`, `src/storage.rs`, `src/ll
 - **CLI provider model format** is `backend/model` (slash, not colon) — `cli:codex/gpt-5.2-codex`. No tool calls, no structured output, prompt-only.
 - **OpenAI uses the Responses API** (`/v1/responses`), not `/v1/chat/completions`. The `openai_compat` layer uses `/v1/chat/completions`.
 - **`fastembed` and `huggingface` are default features** — code gated on them must use `#[cfg(feature = "...")]`.
-- **Shared HTTP client** in `providers/shared.rs` is process-wide and arc-swapped on connection errors — don't create per-request clients.
+- **Shared HTTP client** in `src/http.rs` is process-wide. Reqwest manages failed connections within its pool; rebuild only when application configuration changes, never on request errors. Don't create per-request clients.
 - **`supports_model()` for native providers** should use `is_model_in_pricing_table()` — this enforces that only known/priced models are accepted.
 - **ReasoningEffort is a hint, not a guarantee** — models without thinking support silently ignore it. Anthropic clamps budget_tokens below max_tokens.
+- **A finished media job always resolves** — when a provider reports a job finished, pass the parsed output through `shared::readable_output`: output with no readable media of the requested kind is the job's `Failed` outcome, not an `Err`. An `Err` from a poll leaves a caller's stored job live forever, re-polled (and failing) on every read.
+- **Input media goes to the provider's own store, privately, never inline when an upload exists** — `Bytes`/`File` sources are uploaded and passed by reference only after the request has passed every check (a refused request must not put the user's file anywhere). Lock and shorten what the provider allows: fal uploads with `initial_acl` `forbid` + 1 h expiry and passes a signed read link (a locked file passed as a plain URL fails the job); MiniMax V2 video uses `mm_file://{file_id}` and deletes the file right after the create call (MiniMax reads it at submit). Higgsfield only offers a public `public_url`. `source_to_data_or_uri` is for `Url` sources and for providers with no upload API (OpenRouter); Replicate (`/v1/files`, private, 24 h) and Runway (`runway://`, 24 h) still inline and should move to their upload APIs.
 
 ## Never
 
@@ -287,3 +508,4 @@ Files still showing `Copyright 2025` (`src/errors.rs`, `src/storage.rs`, `src/ll
 - Accept API keys as function parameters — always read from environment variables
 - Add a model to a native provider's `PRICING` table without verifying the price from the provider's official pricing page
 - Put a less-specific pattern before a more-specific one in `REFERENCE_PRICING` or `REFERENCE_CAPABILITIES`
+- Add a model or provider without a priced `reference_models.rs` row and a test that `OpenRouterProvider::get_model_pricing` returns it (see "Every new model or maker")

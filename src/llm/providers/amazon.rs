@@ -29,12 +29,11 @@
 //! Alternative: You can implement AWS SigV4 signing, but API keys are simpler for most use cases.
 
 use crate::llm::providers::openai_compat::{
-    chat_completion as openai_compat_chat_completion, get_api_url, get_optional_api_key,
-    OpenAiCompatConfig,
+	chat_completion as openai_compat_chat_completion, get_api_url, get_optional_api_key, OpenAiCompatConfig,
 };
 use crate::llm::traits::AiProvider;
 use crate::llm::types::{ChatCompletionParams, ProviderResponse};
-use crate::llm::utils::normalize_model_name;
+use crate::llm::utils::{get_model_pricing, normalize_model_name, PricingTuple};
 use anyhow::Result;
 
 /// Amazon Bedrock provider
@@ -42,165 +41,200 @@ use anyhow::Result;
 pub struct AmazonBedrockProvider;
 
 impl Default for AmazonBedrockProvider {
-    fn default() -> Self {
-        Self::new()
-    }
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 impl AmazonBedrockProvider {
-    pub fn new() -> Self {
-        Self
-    }
+	pub fn new() -> Self {
+		Self
+	}
 }
 
-const AWS_BEARER_TOKEN_BEDROCK_ENV: &str = "AWS_BEARER_TOKEN_BEDROCK";
+pub(crate) const AWS_BEARER_TOKEN_BEDROCK_ENV: &str = "AWS_BEARER_TOKEN_BEDROCK";
 const AWS_BEDROCK_REGION_ENV: &str = "AWS_BEDROCK_REGION";
 const AWS_BEDROCK_API_URL_ENV: &str = "AWS_BEDROCK_API_URL";
 
+/// Bedrock on-demand Standard rates (us-east-1, per 1M tokens) for hosted
+/// open-weight and partner models whose Bedrock price differs from the
+/// maker's. Patterns keep Bedrock's `vendor.` prefix and match raw (no
+/// sanitizing), so `deepseek.v3.2` never catches DeepSeek's own
+/// `deepseek-v3.2`. Source: AWS Price List API, AmazonBedrock offer published
+/// 2026-09-30; GLM 5.3 and the Qwen3 Next rate from aws.amazon.com/bedrock/pricing
+/// (verified 2026-10-20). `global.` cross-region IDs bill below in-region IDs and must
+/// precede them. Models without prompt caching bill cache columns at input.
+/// Format: (model, input, output, cache_write, cache_read)
+const PRICING: &[PricingTuple] = &[
+	("global.moonshotai.kimi-k3", 3.00, 15.00, 3.75, 0.30),
+	("moonshotai.kimi-k3", 3.30, 16.50, 4.125, 0.33),
+	("global.xai.grok-4.7", 2.00, 6.00, 2.00, 0.50),
+	("xai.grok-4.7", 2.20, 6.60, 2.20, 0.55),
+	("global.xai.grok-4.6", 2.00, 6.00, 2.00, 0.50),
+	("xai.grok-4.6", 2.20, 6.60, 2.20, 0.55),
+	(QWEN3_235B_PATTERN, 0.22, 0.88, 0.22, 0.22),
+	(QWEN3_32B_PATTERN, 0.15, 0.60, 0.15, 0.15),
+	(QWEN3_CODER_PATTERN, 0.45, 1.80, 0.45, 0.45),
+	("qwen.qwen3-coder-next", 0.50, 1.20, 0.50, 0.50),
+	(QWEN3_NEXT_PATTERN, 0.15, 1.20, 0.15, 0.15),
+	(GPT_OSS_120B_PATTERN, 0.15, 0.60, 0.15, 0.15),
+	(GPT_OSS_20B_PATTERN, 0.07, 0.30, 0.07, 0.07),
+	("deepseek.v3.2", 0.62, 1.85, 0.62, 0.62),
+	// DeepSeek V3.1: `deepseek.v3.1` on the Mantle endpoint, `deepseek.v3-v1:0`
+	// on bedrock-runtime.
+	("deepseek.v3.1", 0.58, 1.68, 0.58, 0.58),
+	(DEEPSEEK_V3_PATTERN, 0.58, 1.68, 0.58, 0.58),
+	(DEEPSEEK_R1_PATTERN, 1.35, 5.40, 1.35, 1.35),
+	// GLM 5.3: cache write is the 30-minute rate; the bare row carries the US CRIS rate.
+	("global.zai.glm-5.3", 1.68, 5.28, 2.10, 0.312),
+	("zai.glm-5.3", 1.848, 5.808, 2.31, 0.3432),
+	("zai.glm-4.7-flash", 0.07, 0.40, 0.07, 0.07),
+	("minimax.minimax-m2.1", 0.30, 1.20, 0.30, 0.30),
+	("google.gemma-4-31b", 0.14, 0.40, 0.14, 0.14),
+	("google.gemma-4-26b-a4b", 0.13, 0.40, 0.13, 0.13),
+	("google.gemma-4-e2b", 0.04, 0.08, 0.04, 0.04),
+];
+
+const QWEN3_235B_PATTERN: &str = "qwen.qwen3-235b-a22b-2507";
+const QWEN3_32B_PATTERN: &str = "qwen.qwen3-32b";
+const QWEN3_CODER_PATTERN: &str = "qwen.qwen3-coder-480b-a35b";
+const QWEN3_NEXT_PATTERN: &str = "qwen.qwen3-next-80b-a3b";
+const GPT_OSS_120B_PATTERN: &str = "openai.gpt-oss-120b";
+const GPT_OSS_20B_PATTERN: &str = "openai.gpt-oss-20b";
+const DEEPSEEK_V3_PATTERN: &str = "deepseek.v3-v1";
+const DEEPSEEK_R1_PATTERN: &str = "deepseek.r1";
+
+pub(crate) fn setup_models() -> impl Iterator<Item = &'static str> {
+	// These prefixes require a version or instruction suffix on Bedrock.
+	PRICING.iter().map(|row| row.0).filter(|model| {
+		!matches!(
+			*model,
+			QWEN3_235B_PATTERN
+				| QWEN3_32B_PATTERN
+				| QWEN3_CODER_PATTERN
+				| QWEN3_NEXT_PATTERN
+				| GPT_OSS_120B_PATTERN
+				| GPT_OSS_20B_PATTERN
+				| DEEPSEEK_V3_PATTERN
+				| DEEPSEEK_R1_PATTERN
+		)
+	})
+}
+
 fn default_bedrock_api_url() -> String {
-    let region = std::env::var(AWS_BEDROCK_REGION_ENV).unwrap_or_else(|_| "us-east-1".to_string());
-    format!(
-        "https://bedrock-runtime.{}.amazonaws.com/openai/v1/chat/completions",
-        region
-    )
+	let region = std::env::var(AWS_BEDROCK_REGION_ENV).unwrap_or_else(|_| "us-east-1".to_string());
+	format!(
+		"https://bedrock-runtime.{}.amazonaws.com/openai/v1/chat/completions",
+		region
+	)
 }
 
 #[async_trait::async_trait]
 impl AiProvider for AmazonBedrockProvider {
-    fn name(&self) -> &str {
-        "amazon"
-    }
+	fn name(&self) -> &str {
+		"amazon"
+	}
 
-    fn supports_model(&self, model: &str) -> bool {
-        !model.is_empty()
-    }
+	fn supports_model(&self, model: &str) -> bool {
+		!model.is_empty()
+	}
 
-    fn get_api_key(&self) -> Result<String> {
-        let token = get_optional_api_key(AWS_BEARER_TOKEN_BEDROCK_ENV);
-        if token.is_empty() {
-            Err(anyhow::anyhow!(
-                "Amazon Bedrock API key not found. Set {} environment variable.\n\
+	fn get_api_key(&self) -> Result<String> {
+		let token = get_optional_api_key(AWS_BEARER_TOKEN_BEDROCK_ENV);
+		if token.is_empty() {
+			Err(anyhow::anyhow!(
+				"Amazon Bedrock API key not found. Set {} environment variable.\n\
                 To create a Bedrock API key:\n\
                 1. AWS Console → IAM → Users → Select/Create user\n\
                 2. Security credentials → Create service-specific credential\n\
                 3. Select 'Amazon Bedrock' as the service\n\
                 4. Copy the generated API key (format: bedrock-<region>-<account>:<secret>)\n\
                 Note: These are NOT regular AWS access keys.",
-                AWS_BEARER_TOKEN_BEDROCK_ENV
-            ))
-        } else {
-            Ok(token)
-        }
-    }
+				AWS_BEARER_TOKEN_BEDROCK_ENV
+			))
+		} else {
+			Ok(token)
+		}
+	}
 
-    fn supports_caching(&self, _model: &str) -> bool {
-        false
-    }
+	fn supports_caching(&self, _model: &str) -> bool {
+		false
+	}
 
-    fn supports_vision(&self, model: &str) -> bool {
-        // Bedrock-specific known models
-        let model_lower = normalize_model_name(model);
-        if model_lower.contains("claude-3")
-            || model_lower.contains("claude-4")
-            || model_lower.contains("anthropic.claude")
-            || model_lower.contains("nova")
-        {
-            return true;
-        }
-        // Fall back to reference capabilities for other models on Bedrock
-        crate::llm::reference_models::get_reference_capabilities(model)
-            .map(|c| c.vision)
-            .unwrap_or(false)
-    }
+	fn supports_vision(&self, model: &str) -> bool {
+		// Bedrock-specific known models
+		let model_lower = normalize_model_name(model);
+		if model_lower.contains("claude-3")
+			|| model_lower.contains("claude-4")
+			|| model_lower.contains("anthropic.claude")
+		{
+			return true;
+		}
+		// Fall back to reference capabilities for other models on Bedrock
+		crate::llm::reference_models::get_reference_capabilities(model)
+			.map(|c| c.vision)
+			.unwrap_or(false)
+	}
 
-    fn get_max_input_tokens(&self, model: &str) -> usize {
-        // Bedrock-specific known models
-        let model_lower = normalize_model_name(model);
-        if model_lower.contains("claude") || model_lower.contains("anthropic.claude") {
-            return 200_000;
-        }
-        if model_lower.contains("titan") || model_lower.contains("amazon.titan") {
-            return 32_000;
-        }
-        // Fall back to reference capabilities for other models on Bedrock
-        crate::llm::reference_models::get_reference_capabilities(model)
-            .map(|c| c.max_input_tokens)
-            .unwrap_or(32_768)
-    }
+	fn get_max_input_tokens(&self, model: &str) -> usize {
+		// Bedrock-specific known models
+		let model_lower = normalize_model_name(model);
+		if model_lower.contains("claude") || model_lower.contains("anthropic.claude") {
+			return 200_000;
+		}
+		if model_lower.contains("titan") || model_lower.contains("amazon.titan") {
+			return 32_000;
+		}
+		// Fall back to reference capabilities for other models on Bedrock
+		crate::llm::reference_models::get_reference_capabilities(model)
+			.map(|c| c.max_input_tokens)
+			.unwrap_or(32_768)
+	}
 
-    fn supports_structured_output(&self, _model: &str) -> bool {
-        true
-    }
+	fn supports_structured_output(&self, model: &str) -> bool {
+		// Bedrock structured outputs cover the Anthropic Claude routes. Other
+		// hosted families resolve through reference capabilities — the Nova
+		// model cards list structured outputs as not supported.
+		let model_lower = normalize_model_name(model);
+		if model_lower.contains("claude") {
+			return true;
+		}
+		crate::llm::reference_models::get_reference_capabilities(model)
+			.map(|c| c.structured_output)
+			.unwrap_or(false)
+	}
 
-    fn enforces_response_schema(&self, _model: &str) -> bool {
-        true
-    }
+	fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
+		// Bedrock's own rate where it differs from the maker's; otherwise the
+		// reference table's model-level rate.
+		get_model_pricing(model, PRICING)
+			.map(|(input, output, cache_write, cache_read)| {
+				crate::llm::types::ModelPricing::new(input, output, cache_write, cache_read)
+			})
+			.or_else(|| crate::llm::reference_models::get_reference_pricing(model))
+	}
 
-    fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
-        // Try reference pricing based on underlying model
-        crate::llm::reference_models::get_reference_pricing(model)
-    }
+	async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
+		let api_key = super::shared::resolve_api_key(self, &params)?;
+		let api_url = get_api_url(AWS_BEDROCK_API_URL_ENV, &default_bedrock_api_url());
 
-    async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
-        let api_key = self.get_api_key()?;
-        let api_url = get_api_url(AWS_BEDROCK_API_URL_ENV, &default_bedrock_api_url());
-
-        openai_compat_chat_completion(
-            OpenAiCompatConfig {
-                provider_name: "amazon",
-                usage_fallback_cost: None,
-                use_response_cost: true,
-            },
-            api_key,
-            api_url,
-            params,
-        )
-        .await
-    }
+		openai_compat_chat_completion(
+			OpenAiCompatConfig {
+				provider_name: "amazon",
+				usage_fallback_cost: None,
+				use_response_cost: true,
+				enforces_response_schema: self.enforces_response_schema(&params.model),
+				supports_required_tool_choice: false,
+				supports_parallel_tool_calls: true,
+			},
+			api_key,
+			api_url,
+			params,
+		)
+		.await
+	}
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_supports_model() {
-        let provider = AmazonBedrockProvider::new();
-
-        // Amazon Bedrock accepts any non-empty model identifier
-        assert!(provider.supports_model("anthropic.claude-3-haiku-20240307-v1:0"));
-        assert!(provider.supports_model("anthropic.claude-3-5-sonnet-20241022-v2:0"));
-        assert!(provider.supports_model("meta.llama3-2-90b-instruct-v1:0"));
-        assert!(provider.supports_model("amazon.titan-embed-text-v2:0"));
-        assert!(provider.supports_model("gpt-4"));
-        assert!(provider.supports_model("deepseek-chat"));
-        assert!(!provider.supports_model(""));
-    }
-
-    #[test]
-    fn test_supports_model_case_insensitive() {
-        let provider = AmazonBedrockProvider::new();
-
-        // Test uppercase
-        assert!(provider.supports_model("ANTHROPIC.CLAUDE-3-HAIKU-20240307-V1:0"));
-        assert!(provider.supports_model("META.LLAMA3-2-90B-INSTRUCT-V1:0"));
-        // Test mixed case
-        assert!(provider.supports_model("Anthropic.Claude-3-Haiku"));
-        assert!(provider.supports_model("AMAZON.TITAN-EMBED-TEXT-V2:0"));
-    }
-
-    #[test]
-    fn test_supports_vision_case_insensitive() {
-        let provider = AmazonBedrockProvider::new();
-
-        // Test lowercase
-        assert!(provider.supports_vision("claude-3-haiku"));
-        assert!(provider.supports_vision("claude-3-sonnet"));
-
-        // Test uppercase
-        assert!(provider.supports_vision("CLAUDE-3-HAIKU"));
-        assert!(provider.supports_vision("CLAUDE-3-SONNET"));
-        // Test mixed case
-        assert!(provider.supports_vision("Anthropic.Claude-3-Haiku"));
-    }
-}
+#[path = "amazon_tests.rs"]
+mod tests;

@@ -1,0 +1,310 @@
+// Copyright 2026 Muvon Un Limited
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::*;
+
+#[test]
+fn test_redaction_removes_error_sources_and_preserves_connection_classification() {
+	let params =
+		crate::llm::types::ChatCompletionParams::new(&[], "model", 10).with_api_key("private-request-key".to_owned());
+	let error = anyhow::Error::new(RedactedError {
+		message: "connection failed: private-request-key".to_owned(),
+		transport_error: Some(TransportErrorKind::Connect),
+		terminal_stream_error: false,
+	})
+	.context("outer context contains private-request-key");
+	let error = redact_error(error, params.api_key.as_ref());
+	assert_eq!(transport_error_kind(&error), Some(TransportErrorKind::Connect));
+	assert_eq!(error.chain().count(), 1);
+	assert_eq!(error.to_string().matches("[redacted]").count(), 2);
+	assert!(!format!("{error:#?}").contains("private-request-key"));
+}
+
+#[test]
+fn test_response_parse_errors_redact_echoed_credentials() {
+	let params =
+		crate::llm::types::ChatCompletionParams::new(&[], "model", 10).with_api_key("private-request-key".to_owned());
+	let error = parse_response::<Vec<String>>(r#""private-request-key""#, params.api_key.as_ref()).unwrap_err();
+	assert!(error.to_string().contains("[redacted]"));
+	assert!(!format!("{error:#?}").contains("private-request-key"));
+	let plain = parse_response::<Vec<String>>(r#""private-request-key""#, None).unwrap_err();
+	assert!(plain.to_string().contains("private-request-key"));
+}
+
+#[test]
+#[serial_test::serial]
+fn test_byok_key_resolution_without_or_with_environment_keys() {
+	use crate::llm::factory::ProviderFactory;
+	use crate::llm::types::ChatCompletionParams;
+	for (provider_name, env_var) in [
+		("openai", "OPENAI_API_KEY"),
+		("anthropic", "ANTHROPIC_API_KEY"),
+		("google-studio", "GOOGLE_STUDIO_API_KEY"),
+		("openrouter", "OPENROUTER_API_KEY"),
+		("ollama", "OLLAMA_API_KEY"),
+		("together", "TOGETHER_API_KEY"),
+		("deepseek", "DEEPSEEK_API_KEY"),
+		("zai", "ZAI_API_KEY"),
+		("moonshot", "MOONSHOT_API_KEY"),
+		("alibaba", "ALIBABA_API_KEY"),
+		("cerebras", "CEREBRAS_API_KEY"),
+	] {
+		let original = std::env::var_os(env_var);
+		let provider = ProviderFactory::create_provider(provider_name).unwrap();
+		let params = ChatCompletionParams::new(&[], "model", 10).with_api_key("request-key".to_owned());
+		std::env::remove_var(env_var);
+		assert_eq!(
+			resolve_api_key(provider.as_ref(), &params).unwrap(),
+			"request-key",
+			"{provider_name}"
+		);
+		std::env::set_var(env_var, "platform-key");
+		assert_eq!(
+			resolve_api_key(provider.as_ref(), &params).unwrap(),
+			"request-key",
+			"{provider_name}"
+		);
+		match original {
+			Some(value) => std::env::set_var(env_var, value),
+			None => std::env::remove_var(env_var),
+		}
+	}
+}
+
+#[tokio::test]
+async fn test_multi_credential_and_managed_providers_reject_per_call_keys() {
+	use crate::errors::ProviderError;
+	use crate::llm::factory::ProviderFactory;
+	use crate::llm::types::ChatCompletionParams;
+	for provider_name in ["cloudflare", "google-vertex", "chatgpt"] {
+		let provider = ProviderFactory::create_provider(provider_name).unwrap();
+		let params = ChatCompletionParams::new(&[], "model", 10).with_api_key("private-request-key".to_owned());
+		let error = provider.chat_completion(params).await.unwrap_err();
+		assert!(matches!(
+			error.downcast_ref::<ProviderError>(),
+			Some(ProviderError::UnsupportedOperation { provider, operation })
+				if provider == provider_name && operation == "per-call API key authentication"
+		));
+		assert!(!format!("{error:?}").contains("private-request-key"));
+	}
+}
+
+#[test]
+fn test_maybe_ephemeral_cache_control() {
+	assert!(maybe_ephemeral_cache_control(false).is_none());
+	assert_eq!(
+		maybe_ephemeral_cache_control(true),
+		Some(serde_json::json!({"type": "ephemeral"}))
+	);
+}
+
+/// GLM-5.3 has no off level on any verified host, nor do Model Studio's
+/// thinking-only kimi-k3 and qwen3.8-2.4t-a95b; every other model and host
+/// keeps the requested effort.
+#[test]
+fn test_supported_reasoning_effort_floors_only_models_that_always_think() {
+	let off = ReasoningEffort::None;
+	for (provider_name, model) in [
+		("alibaba", "glm-5.3"),
+		("alibaba", "kimi-k3"),
+		("alibaba", "qwen3.8-2.4t-a95b"),
+		("zai", "GLM-5.3-Flash"),
+		("ollama", "glm-5.3:cloud"),
+		("nvidia", "z-ai/glm-5.3"),
+		("opencode-zen", "glm-5.3"),
+		("opencode-go", "glm-5.3-flash"),
+		("fireworks", "accounts/fireworks/models/glm-5p3"),
+		("fireworks", "accounts/fireworks/models/qwen3p8-2p4t-a95b"),
+	] {
+		assert_eq!(
+			supported_reasoning_effort(provider_name, model, off),
+			ReasoningEffort::Low,
+			"{provider_name} {model}"
+		);
+	}
+	assert_eq!(
+		supported_reasoning_effort("alibaba", "glm-5.3", ReasoningEffort::High),
+		ReasoningEffort::High
+	);
+	assert_eq!(supported_reasoning_effort("alibaba", "glm-5.2", off), off);
+	assert_eq!(supported_reasoning_effort("ollama", "kimi-k3", off), off);
+	assert_eq!(supported_reasoning_effort("together", "zai-org/glm-5.3", off), off);
+}
+
+#[test]
+fn test_parse_generic_tool_calls_lossy() {
+	let calls = serde_json::json!([{
+		"id": "call_1",
+		"name": "lookup",
+		"arguments": { "q": "rust" },
+		"meta": null
+	}]);
+	assert_eq!(parse_generic_tool_calls_lossy(Some(&calls), "test").len(), 1);
+	assert!(parse_generic_tool_calls_lossy(Some(&serde_json::json!({"bad": true})), "test").is_empty());
+}
+
+#[test]
+fn test_parse_generic_tool_calls_strict() {
+	let calls = serde_json::json!([{
+		"id": "call_1",
+		"name": "lookup",
+		"arguments": { "q": "rust" },
+		"meta": null
+	}]);
+	assert!(parse_generic_tool_calls_strict(&calls, "test").is_ok());
+	assert!(parse_generic_tool_calls_strict(&serde_json::json!({"bad": true}), "test").is_err());
+}
+
+#[test]
+fn test_set_response_tool_calls() {
+	let calls = vec![ToolCall {
+		id: "call_1".to_string(),
+		name: "lookup".to_string(),
+		arguments: serde_json::json!({"q": "rust"}),
+	}];
+	let mut response = serde_json::json!({});
+	set_response_tool_calls(&mut response, &calls, None);
+	assert!(response.get("tool_calls").is_some());
+}
+
+#[test]
+fn test_parse_structured_output_from_text() {
+	assert!(parse_structured_output_from_text("{\"x\":1}").is_some());
+	assert!(parse_structured_output_from_text("[1,2]").is_some());
+	assert_eq!(
+		parse_structured_output_from_text("```json\n{\"x\":1}\n```"),
+		Some(serde_json::json!({"x": 1}))
+	);
+	assert_eq!(
+		parse_structured_output_from_text("```\n[1,2]\n```"),
+		Some(serde_json::json!([1, 2]))
+	);
+	assert!(parse_structured_output_from_text("not json").is_none());
+	assert!(parse_structured_output_from_text("{not-json").is_none());
+	assert!(parse_structured_output_from_text("before\n```json\n{}\n```").is_none());
+	assert!(parse_structured_output_from_text("```rust\n{}\n```").is_none());
+	assert!(parse_structured_output_from_text("```json\n{}").is_none());
+}
+
+#[test]
+fn test_apply_extra_headers_upserts_and_preserves() {
+	let mut extra = std::collections::HashMap::new();
+	extra.insert("X-Model-Purpose".to_string(), "compression".to_string());
+	extra.insert("Authorization".to_string(), "Bearer override".to_string());
+	extra.insert("bad name!".to_string(), "ignored".to_string());
+
+	let builder = http_client()
+		.post("http://localhost/never-sent")
+		.header("Authorization", "Bearer original")
+		.header("Content-Type", "application/json");
+	let req = apply_extra_headers(builder, Some(&extra)).build().unwrap();
+
+	// Override wins, without duplicating the header.
+	let auth: Vec<_> = req.headers().get_all("Authorization").iter().collect();
+	assert_eq!(auth.len(), 1);
+	assert_eq!(auth[0], "Bearer override");
+	// New name lands; provider-set names not in the map survive.
+	assert_eq!(req.headers()["X-Model-Purpose"], "compression");
+	assert_eq!(req.headers()["Content-Type"], "application/json");
+	// Invalid names are skipped, not fatal.
+	assert!(req.headers().get("bad name!").is_none());
+
+	// None / empty map are no-ops.
+	let untouched = apply_extra_headers(http_client().post("http://localhost/x").header("A", "1"), None)
+		.build()
+		.unwrap();
+	assert_eq!(untouched.headers()["A"], "1");
+}
+
+#[test]
+fn test_parse_tool_call_arguments_lossy() {
+	assert_eq!(
+		parse_tool_call_arguments_lossy("{\"a\":1}"),
+		serde_json::json!({"a": 1})
+	);
+	assert_eq!(
+		parse_tool_call_arguments_lossy("{invalid"),
+		serde_json::json!({"raw_arguments": "{invalid"})
+	);
+}
+
+// Central fixture keeps provider contract regressions on the same image payload.
+pub(crate) fn tool_image_message(text: &str) -> crate::llm::types::Message {
+	use crate::llm::types::{ImageAttachment, ImageData, Message, SourceType};
+	Message::tool(text, "call_image", "screenshot").with_images(vec![
+		ImageAttachment {
+			data: ImageData::Base64("aW1hZ2U=".into()),
+			media_type: "image/png".into(),
+			source_type: SourceType::Url,
+			dimensions: None,
+			size_bytes: None,
+		},
+		ImageAttachment {
+			data: ImageData::Url("https://example.com/screenshot.jpg".into()),
+			media_type: "image/jpeg".into(),
+			source_type: SourceType::Url,
+			dimensions: None,
+			size_bytes: None,
+		},
+	])
+}
+
+#[test]
+fn chat_images_follow_all_parallel_tool_results_and_keep_attribution() {
+	use crate::llm::types::Message;
+	let messages = vec![
+		Message::assistant(""),
+		tool_image_message("caption"),
+		Message::tool("second result", "call_second", "view"),
+		Message::user("continue"),
+	];
+	let converted = chat_completion_messages(&messages);
+	assert_eq!(converted.len(), 5);
+	assert_eq!(converted[1].tool_call_id.as_deref(), Some("call_image"));
+	assert!(converted[1].images.is_none());
+	assert_eq!(converted[2].tool_call_id.as_deref(), Some("call_second"));
+	assert_eq!(converted[3].role, "user");
+	assert!(converted[3].content.contains("screenshot"));
+	assert!(converted[3].content.contains("call_image"));
+	assert_eq!(converted[3].images.as_ref().unwrap().len(), 2);
+	assert_eq!(converted[4].content, "continue");
+	assert_eq!(messages[1].images.as_ref().unwrap().len(), 2);
+	let text_only = [Message::tool("text", "call_text", "view")];
+	assert!(matches!(
+		chat_completion_messages(&text_only),
+		std::borrow::Cow::Borrowed(_)
+	));
+}
+
+#[test]
+fn anthropic_tool_blocks_preserve_images_and_text_only_shape() {
+	use crate::llm::types::Message;
+	assert_eq!(
+		anthropic_tool_content(&Message::tool("text", "id", "view")),
+		serde_json::json!("text")
+	);
+	for text in ["caption", ""] {
+		let blocks = anthropic_tool_content(&tool_image_message(text));
+		let offset = usize::from(!text.is_empty());
+		assert_eq!(blocks.as_array().unwrap().len(), offset + 2);
+		assert_eq!(blocks[offset]["source"]["type"], "base64");
+		assert_eq!(blocks[offset]["source"]["media_type"], "image/png");
+		assert_eq!(blocks[offset]["source"]["data"], "aW1hZ2U=");
+		assert_eq!(blocks[offset + 1]["source"]["type"], "url");
+		assert_eq!(
+			blocks[offset + 1]["source"]["url"],
+			"https://example.com/screenshot.jpg"
+		);
+	}
+}

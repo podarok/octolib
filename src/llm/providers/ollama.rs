@@ -20,13 +20,18 @@
 //! Configuration:
 //! - `OLLAMA_API_KEY`: Optional API key (required for cloud/private deployments)
 //! - `OLLAMA_API_URL`: Override endpoint
+//!
+//! Prompt caching is automatic. An idle model is unloaded, and its cache lost,
+//! once `keep_alive` runs out, so requests set it from `use_long_cache` and a
+//! pre-warm is a one-token completion that restarts the timer.
 
+use crate::llm::config::CacheTTL;
 use crate::llm::providers::openai_compat::{
-    chat_completion as openai_compat_chat_completion, get_api_url, get_optional_api_key,
-    OpenAiCompatConfig,
+	chat_completion as openai_compat_chat_completion, get_api_url, get_optional_api_key, OpenAiCompatConfig,
 };
-use crate::llm::traits::AiProvider;
+use crate::llm::traits::{AiProvider, KeepalivePolicy};
 use crate::llm::types::{ChatCompletionParams, ProviderResponse};
+use crate::llm::utils::{calculate_cost_from_pricing_table, get_model_pricing, PricingTuple};
 use anyhow::Result;
 
 /// Ollama provider
@@ -34,159 +39,173 @@ use anyhow::Result;
 pub struct OllamaProvider;
 
 impl Default for OllamaProvider {
-    fn default() -> Self {
-        Self::new()
-    }
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 impl OllamaProvider {
-    pub fn new() -> Self {
-        Self
-    }
+	pub fn new() -> Self {
+		Self
+	}
 }
 
-const OLLAMA_API_KEY_ENV: &str = "OLLAMA_API_KEY";
+pub(crate) const OLLAMA_API_KEY_ENV: &str = "OLLAMA_API_KEY";
 const OLLAMA_API_URL_ENV: &str = "OLLAMA_API_URL";
 const OLLAMA_API_URL: &str = "https://ollama.com/v1/chat/completions";
+/// Public model list (OpenAI `/v1/models` shape); answers without an API key.
+pub(crate) const OLLAMA_MODELS_URL: &str = "https://ollama.com/v1/models";
+/// Ollama has no zero-output completion, so a pre-warm asks for the cheapest one.
+const CACHE_PREWARM_MAX_TOKENS: u32 = 1;
+
+/// Ollama Cloud's own rates, which differ from the reference rows it resells:
+/// (model, input, output, cache_write, cache_read) per 1M tokens, checked against
+/// https://ollama.com/pricing on 2026-11-07. Peak rates: DeepSeek bills half of
+/// these off-peak. Ollama lists no write rate, and `-` for cached input means
+/// input rate. `clef` is omitted because it publishes no output rate. Specific
+/// patterns come first.
+const PRICING: &[PricingTuple] = &[
+	("beam", 0.125, 0.40, 0.125, 0.015),
+	("deepseek-v4.1-flash", 0.30, 1.20, 0.30, 0.006),
+	("deepseek-v4-pro", 1.32, 3.96, 1.32, 0.044),
+	("gemma4", 0.14, 0.40, 0.14, 0.05),
+	("glm-5.3-flash", 0.15, 0.50, 0.15, 0.03),
+	("glm-5.3", 1.40, 4.40, 1.40, 0.26),
+	("glm-5.2", 1.40, 4.40, 1.40, 0.26),
+	("gpt-oss:120b", 0.15, 0.60, 0.15, 0.014),
+	("gpt-oss:20b", 0.07, 0.30, 0.07, 0.035),
+	("kimi-k3.1-pro", 2.00, 10.00, 2.00, 0.20),
+	("kimi-k3", 3.00, 15.00, 3.00, 0.30),
+	("kimi-k2.7-code", 0.95, 4.00, 0.95, 0.19),
+	("kimi-k2.6", 0.95, 4.00, 0.95, 0.16),
+	("mimo-v2.6-flash", 0.14, 0.28, 0.14, 0.0028),
+	("mimo-v2.6-pro", 0.435, 0.87, 0.435, 0.0036),
+	("minimax-m3.1-flash", 0.15, 0.60, 0.15, 0.015),
+	("minimax-m3", 0.60, 2.40, 0.60, 0.12),
+	("minimax-m2.7", 0.30, 1.20, 0.30, 0.06),
+	("mistral-large-4", 0.70, 2.10, 0.70, 0.07),
+	("mistral-large-3", 0.50, 1.50, 0.50, 0.50),
+	("muse-spark-open", 1.25, 4.25, 1.25, 0.15),
+	("nemotron-3-nano", 0.06, 0.24, 0.06, 0.06),
+	("nemotron-3-super", 0.015, 0.60, 0.015, 0.015),
+	("nemotron-3-ultra", 0.10, 3.00, 0.10, 0.10),
+];
 
 #[async_trait::async_trait]
 impl AiProvider for OllamaProvider {
-    fn name(&self) -> &str {
-        "ollama"
-    }
+	fn name(&self) -> &str {
+		"ollama"
+	}
 
-    fn supports_model(&self, model: &str) -> bool {
-        !model.is_empty()
-    }
+	fn supports_model(&self, model: &str) -> bool {
+		!model.is_empty()
+	}
 
-    fn get_api_key(&self) -> Result<String> {
-        Ok(get_optional_api_key(OLLAMA_API_KEY_ENV))
-    }
+	fn get_api_key(&self) -> Result<String> {
+		Ok(get_optional_api_key(OLLAMA_API_KEY_ENV))
+	}
 
-    fn supports_caching(&self, _model: &str) -> bool {
-        false
-    }
+	/// Ollama's OpenAI layer replays reasoning for the trailing assistant
+	/// message only, except Kimi models that preserve it across every turn.
+	fn replays_thinking(&self, model: &str) -> bool {
+		crate::llm::providers::moonshot::preserves_historical_thinking(model)
+	}
 
-    fn supports_video(&self, _model: &str) -> bool {
-        false
-    }
+	/// Ollama reuses a matching prompt prefix on its own and reports the hit in
+	/// `prompt_tokens_details.cached_tokens`; Ollama Cloud bills it at a cached rate.
+	fn supports_caching(&self, _model: &str) -> bool {
+		true
+	}
 
-    // supports_vision, supports_video, supports_structured_output, get_max_input_tokens
-    // are resolved via reference capabilities (trait defaults)
+	fn keepalive_policy(&self, model: &str, use_long_cache: bool) -> Option<KeepalivePolicy> {
+		self.cache_lifetime(model, use_long_cache)
+			.map(KeepalivePolicy::before_expiry)
+	}
 
-    fn enforces_response_schema(&self, _model: &str) -> bool {
-        // Ollama-compatible routes accept a JSON schema-shaped `format`, but
-        // observed cloud routes can still return non-conforming text. Treat
-        // structured-output support as "can be guided", not hard constrained.
-        false
-    }
+	/// The `keep_alive` sent with each request.
+	fn cache_lifetime(&self, _model: &str, use_long_cache: bool) -> Option<std::time::Duration> {
+		Some(CacheTTL::from_long_cache_flag(use_long_cache).to_duration())
+	}
 
-    fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
-        // Try reference pricing for cloud-equivalent cost estimation
-        crate::llm::reference_models::get_reference_pricing(model)
-    }
+	fn supports_video(&self, _model: &str) -> bool {
+		false
+	}
 
-    async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
-        let api_key = self.get_api_key()?;
-        let api_url = get_api_url(OLLAMA_API_URL_ENV, OLLAMA_API_URL);
-        let model = params.model.clone();
+	// supports_vision, supports_video, supports_structured_output, get_max_input_tokens
+	// are resolved via reference capabilities (trait defaults)
 
-        let mut response = openai_compat_chat_completion(
-            OpenAiCompatConfig {
-                provider_name: "ollama",
-                usage_fallback_cost: None,
-                use_response_cost: true,
-            },
-            api_key,
-            api_url,
-            params,
-        )
-        .await?;
+	/// Ollama Cloud does not constrain decoding: a schema reaches the model only
+	/// as a forced tool call, which it may answer with the wrong shape. Routers
+	/// read this flag to send structured requests to a lane that guarantees it.
+	fn enforces_response_schema(&self, _model: &str) -> bool {
+		false
+	}
 
-        // Fill cost from reference pricing if the API didn't return one
-        if let Some(ref mut usage) = response.exchange.usage {
-            if usage.cost.is_none() {
-                usage.cost = crate::llm::reference_models::calculate_reference_cost(
-                    &model,
-                    usage.input_tokens,
-                    usage.cache_read_tokens,
-                    usage.billable_output_tokens(),
-                );
-            }
-        }
+	fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
+		get_model_pricing(model, PRICING)
+			.map(|(input, output, cache_write, cache_read)| {
+				crate::llm::types::ModelPricing::new(input, output, cache_write, cache_read)
+			})
+			// Try reference pricing for cloud-equivalent cost estimation
+			.or_else(|| crate::llm::reference_models::get_reference_pricing(model))
+	}
 
-        Ok(response)
-    }
+	async fn chat_completion(&self, mut params: ChatCompletionParams) -> Result<ProviderResponse> {
+		let api_key = super::shared::resolve_api_key(self, &params)?;
+		let api_url = get_api_url(OLLAMA_API_URL_ENV, OLLAMA_API_URL);
+		let model = params.model.clone();
+
+		if params.cache_prewarm {
+			params.max_tokens = CACHE_PREWARM_MAX_TOKENS;
+			// A one-token reply cannot pass schema validation. The format only
+			// constrains decoding, so the cached prompt prefix stays the same.
+			params.response_format = None;
+		}
+
+		let mut response = openai_compat_chat_completion(
+			OpenAiCompatConfig {
+				provider_name: "ollama",
+				usage_fallback_cost: None,
+				use_response_cost: true,
+				enforces_response_schema: false,
+				supports_required_tool_choice: true,
+				supports_parallel_tool_calls: true,
+			},
+			api_key,
+			api_url,
+			params,
+		)
+		.await?;
+
+		// Fill cost from the pricing tables if the API didn't return one
+		if let Some(ref mut usage) = response.exchange.usage {
+			if usage.cost.is_none() {
+				usage.cost = calculate_cost_from_pricing_table(
+					&model,
+					PRICING,
+					usage.input_tokens,
+					0,
+					usage.cache_read_tokens,
+					usage.billable_output_tokens(),
+				)
+				.or_else(|| {
+					crate::llm::reference_models::calculate_reference_cost(
+						&model,
+						usage.input_tokens,
+						usage.cache_read_tokens,
+						usage.billable_output_tokens(),
+					)
+				});
+			}
+		}
+
+		Ok(response)
+	}
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_supports_model() {
-        let provider = OllamaProvider::new();
-        assert!(provider.supports_model("llama3.2"));
-        assert!(provider.supports_model("qwen2.5"));
-        assert!(!provider.supports_model(""));
-    }
-
-    #[test]
-    fn test_default_capabilities() {
-        let provider = OllamaProvider::new();
-        assert_eq!(provider.name(), "ollama");
-        assert!(!provider.supports_caching("any-model"));
-    }
-
-    #[test]
-    fn test_vision_model_specific() {
-        let provider = OllamaProvider::new();
-        // Vision models detected via reference capabilities
-        assert!(provider.supports_vision("llava:latest"));
-        assert!(provider.supports_vision("qwen2.5-vl:72b"));
-        assert!(provider.supports_vision("gemma3:27b"));
-        // Text-only models correctly report no vision
-        assert!(!provider.supports_vision("llama3.1:8b"));
-        assert!(!provider.supports_vision("mistral:7b"));
-        // Unknown models default to false
-        assert!(!provider.supports_vision("unknown-model"));
-    }
-
-    #[test]
-    fn test_video_model_specific() {
-        let provider = OllamaProvider::new();
-        // Ollama chat API does not support video (only text and images)
-        assert!(!provider.supports_video("qwen2.5-vl:72b"));
-        assert!(!provider.supports_video("llama3.1:8b"));
-        assert!(!provider.supports_video("llava:latest"));
-    }
-
-    #[test]
-    fn test_structured_output_model_specific() {
-        let provider = OllamaProvider::new();
-        assert!(provider.supports_structured_output("llama3.1:8b"));
-        assert!(provider.supports_structured_output("qwen2.5:72b"));
-        assert!(!provider.supports_structured_output("mistral:7b"));
-    }
-
-    #[test]
-    fn test_schema_enforcement_proxy_policy() {
-        let provider = OllamaProvider::new();
-        assert!(!provider.enforces_response_schema("deepseek-v4-pro"));
-        assert!(!provider.enforces_response_schema("ollama:deepseek-v4-pro"));
-        assert!(!provider.enforces_response_schema("gemma4:31b-cloud"));
-        assert!(!provider.enforces_response_schema("minimax-m3"));
-        assert!(!provider.enforces_response_schema("mistral:7b"));
-        assert!(!provider.enforces_response_schema("llama3.1:8b"));
-        assert!(!provider.enforces_response_schema("unknown-cloud-model"));
-    }
-
-    #[test]
-    fn test_context_window_model_specific() {
-        let provider = OllamaProvider::new();
-        assert_eq!(provider.get_max_input_tokens("llama3.1:8b"), 131_072);
-        assert_eq!(provider.get_max_input_tokens("mistral:7b"), 32_768);
-        // Unknown models get reference-capabilities fallback default
-        assert_eq!(provider.get_max_input_tokens("unknown-model"), 262_144);
-    }
-}
+#[path = "ollama_http_tests.rs"]
+mod http_tests;
+#[cfg(test)]
+#[path = "ollama_tests.rs"]
+mod tests;

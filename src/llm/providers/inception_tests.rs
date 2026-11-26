@@ -1,0 +1,115 @@
+// Copyright 2026 Muvon Un Limited
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Inception is deprecated (removal 2026-12-28); these tests exercise it until then.
+#![allow(deprecated)]
+use super::*;
+use crate::test_support::env::EnvGuard;
+
+#[test]
+fn test_supports_model() {
+	let provider = InceptionProvider::new();
+	assert!(provider.supports_model("mercury-3"));
+	assert!(provider.supports_model("mercury-voice"));
+	assert!(provider.supports_model("mercury-2.5"));
+	assert!(provider.supports_model("mercury-2"));
+	// Mercury Edit 2 is FIM/edit-only; the chat endpoint 404s it
+	assert!(!provider.supports_model("mercury-edit-2"));
+	assert!(!provider.supports_model("unknown-model"));
+	assert!(!provider.supports_model(""));
+
+	// Case-insensitive: the provider canonicalizes before sending
+	assert!(provider.supports_model("MERCURY-2.5"));
+	assert_eq!(find_model("mercury-2.5").map(|(id, _)| *id), Some("mercury-2.5"));
+}
+
+#[test]
+fn test_model_capabilities() {
+	let provider = InceptionProvider::new();
+	// Text-only models (input_modalities: ["text"])
+	assert!(!provider.supports_vision("mercury-2.5"));
+	assert_eq!(provider.get_max_input_tokens("mercury-3"), 1_000_000);
+	assert_eq!(provider.get_max_input_tokens("mercury-voice"), 128_000);
+	assert_eq!(provider.get_max_input_tokens("mercury-2.5"), 260_000);
+	assert_eq!(provider.get_max_input_tokens("mercury-2"), 128_000);
+	assert_eq!(provider.get_max_input_tokens("unknown-model"), 128_000);
+}
+
+#[test]
+fn test_chat_features() {
+	let provider = InceptionProvider::new();
+	// supported_features: ["tools", "json_mode", "structured_outputs"]
+	assert!(provider.supports_structured_output("mercury-2.5"));
+	// Advertised structured_outputs does not constrain decoding (live, 2026-10-26).
+	for model in ["mercury-3", "mercury-2.5"] {
+		assert!(!provider.enforces_response_schema(model), "{model}");
+	}
+	assert!(provider.supports_required_tool_choice("mercury-2.5"));
+	// Automatic prefix caching with discounted cached-input billing
+	assert!(provider.supports_caching("mercury-2.5"));
+}
+
+#[test]
+fn test_pricing() {
+	let provider = InceptionProvider::new();
+	// Mercury 3 launch pricing (50% off): $0.10 in / $0.35 out / $0.01 cached
+	let pricing = provider.get_model_pricing("mercury-3").unwrap();
+	assert_eq!(pricing.input_price_per_1m, 0.10);
+	assert_eq!(pricing.output_price_per_1m, 0.35);
+	assert_eq!(pricing.cache_read_price_per_1m, 0.01);
+
+	// Mercury Voice launch pricing (50% off): $0.20 in / $0.75 out / $0.02 cached.
+	// Routers price it through the reference table, which must agree.
+	let pricing = provider.get_model_pricing("mercury-voice").unwrap();
+	assert_eq!(pricing.input_price_per_1m, 0.20);
+	assert_eq!(pricing.output_price_per_1m, 0.75);
+	assert_eq!(pricing.cache_read_price_per_1m, 0.02);
+	let reference = crate::llm::reference_models::get_reference_pricing("inception/mercury-voice").unwrap();
+	assert_eq!(reference.input_price_per_1m, 0.20);
+	assert_eq!(reference.output_price_per_1m, 0.75);
+	assert_eq!(reference.cache_read_price_per_1m, 0.02);
+
+	// Mercury 2.5 launch discount ended: $0.20 in / $0.75 out / $0.02 cached
+	let pricing = provider.get_model_pricing("mercury-2.5").unwrap();
+	assert_eq!(pricing.input_price_per_1m, 0.20);
+	assert_eq!(pricing.output_price_per_1m, 0.75);
+	assert_eq!(pricing.cache_read_price_per_1m, 0.02);
+
+	let pricing = provider.get_model_pricing("mercury-2").unwrap();
+	assert_eq!(pricing.input_price_per_1m, 0.25);
+	assert_eq!(pricing.output_price_per_1m, 0.75);
+	assert_eq!(pricing.cache_read_price_per_1m, 0.025);
+
+	// Unknown models are not priced (strict catalogue)
+	assert!(provider.get_model_pricing("mercury-9").is_none());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn request_omits_sampling_fields() {
+	let mock = crate::test_support::mock_http::MockHttp::start(vec![(
+		200,
+		crate::test_support::mock_http::chat_completion_body("ok"),
+	)]);
+	let _env = EnvGuard::new().set("INCEPTION_API_URL", mock.url.clone());
+	let params = ChatCompletionParams::new(&[], "mercury-2.5", 10).with_api_key("mock-key".to_owned());
+	InceptionProvider::new()
+		.chat_completion(params)
+		.await
+		.expect("mock completion");
+	let body: serde_json::Value = serde_json::from_str(&mock.requests()[0].body).expect("request json");
+	for field in ["temperature", "top_p", "top_k"] {
+		assert!(body.get(field).is_none(), "{field} must not be sent");
+	}
+}

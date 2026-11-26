@@ -1,0 +1,1506 @@
+// Copyright 2026 Muvon Un Limited
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::*;
+use crate::test_support::env::EnvGuard;
+use serial_test::serial;
+
+#[test]
+#[serial]
+fn test_per_call_key_auth_headers_override_api_key_and_oauth() {
+	let provider = AnthropicProvider::new();
+	let params = ChatCompletionParams::new(&[], "claude-sonnet-4-6", 10).with_api_key("private-request-key".to_owned());
+	let original_key = env::var_os(ANTHROPIC_API_KEY_ENV);
+	let original_oauth = env::var_os(ANTHROPIC_OAUTH_TOKEN_ENV);
+	for platform_auth in [false, true] {
+		if platform_auth {
+			env::set_var(ANTHROPIC_API_KEY_ENV, "platform-key");
+			env::set_var(ANTHROPIC_OAUTH_TOKEN_ENV, "platform-oauth");
+		} else {
+			env::remove_var(ANTHROPIC_API_KEY_ENV);
+			env::remove_var(ANTHROPIC_OAUTH_TOKEN_ENV);
+		}
+		let request = shared::http_client()
+			.post(ANTHROPIC_API_URL)
+			.headers(provider.auth_headers(&params).unwrap())
+			.build()
+			.unwrap();
+		assert_eq!(request.headers()["x-api-key"], "private-request-key");
+		assert!(!request.headers().contains_key("Authorization"));
+		assert!(!format!("{request:?}").contains("private-request-key"));
+	}
+	for (name, original) in [
+		(ANTHROPIC_API_KEY_ENV, original_key),
+		(ANTHROPIC_OAUTH_TOKEN_ENV, original_oauth),
+	] {
+		match original {
+			Some(value) => env::set_var(name, value),
+			None => env::remove_var(name),
+		}
+	}
+}
+
+#[test]
+#[serial]
+fn test_oauth_token_priority() {
+	let provider = AnthropicProvider::new();
+
+	// Set OAuth token
+	env::set_var(ANTHROPIC_OAUTH_TOKEN_ENV, "test-oauth-token");
+
+	// get_api_key should return error when OAuth is set
+	let result = provider.get_api_key();
+	assert!(result.is_err());
+	assert!(result.unwrap_err().to_string().contains("OAuth authentication"));
+
+	// Clean up
+	env::remove_var(ANTHROPIC_OAUTH_TOKEN_ENV);
+}
+
+#[test]
+#[serial]
+fn test_api_key_fallback() {
+	let provider = AnthropicProvider::new();
+
+	// Remove OAuth token if set
+	env::remove_var(ANTHROPIC_OAUTH_TOKEN_ENV);
+
+	// Set API key
+	env::set_var(ANTHROPIC_API_KEY_ENV, "test-api-key");
+
+	// get_api_key should return the API key
+	let result = provider.get_api_key();
+	assert!(result.is_ok());
+	assert_eq!(result.unwrap(), "test-api-key");
+
+	// Clean up
+	env::remove_var(ANTHROPIC_API_KEY_ENV);
+}
+
+#[test]
+#[serial]
+fn test_no_auth_error() {
+	let provider = AnthropicProvider::new();
+
+	// Remove both OAuth and API key
+	env::remove_var(ANTHROPIC_OAUTH_TOKEN_ENV);
+	env::remove_var(ANTHROPIC_API_KEY_ENV);
+
+	// get_api_key should return error
+	let result = provider.get_api_key();
+	assert!(result.is_err());
+	let error_msg = result.unwrap_err().to_string();
+	assert!(error_msg.contains("ANTHROPIC_API_KEY") || error_msg.contains("ANTHROPIC_OAUTH_TOKEN"));
+}
+
+#[test]
+fn test_supports_model_case_insensitive() {
+	let provider = AnthropicProvider::new();
+
+	// Test lowercase (already working)
+	assert!(provider.supports_model("claude-haiku-4-5"));
+	assert!(provider.supports_model("claude-sonnet-4-6"));
+	assert!(provider.supports_model("claude-opus-4-7"));
+
+	// Test uppercase
+	assert!(provider.supports_model("CLAUDE-HAIKU-4-5"));
+	assert!(provider.supports_model("CLAUDE-SONNET-4-6"));
+	assert!(provider.supports_model("CLAUDE-OPUS-4-7"));
+	// Test mixed case
+	assert!(provider.supports_model("ClaUde-Haiku-4-5"));
+	assert!(provider.supports_model("CLAUDE-Sonnet-4-6"));
+}
+
+#[test]
+fn test_retired_models_unsupported() {
+	let provider = AnthropicProvider::new();
+
+	// Retired per the live deprecations page (Sonnet 4.5 is deprecated and
+	// dropped ahead of its retirement): the strict table lookup rejects them
+	for model in [
+		"claude-sonnet-4-5-20250929",
+		"claude-sonnet-4-5",
+		"claude-opus-4-1-20250805",
+		"claude-opus-4-1",
+		"claude-opus-4-20250514",
+		"claude-opus-4-0",
+		"claude-opus-4",
+		"claude-sonnet-4-20250514",
+		"claude-sonnet-4-0",
+		"claude-sonnet-4",
+		"claude-3-7-sonnet-20250219",
+		"claude-3-7-sonnet",
+		"claude-3-5-sonnet",
+		"claude-3.5-sonnet",
+		"claude-3-5-haiku-20241022",
+		"claude-3-5-haiku",
+		"claude-3.5-haiku",
+		"claude-3-opus",
+		"claude-3-sonnet",
+		"claude-3-haiku-20240307",
+		"claude-3-haiku",
+	] {
+		assert!(!provider.supports_model(model), "{model} should be unsupported");
+		assert!(
+			provider.get_model_pricing(model).is_none(),
+			"{model} should have no pricing"
+		);
+	}
+	// No such model exists; thinking must not be enabled for it
+	assert!(!THINKING_MODELS.contains(&"sonnet-4-7"));
+	assert!(!THINKING_MODELS.contains(&"3-7-sonnet"));
+}
+
+#[test]
+fn test_supports_vision_case_insensitive() {
+	let provider = AnthropicProvider::new();
+
+	assert!(provider.supports_vision("claude-sonnet-5"));
+	assert!(provider.supports_vision("claude-opus-4-6"));
+	assert!(provider.supports_vision("claude-sonnet-4-6"));
+	assert!(provider.supports_vision("claude-haiku-4-5"));
+
+	// Test lowercase
+	assert!(provider.supports_vision("claude-opus-4-7"));
+
+	// Test uppercase
+	assert!(provider.supports_vision("CLAUDE-HAIKU-4-5"));
+	assert!(provider.supports_vision("CLAUDE-OPUS-4-7"));
+	// Test mixed case
+	assert!(provider.supports_vision("ClaUde-HaiKu-4-5"));
+}
+
+#[test]
+fn structured_outputs_follow_the_documented_model_list() {
+	let provider = AnthropicProvider::new();
+	for model in [
+		"claude-opus-5-5",
+		"claude-sonnet-5-5",
+		"claude-haiku-5-5",
+		"claude-fable-5-1",
+		"claude-fable-5-2",
+		"claude-haiku-4-5",
+	] {
+		assert!(provider.supports_structured_output(model), "{model}");
+		assert!(provider.enforces_response_schema(model), "{model}");
+	}
+	assert!(!provider.supports_structured_output("claude-3-7-sonnet-latest"));
+}
+
+#[test]
+fn output_format_schema_moves_unsupported_bounds_into_descriptions() {
+	let schema = serde_json::json!({
+		"type": "object",
+		"required": ["maximum", "tags"],
+		"properties": {
+			// A property named like a keyword stays.
+			"maximum": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Cap."},
+			"tags": {
+				"type": "array",
+				"minItems": 1,
+				"maxItems": 0,
+				"items": {"anyOf": [{"type": "object", "properties": {"t": {"type": "string", "maxLength": 0}}}]}
+			},
+			"many": {"type": "array", "minItems": 2, "items": {"type": "string"}}
+		}
+	});
+	let sent = output_format_schema(&schema);
+
+	assert_eq!(sent["additionalProperties"], false);
+	let cap = &sent["properties"]["maximum"];
+	assert!(cap.get("minimum").is_none() && cap.get("maximum").is_none());
+	assert_eq!(cap["description"], "Cap.\n\n{minimum: 1, maximum: 10}");
+	let tags = &sent["properties"]["tags"];
+	assert_eq!(tags["minItems"], 1, "minItems 0/1 is supported");
+	assert_eq!(tags["description"], "{maxItems: 0}");
+	let nested = &tags["items"]["anyOf"][0];
+	assert_eq!(nested["additionalProperties"], false);
+	assert_eq!(nested["properties"]["t"]["description"], "{maxLength: 0}");
+	assert_eq!(sent["properties"]["many"]["description"], "{minItems: 2}");
+	assert!(sent["properties"]["many"].get("minItems").is_none());
+}
+
+#[test]
+fn test_get_model_pricing() {
+	let provider = AnthropicProvider::new();
+
+	// Test Sonnet 4.6 pricing
+	let pricing = provider.get_model_pricing("claude-sonnet-4-6").unwrap();
+	assert_eq!(pricing.input_price_per_1m, 3.0);
+	assert_eq!(pricing.output_price_per_1m, 15.0);
+	assert_eq!(pricing.cache_write_price_per_1m, 3.75);
+	assert_eq!(pricing.cache_read_price_per_1m, 0.30);
+
+	// Test Opus 4.7 pricing
+	let pricing = provider.get_model_pricing("claude-opus-4-7").unwrap();
+	assert_eq!(pricing.input_price_per_1m, 5.0);
+	assert_eq!(pricing.output_price_per_1m, 25.0);
+	assert_eq!(pricing.cache_write_price_per_1m, 6.25);
+	assert_eq!(pricing.cache_read_price_per_1m, 0.50);
+
+	// Test Opus 4.7 context window
+	assert_eq!(provider.get_max_input_tokens("claude-opus-4-7"), 1_000_000);
+
+	// Test Haiku 4.5 pricing
+	let pricing = provider.get_model_pricing("claude-haiku-4-5").unwrap();
+	assert_eq!(pricing.input_price_per_1m, 1.00);
+	assert_eq!(pricing.output_price_per_1m, 5.00);
+	assert_eq!(pricing.cache_write_price_per_1m, 1.25);
+	assert_eq!(pricing.cache_read_price_per_1m, 0.10);
+
+	// Test case insensitive
+	let pricing = provider.get_model_pricing("CLAUDE-SONNET-4-6").unwrap();
+	assert_eq!(pricing.input_price_per_1m, 3.0);
+
+	// Test unknown model
+	assert!(provider.get_model_pricing("unknown-model").is_none());
+}
+
+#[test]
+fn test_opus_5_5() {
+	let provider = AnthropicProvider::new();
+	let model = "claude-opus-5-5";
+
+	assert!(provider.supports_model(model));
+
+	// Must not fall through to the Opus 5 row.
+	let pricing = provider.get_model_pricing(model).unwrap();
+	assert_eq!(pricing.input_price_per_1m, 4.0);
+	assert_eq!(pricing.output_price_per_1m, 20.0);
+	assert_eq!(pricing.cache_write_price_per_1m, 5.0);
+	assert_eq!(pricing.cache_read_price_per_1m, 0.20);
+
+	assert_eq!(provider.get_max_input_tokens(model), 1_000_000);
+	assert!(provider.supports_vision(model));
+	assert!(ADAPTIVE_ONLY_MODELS.iter().any(|p| model.contains(p)));
+	assert!(EFFORT_PARAM_MODELS.iter().any(|p| model.contains(p)));
+	assert_eq!(effort_value(model, ReasoningEffort::XHigh, true), "xhigh");
+	assert_eq!(effort_value(model, ReasoningEffort::Max, true), "max");
+}
+
+#[test]
+fn test_opus_5() {
+	let provider = AnthropicProvider::new();
+	let model = "claude-opus-5";
+
+	assert!(provider.supports_model(model));
+
+	let pricing = provider.get_model_pricing(model).unwrap();
+	assert_eq!(pricing.input_price_per_1m, 5.0);
+	assert_eq!(pricing.output_price_per_1m, 25.0);
+	assert_eq!(pricing.cache_write_price_per_1m, 6.25);
+	assert_eq!(pricing.cache_read_price_per_1m, 0.50);
+
+	assert_eq!(provider.get_max_input_tokens(model), 1_000_000);
+	assert!(provider.supports_vision(model));
+	assert!(THINKING_MODELS.contains(&"opus-5"));
+	assert!(ADAPTIVE_THINKING_MODELS.contains(&"opus-5"));
+	assert!(EFFORT_PARAM_MODELS.contains(&"opus-5"));
+	assert_eq!(effort_value(model, ReasoningEffort::XHigh, true), "xhigh");
+	assert_eq!(effort_value(model, ReasoningEffort::Max, true), "max");
+}
+
+#[test]
+fn test_fable_5() {
+	let provider = AnthropicProvider::new();
+
+	let model = "claude-fable-5";
+	assert!(provider.supports_model(model));
+
+	// $10/$50, cache write 1.25x = 12.50, cache read 0.1x = 1.00
+	let pricing = provider.get_model_pricing(model).unwrap();
+	assert_eq!(pricing.input_price_per_1m, 10.0);
+	assert_eq!(pricing.output_price_per_1m, 50.0);
+	assert_eq!(pricing.cache_write_price_per_1m, 12.50);
+	assert_eq!(pricing.cache_read_price_per_1m, 1.00);
+
+	// 1M context window and vision
+	assert_eq!(provider.get_max_input_tokens(model), 1_000_000);
+	assert!(provider.supports_vision(model));
+}
+
+#[test]
+fn test_fable_5_1() {
+	let provider = AnthropicProvider::new();
+
+	let model = "claude-fable-5-1";
+	assert!(provider.supports_model(model));
+
+	// Cache read is 0.025x input ($0.25), not the 0.1x every other Claude
+	// uses — proves the 5.1 row is matched ahead of the "claude-fable-5" row.
+	let pricing = provider.get_model_pricing(model).unwrap();
+	assert_eq!(pricing.input_price_per_1m, 10.0);
+	assert_eq!(pricing.output_price_per_1m, 50.0);
+	assert_eq!(pricing.cache_write_price_per_1m, 12.50);
+	assert_eq!(pricing.cache_read_price_per_1m, 0.25);
+
+	assert_eq!(provider.get_max_input_tokens(model), 1_000_000);
+	assert_eq!(effort_value(model, ReasoningEffort::XHigh, true), "xhigh");
+}
+
+#[test]
+fn test_fable_5_2() {
+	let provider = AnthropicProvider::new();
+
+	let model = "claude-fable-5-2";
+	assert!(provider.supports_model(model));
+
+	// $8/$40, cache write 1.25x = $10, cache read 0.025x = $0.20: proves the
+	// 5.2 row is matched ahead of the "claude-fable-5" row.
+	let pricing = provider.get_model_pricing(model).unwrap();
+	assert_eq!(pricing.input_price_per_1m, 8.0);
+	assert_eq!(pricing.output_price_per_1m, 40.0);
+	assert_eq!(pricing.cache_write_price_per_1m, 10.0);
+	assert_eq!(pricing.cache_read_price_per_1m, 0.20);
+
+	// 1M of each: input $8 + output $40 + 5m write $10 + 1h write (2x input) $16
+	// + cache read $0.20.
+	let cost = calculate_anthropic_cost(model, 1_000_000, 1_000_000, 1_000_000, 1_000_000, 1_000_000).unwrap();
+	assert!((cost - 74.20).abs() < 1e-9);
+
+	assert_eq!(provider.get_max_input_tokens(model), 1_000_000);
+	assert_eq!(effective_max_tokens(model, 0), 128_000);
+	assert!(provider.supports_vision(model));
+	assert_eq!(effort_value(model, ReasoningEffort::XHigh, true), "xhigh");
+	assert_eq!(effort_value(model, ReasoningEffort::Max, true), "max");
+
+	// Mythos 5.2 (limited availability) has the same rates in its own row.
+	let mythos = provider.get_model_pricing("claude-mythos-5-2").unwrap();
+	assert_eq!(mythos.input_price_per_1m, 8.0);
+	assert_eq!(mythos.output_price_per_1m, 40.0);
+	assert_eq!(mythos.cache_write_price_per_1m, 10.0);
+	assert_eq!(mythos.cache_read_price_per_1m, 0.20);
+}
+
+#[test]
+fn test_sonnet_5_5() {
+	let provider = AnthropicProvider::new();
+	let model = "claude-sonnet-5-5";
+
+	assert!(provider.supports_model(model));
+
+	let pricing = provider.get_model_pricing(model).unwrap();
+	assert_eq!(pricing.input_price_per_1m, 2.0);
+	assert_eq!(pricing.output_price_per_1m, 10.0);
+	assert_eq!(pricing.cache_write_price_per_1m, 2.50);
+	assert_eq!(pricing.cache_read_price_per_1m, 0.10);
+
+	assert_eq!(provider.get_max_input_tokens(model), 1_000_000);
+	assert!(provider.supports_vision(model));
+	assert!(ADAPTIVE_ONLY_MODELS.iter().any(|p| model.contains(p)));
+	assert!(EFFORT_PARAM_MODELS.iter().any(|p| model.contains(p)));
+	assert_eq!(effort_value(model, ReasoningEffort::XHigh, true), "xhigh");
+	assert_eq!(effort_value(model, ReasoningEffort::Max, true), "max");
+}
+
+#[test]
+fn test_sonnet_5() {
+	let provider = AnthropicProvider::new();
+
+	let model = "claude-sonnet-5";
+	assert!(provider.supports_model(model));
+
+	assert!(THINKING_MODELS.contains(&"sonnet-5"));
+	assert!(ADAPTIVE_THINKING_MODELS.contains(&"sonnet-5"));
+	assert!(ADAPTIVE_ONLY_MODELS.contains(&"sonnet-5"));
+	assert!(EFFORT_PARAM_MODELS.contains(&"sonnet-5"));
+	assert_eq!(effort_value(model, ReasoningEffort::XHigh, true), "xhigh");
+}
+
+#[test]
+fn test_mythos_5() {
+	let provider = AnthropicProvider::new();
+
+	// Project Glasswing only, but same pricing/capabilities as Fable 5
+	let model = "claude-mythos-5";
+	assert!(provider.supports_model(model));
+
+	// $10/$50, cache write 1.25x = 12.50, cache read 0.1x = 1.00
+	let pricing = provider.get_model_pricing(model).unwrap();
+	assert_eq!(pricing.input_price_per_1m, 10.0);
+	assert_eq!(pricing.output_price_per_1m, 50.0);
+	assert_eq!(pricing.cache_write_price_per_1m, 12.50);
+	assert_eq!(pricing.cache_read_price_per_1m, 1.00);
+
+	// 1M context window and vision
+	assert_eq!(provider.get_max_input_tokens(model), 1_000_000);
+	assert!(provider.supports_vision(model));
+}
+
+#[test]
+fn parallel_tool_results_share_one_user_message() {
+	let mut assistant = Message::assistant("");
+	assistant.tool_calls = Some(serde_json::json!([
+		{"id": "toolu_a", "name": "first", "arguments": {}, "meta": null},
+		{"id": "toolu_b", "name": "second", "arguments": {}, "meta": null}
+	]));
+
+	let messages = vec![
+		assistant,
+		Message::tool("result A", "toolu_a", "first"),
+		Message::tool("result B", "toolu_b", "second"),
+	];
+
+	let converted = convert_messages(&messages);
+	assert_eq!(converted.len(), 2);
+	assert_eq!(converted[0].role, "assistant");
+	assert_eq!(converted[1].role, "user");
+
+	let user_content = serde_json::to_value(&converted[1].content).unwrap();
+	let blocks = user_content.as_array().unwrap();
+	assert_eq!(blocks.len(), 2);
+	assert_eq!(blocks[0]["type"], "tool_result");
+	assert_eq!(blocks[0]["tool_use_id"], "toolu_a");
+	assert_eq!(blocks[1]["type"], "tool_result");
+	assert_eq!(blocks[1]["tool_use_id"], "toolu_b");
+}
+
+#[test]
+fn tool_results_merge_following_user_hint() {
+	let messages = vec![
+		Message::tool("result A", "toolu_a", "first"),
+		Message::tool("result B", "toolu_b", "second"),
+		Message::user("Please use those results."),
+	];
+
+	let converted = convert_messages(&messages);
+	assert_eq!(converted.len(), 1);
+	assert_eq!(converted[0].role, "user");
+
+	let content = serde_json::to_value(&converted[0].content).unwrap();
+	let blocks = content.as_array().unwrap();
+	assert_eq!(blocks.len(), 3);
+	assert_eq!(blocks[0]["tool_use_id"], "toolu_a");
+	assert_eq!(blocks[1]["tool_use_id"], "toolu_b");
+	assert_eq!(blocks[2]["type"], "text");
+	assert_eq!(blocks[2]["text"], "Please use those results.");
+}
+
+#[test]
+fn test_haiku_5_5() {
+	let provider = AnthropicProvider::new();
+	let model = "claude-haiku-5-5";
+	assert!(provider.supports_model(model));
+	assert!(provider.supports_model("CLAUDE-HAIKU-5-5"));
+	assert_eq!(provider.get_max_input_tokens(model), 1_000_000);
+	assert!(provider.supports_vision(model));
+	assert!(provider.supports_caching(model));
+	assert!(provider.supports_structured_output(model));
+	let pricing = provider.get_model_pricing(model).unwrap();
+	assert_eq!(pricing.input_price_per_1m, 0.10);
+	assert_eq!(pricing.output_price_per_1m, 0.50);
+	assert_eq!(pricing.cache_write_price_per_1m, 0.125);
+	assert_eq!(pricing.cache_read_price_per_1m, 0.01);
+	assert!(THINKING_MODELS.iter().any(|p| model.contains(p)));
+	assert!(ADAPTIVE_THINKING_MODELS.iter().any(|p| model.contains(p)));
+	assert!(ADAPTIVE_ONLY_MODELS.iter().any(|p| model.contains(p)));
+	assert!(EFFORT_PARAM_MODELS.iter().any(|p| model.contains(p)));
+	for (effort, expected) in [
+		(ReasoningEffort::Low, "low"),
+		(ReasoningEffort::Medium, "medium"),
+		(ReasoningEffort::High, "high"),
+		(ReasoningEffort::XHigh, "xhigh"),
+		(ReasoningEffort::Max, "max"),
+	] {
+		assert_eq!(effort_value(model, effort, true), expected);
+	}
+}
+
+#[test]
+fn haiku_5_5_cost_tiers_include_all_prompt_tokens() {
+	for prompt_tokens in [99_999, 100_000, 100_001] {
+		// Each input category independently crosses the boundary, including
+		// both cache-write TTLs. Output alone must never select the high tier.
+		for category in 0..4 {
+			let mut tokens = [0; 4];
+			tokens[category] = prompt_tokens;
+			let cost = calculate_anthropic_cost(
+				"CLAUDE-HAIKU-5-5",
+				tokens[0],
+				1_000_000,
+				tokens[1],
+				tokens[2],
+				tokens[3],
+			)
+			.unwrap();
+			let rate = [0.10, 0.125, 0.20, 0.01][category];
+			let multiplier = if prompt_tokens > 100_000 { 5.0 } else { 1.0 };
+			let expected = (prompt_tokens as f64 / 1_000_000.0 * rate + 0.50) * multiplier;
+			assert!((cost - expected).abs() < 1e-12);
+		}
+	}
+	// The combined prompt crosses 100k even though each individual counter doesn't.
+	let cost = calculate_anthropic_cost("claude-haiku-5-5", 25_001, 10_000, 25_000, 25_000, 25_000).unwrap();
+	assert!((cost - 0.0793755).abs() < 1e-12);
+	// Other Claude models must not acquire Haiku's tiered pricing.
+	let cost = calculate_anthropic_cost("claude-haiku-4-5", 100_001, 1_000_000, 0, 0, 0).unwrap();
+	assert!((cost - 5.100001).abs() < 1e-12);
+}
+
+#[test]
+fn tool_images_stay_inside_the_matching_tool_result() {
+	for text in ["caption", ""] {
+		let converted = convert_messages(&[shared::tests::tool_image_message(text)]);
+		let value = serde_json::to_value(&converted).unwrap();
+		let result = &value[0]["content"][0];
+		assert_eq!(result["type"], "tool_result");
+		assert_eq!(result["tool_use_id"], "call_image");
+		let offset = usize::from(!text.is_empty());
+		assert_eq!(result["content"][offset]["type"], "image");
+		assert_eq!(result["content"][offset]["source"]["data"], "aW1hZ2U=");
+		assert_eq!(
+			result["content"][offset + 1]["source"]["url"],
+			"https://example.com/screenshot.jpg"
+		);
+	}
+}
+
+#[test]
+fn thinking_off_follows_each_model_switch() {
+	let off = |model: &str| {
+		let mut body = serde_json::json!({});
+		apply_thinking_off(model, &mut body);
+		body
+	};
+
+	// Always-on models: "disabled" is a 400, so drop effort to "low" instead.
+	for model in [
+		"claude-opus-5-5",
+		"claude-fable-5",
+		"claude-fable-5-1",
+		"claude-fable-5-2",
+		"claude-mythos-5",
+		"claude-mythos-5-1",
+		"claude-mythos-5-2",
+	] {
+		assert_eq!(
+			off(model),
+			serde_json::json!({"output_config": {"effort": "low"}}),
+			"{model}"
+		);
+	}
+
+	// Sonnet 5.5 rejects "disabled"; "between_tools" is its off switch.
+	assert_eq!(
+		off("claude-sonnet-5-5"),
+		serde_json::json!({"thinking": {"type": "between_tools"}})
+	);
+
+	for model in ["claude-opus-5", "claude-sonnet-5", "claude-haiku-5-5"] {
+		assert_eq!(
+			off(model),
+			serde_json::json!({"thinking": {"type": "disabled"}}),
+			"{model}"
+		);
+	}
+
+	// Thinking is already off by default on these models.
+	for model in [
+		"claude-opus-4-8",
+		"claude-opus-4-7",
+		"claude-opus-4-6",
+		"claude-sonnet-4-6",
+		"claude-opus-4-5",
+		"claude-haiku-4-5",
+	] {
+		assert_eq!(off(model), serde_json::json!({}), "{model}");
+	}
+}
+
+#[test]
+fn test_effective_max_tokens() {
+	// An explicit cap always wins.
+	assert_eq!(effective_max_tokens("claude-opus-5-5", 1024), 1024);
+
+	// 0 = no limit: the model's output ceiling, never an omitted field.
+	assert_eq!(effective_max_tokens("claude-opus-5-5", 0), 128_000);
+	assert_eq!(effective_max_tokens("claude-sonnet-4-6", 0), 128_000);
+	assert_eq!(effective_max_tokens("claude-opus-4-5", 0), 64_000);
+	assert_eq!(effective_max_tokens("claude-haiku-4-5", 0), 64_000);
+	assert_eq!(effective_max_tokens("claude-3-haiku", 0), 4_096);
+}
+
+#[test]
+fn test_calculate_cost_with_cache_full_breakdown() {
+	// claude-opus-4-7: 5.00 input / 25.00 output / 6.25 cache write / 0.50 cache read per 1M
+	let cost = calculate_cost_with_cache(
+		"claude-opus-4-7",
+		CacheTokenUsage {
+			regular_input_tokens: 1_000_000,
+			cache_creation_tokens: 1_000_000,
+			cache_creation_tokens_1h: 1_000_000,
+			cache_read_tokens: 1_000_000,
+			output_tokens: 1_000_000,
+		},
+	)
+	.unwrap();
+	// 5.00 + 6.25 + 10.00 (2x base) + 0.50 + 25.00 = 46.75
+	assert!((cost - 46.75).abs() < 1e-9, "got {cost}");
+}
+
+#[test]
+fn test_calculate_cost_with_cache_zero_usage() {
+	let cost = calculate_cost_with_cache(
+		"claude-sonnet-4-6",
+		CacheTokenUsage {
+			regular_input_tokens: 0,
+			cache_creation_tokens: 0,
+			cache_creation_tokens_1h: 0,
+			cache_read_tokens: 0,
+			output_tokens: 0,
+		},
+	)
+	.unwrap();
+	assert_eq!(cost, 0.0);
+}
+
+#[test]
+fn test_calculate_cost_with_cache_unknown_model_is_none() {
+	let usage = CacheTokenUsage {
+		regular_input_tokens: 100,
+		cache_creation_tokens: 0,
+		cache_creation_tokens_1h: 0,
+		cache_read_tokens: 0,
+		output_tokens: 10,
+	};
+	assert!(calculate_cost_with_cache("not-a-claude", usage).is_none());
+}
+
+#[test]
+fn test_calculate_cost_haiku_5_5_long_context_multiplier() {
+	// Identical token mix, straddling the 100k prompt-token threshold:
+	// prompt tokens = regular input + cache reads.
+	let just_below = calculate_anthropic_cost("claude-haiku-5-5", 99_999, 1_000, 0, 0, 0).unwrap();
+	let just_above = calculate_anthropic_cost("claude-haiku-5-5", 100_001, 1_000, 0, 0, 0).unwrap();
+	// The 5x long-context multiplier dominates the 2-token difference.
+	assert!(
+		(just_above - just_below * 5.0).abs() < 1e-4,
+		"below {just_below} above {just_above}"
+	);
+}
+
+#[test]
+fn test_effort_value_xhigh_and_max_ceiling() {
+	// XHigh passes through on models that list it...
+	assert_eq!(effort_value("claude-opus-5", ReasoningEffort::XHigh, false), "xhigh");
+	// ...and collapses to high on models that do not.
+	assert_eq!(effort_value("claude-haiku-4-5", ReasoningEffort::XHigh, false), "high");
+	// Max needs adaptive support; otherwise it floors to high.
+	assert_eq!(effort_value("claude-opus-5", ReasoningEffort::Max, true), "max");
+	assert_eq!(effort_value("claude-opus-5", ReasoningEffort::Max, false), "high");
+	assert_eq!(effort_value("claude-sonnet-4-6", ReasoningEffort::Low, false), "low");
+	assert_eq!(
+		effort_value("claude-sonnet-4-6", ReasoningEffort::Medium, false),
+		"medium"
+	);
+	assert_eq!(effort_value("claude-sonnet-4-6", ReasoningEffort::High, false), "high");
+}
+
+#[test]
+fn test_apply_thinking_off_per_model_family() {
+	let mut body = serde_json::json!({});
+	apply_thinking_off("claude-opus-5-5", &mut body);
+	assert_eq!(body["output_config"]["effort"], "low");
+	assert!(body.get("thinking").is_none());
+
+	let mut body = serde_json::json!({});
+	apply_thinking_off("claude-fable-5", &mut body);
+	assert_eq!(body["output_config"]["effort"], "low");
+
+	let mut body = serde_json::json!({});
+	apply_thinking_off("claude-sonnet-5-5", &mut body);
+	assert_eq!(body["thinking"]["type"], "between_tools");
+
+	let mut body = serde_json::json!({});
+	apply_thinking_off("claude-opus-5", &mut body);
+	assert_eq!(body["thinking"]["type"], "disabled");
+
+	let mut body = serde_json::json!({});
+	apply_thinking_off("claude-sonnet-5", &mut body);
+	assert_eq!(body["thinking"]["type"], "disabled");
+
+	// Models that default to thinking-off get nothing.
+	let mut body = serde_json::json!({});
+	apply_thinking_off("claude-opus-4-5", &mut body);
+	assert!(body.as_object().unwrap().is_empty());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn chat_completion_via_mock_http_splits_blocks_and_cache_usage() {
+	let body = r#"{"id":"mock-anthropic","content":[{"type":"text","text":"final answer"},{"type":"thinking","thinking":"step by step"},{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"Oslo"}}],"usage":{"input_tokens":10,"output_tokens":30,"cache_creation_input_tokens":2,"cache_read_input_tokens":4},"stop_reason":"tool_use"}"#;
+	let mock = crate::test_support::mock_http::MockHttp::start(vec![(200, body.to_string())]);
+	let _env = EnvGuard::new().set("ANTHROPIC_API_URL", mock.url.clone());
+
+	let provider = AnthropicProvider::new();
+	let params = ChatCompletionParams::new(&[], "claude-sonnet-4-6", 10).with_api_key("mock-key".to_owned());
+	let response = provider.chat_completion(params).await.expect("mock completion");
+
+	// Text blocks become content; thinking rides its own block; tool_use maps to calls.
+	assert_eq!(response.content, "final answer");
+	assert_eq!(
+		response.thinking.as_ref().expect("thinking present").content,
+		"step by step"
+	);
+	let calls = response.tool_calls.expect("tool calls present");
+	assert_eq!(calls.len(), 1);
+	assert_eq!(calls[0].name, "get_weather");
+	assert_eq!(calls[0].arguments["city"], "Oslo");
+
+	let usage = response.exchange.usage.expect("usage present");
+	assert_eq!(usage.input_tokens, 10);
+	assert_eq!(usage.cache_write_tokens, 2);
+	assert_eq!(usage.cache_read_tokens, 4);
+	assert!(usage.cost.unwrap_or(0.0) > 0.0, "cost computed from the pricing table");
+	assert_eq!(response.finish_reason.as_deref(), Some("tool_use"));
+
+	let requests = mock.requests();
+	let req_body: serde_json::Value = serde_json::from_str(&requests[0].body).expect("request json");
+	assert_eq!(req_body["model"], "claude-sonnet-4-6");
+	for field in ["temperature", "top_p", "top_k"] {
+		assert!(req_body.get(field).is_none(), "{field} must not be sent");
+	}
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn chat_completion_sends_output_config_format_next_to_effort() {
+	let body = r#"{"id":"mock-anthropic","content":[{"type":"thinking","thinking":""},{"type":"text","text":"{\"verdict\":\"PASS\"}"}],"usage":{"input_tokens":10,"output_tokens":5},"stop_reason":"end_turn"}"#;
+	let mock = crate::test_support::mock_http::MockHttp::start(vec![(200, body.to_string())]);
+	let _env = EnvGuard::new().set("ANTHROPIC_API_URL", mock.url.clone());
+
+	let schema = serde_json::json!({
+		"type": "object",
+		"required": ["verdict"],
+		"properties": {"verdict": {"type": "string", "enum": ["PASS", "GAPS"]}}
+	});
+	let mut params = ChatCompletionParams::new(&[], "claude-opus-5-5", 100).with_api_key("mock-key".to_owned());
+	params.reasoning_effort = Some(ReasoningEffort::Medium);
+	params.response_format = Some(crate::llm::types::StructuredOutputRequest {
+		format: OutputFormat::JsonSchema,
+		mode: crate::llm::types::ResponseMode::Strict,
+		schema: Some(schema),
+	});
+	let response = AnthropicProvider::new()
+		.chat_completion(params)
+		.await
+		.expect("mock completion");
+	assert_eq!(response.structured_output, Some(serde_json::json!({"verdict": "PASS"})));
+
+	let req_body: serde_json::Value = serde_json::from_str(&mock.requests()[0].body).expect("request json");
+	assert_eq!(req_body["output_config"]["effort"], "medium");
+	assert_eq!(req_body["output_config"]["format"]["type"], "json_schema");
+	assert_eq!(
+		req_body["output_config"]["format"]["schema"]["additionalProperties"],
+		false
+	);
+	assert!(req_body.get("tools").is_none(), "no forced tool call");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn chat_completion_via_mock_http_surfaces_http_error() {
+	let mock = crate::test_support::mock_http::MockHttp::start(vec![(
+		400,
+		r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad request"}}"#.to_string(),
+	)]);
+	let _env = EnvGuard::new().set("ANTHROPIC_API_URL", mock.url.clone());
+
+	let provider = AnthropicProvider::new();
+	let params = ChatCompletionParams::new(&[], "claude-sonnet-4-6", 10).with_api_key("mock-key".to_owned());
+	let err = provider.chat_completion(params).await.expect_err("http error surfaces");
+	assert!(
+		err.to_string().contains("Anthropic API error"),
+		"unexpected error: {err}"
+	);
+}
+
+/// Content blocks of one assistant turn as Anthropic returns them: signed and
+/// redacted thinking first, then text and a tool call.
+fn thinking_turn_blocks() -> serde_json::Value {
+	serde_json::json!([
+		{"type": "thinking", "thinking": "plan", "signature": "sig-1"},
+		{"type": "redacted_thinking", "data": "opaque"},
+		{"type": "text", "text": "checking"},
+		{"type": "tool_use", "id": "toolu_a", "name": "first", "input": {"q": 1}}
+	])
+}
+
+fn assistant_with_items(provider: &str, items: serde_json::Value, tool_ids: &[&str]) -> Message {
+	let mut message = Message::assistant("checking");
+	message.provider_items = Some(serde_json::json!({"provider": provider, "items": items}));
+	if !tool_ids.is_empty() {
+		message.tool_calls = Some(serde_json::Value::Array(
+			tool_ids
+				.iter()
+				.map(|id| serde_json::json!({"id": id, "name": "first", "arguments": {"q": 1}, "meta": null}))
+				.collect(),
+		));
+	}
+	message
+}
+
+fn request_with_thinking(thinking: Option<serde_json::Value>, messages: &[Message]) -> serde_json::Value {
+	let mut body = serde_json::json!({"messages": convert_messages(messages)});
+	if let Some(thinking) = thinking {
+		body["thinking"] = thinking;
+	}
+	body
+}
+
+fn block_types(message: &serde_json::Value) -> Vec<&str> {
+	message["content"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.map(|block| block["type"].as_str().unwrap())
+		.collect()
+}
+
+#[test]
+fn output_items_are_set_only_when_thinking_is_present() {
+	let mut with_thinking = serde_json::json!({"content": thinking_turn_blocks()});
+	set_response_output_items(&mut with_thinking);
+	assert_eq!(with_thinking["output_items"]["provider"], PROVIDER_NAME);
+	assert_eq!(with_thinking["output_items"]["items"], thinking_turn_blocks());
+
+	let mut redacted_only = serde_json::json!({"content": [{"type": "redacted_thinking", "data": "x"}]});
+	set_response_output_items(&mut redacted_only);
+	assert!(redacted_only.get("output_items").is_some());
+
+	let mut plain = serde_json::json!({"content": [{"type": "text", "text": "hi"}]});
+	set_response_output_items(&mut plain);
+	assert!(plain.get("output_items").is_none());
+}
+
+#[test]
+fn thinking_blocks_replay_verbatim_in_original_order() {
+	let messages = vec![
+		Message::user("go"),
+		assistant_with_items(PROVIDER_NAME, thinking_turn_blocks(), &["toolu_a"]),
+	];
+	let converted = serde_json::to_value(convert_messages(&messages)).unwrap();
+
+	assert_eq!(converted[1]["role"], "assistant");
+	// Signature, redacted payload and block order all survive untouched.
+	assert_eq!(converted[1]["content"], thinking_turn_blocks());
+}
+
+#[test]
+fn replay_falls_back_to_stored_fields_on_provider_or_tool_id_mismatch() {
+	let other_provider = assistant_with_items("openai", thinking_turn_blocks(), &["toolu_a"]);
+	let other_tool_id = assistant_with_items(PROVIDER_NAME, thinking_turn_blocks(), &["toolu_b"]);
+	let missing_tool_calls = assistant_with_items(PROVIDER_NAME, thinking_turn_blocks(), &[]);
+
+	for (message, expected_tool_id) in [
+		(other_provider, Some("toolu_a")),
+		(other_tool_id, Some("toolu_b")),
+		(missing_tool_calls, None),
+	] {
+		let converted = serde_json::to_value(convert_messages(&[message])).unwrap();
+		let blocks = converted[0]["content"].as_array().unwrap();
+		assert!(
+			blocks.iter().all(|block| !is_thinking_block(block)),
+			"reconstructed content has no thinking: {blocks:?}"
+		);
+		assert_eq!(blocks[0]["type"], "text");
+		assert_eq!(blocks.get(1).and_then(|block| block["id"].as_str()), expected_tool_id);
+	}
+}
+
+#[test]
+fn replayed_cache_control_lands_on_the_last_text_block() {
+	let items = serde_json::json!([
+		{"type": "thinking", "thinking": "plan", "signature": "sig-1"},
+		{"type": "text", "text": "first"},
+		{"type": "tool_use", "id": "toolu_a", "name": "first", "input": {}},
+		{"type": "text", "text": "last"}
+	]);
+
+	let mut cached = assistant_with_items(PROVIDER_NAME, items.clone(), &["toolu_a"]);
+	cached.cached = true;
+	cached.cache_ttl = Some("1h".to_string());
+	let converted = serde_json::to_value(convert_messages(&[cached])).unwrap();
+	let blocks = &converted[0]["content"];
+	assert_eq!(
+		blocks[3]["cache_control"],
+		serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+	);
+	for untouched in [0, 1, 2] {
+		assert!(blocks[untouched].get("cache_control").is_none(), "block {untouched}");
+	}
+
+	let uncached = assistant_with_items(PROVIDER_NAME, items, &["toolu_a"]);
+	let converted = serde_json::to_value(convert_messages(&[uncached])).unwrap();
+	assert!(converted[0]["content"][3].get("cache_control").is_none());
+}
+
+#[test]
+fn block_binding_is_sent_on_every_adaptive_or_enabled_request() {
+	let history = [
+		Message::user("go"),
+		assistant_with_items(PROVIDER_NAME, thinking_turn_blocks(), &["toolu_a"]),
+	];
+
+	for thinking in [
+		serde_json::json!({"type": "adaptive"}),
+		serde_json::json!({"type": "enabled", "budget_tokens": 2048}),
+	] {
+		let mut body = request_with_thinking(Some(thinking), &history);
+		apply_thinking_replay_policy(&mut body);
+		assert_eq!(
+			body["thinking"]["block_binding"],
+			serde_json::json!({"prefix_mismatch_behavior": "drop_block"})
+		);
+		assert_eq!(block_types(&body["messages"][1]).len(), 4, "thinking blocks kept");
+		assert!(build_beta_header(&body).contains(THINKING_BINDING_BETA));
+	}
+
+	// Nothing replayed yet (turn one): still bound, so the thinking config, which
+	// is part of the cached prompt, does not change on turn two.
+	let mut no_replay = request_with_thinking(
+		Some(serde_json::json!({"type": "adaptive"})),
+		&[Message::user("go"), Message::assistant("hi")],
+	);
+	apply_thinking_replay_policy(&mut no_replay);
+	assert_eq!(
+		no_replay["thinking"]["block_binding"],
+		serde_json::json!({"prefix_mismatch_behavior": "drop_block"})
+	);
+	assert!(build_beta_header(&no_replay).contains(THINKING_BINDING_BETA));
+}
+
+#[test]
+fn thinking_blocks_are_stripped_unless_thinking_binds() {
+	let thinking_only = assistant_with_items(
+		PROVIDER_NAME,
+		serde_json::json!([{"type": "thinking", "thinking": "x", "signature": "s"}]),
+		&[],
+	);
+	let history = [
+		Message::user("go"),
+		assistant_with_items(PROVIDER_NAME, thinking_turn_blocks(), &["toolu_a"]),
+		thinking_only,
+	];
+
+	for thinking in [
+		Some(serde_json::json!({"type": "disabled"})),
+		Some(serde_json::json!({"type": "between_tools"})),
+		None,
+	] {
+		let mut body = request_with_thinking(thinking, &history);
+		apply_thinking_replay_policy(&mut body);
+
+		// Text and tool_use stay; the message that was only thinking is gone.
+		let messages = body["messages"].as_array().unwrap();
+		assert_eq!(messages.len(), 2, "{body}");
+		assert_eq!(block_types(&messages[1]), ["text", "tool_use"]);
+		assert!(body["thinking"].get("block_binding").is_none());
+		assert!(!build_beta_header(&body).contains(THINKING_BINDING_BETA));
+	}
+}
+
+#[test]
+fn beta_header_keeps_cache_betas_fixed_and_adds_the_ones_the_request_uses() {
+	let plain = serde_json::json!({});
+	assert_eq!(
+		build_beta_header(&plain),
+		"prompt-caching-2024-07-31,extended-cache-ttl-2025-04-11"
+	);
+
+	let bound = serde_json::json!({"thinking": {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}}});
+	assert_eq!(
+		build_beta_header(&bound),
+		"prompt-caching-2024-07-31,extended-cache-ttl-2025-04-11,thinking-binding-controls-2026-08-01"
+	);
+
+	let threaded = serde_json::json!({"thread": {"type": "create"}});
+	assert_eq!(
+		build_beta_header(&threaded),
+		"prompt-caching-2024-07-31,extended-cache-ttl-2025-04-11,message-threads-2026-08-12"
+	);
+}
+
+fn turn(
+	content: &str,
+	tool_calls: Option<Vec<ToolCall>>,
+	structured_output: Option<serde_json::Value>,
+	finish_reason: Option<&str>,
+) -> ProviderResponse {
+	ProviderResponse {
+		content: content.to_string(),
+		thinking: None,
+		exchange: ProviderExchange::new(serde_json::json!({}), serde_json::json!({}), None, PROVIDER_NAME),
+		tool_calls,
+		finish_reason: finish_reason.map(str::to_string),
+		structured_output,
+		id: None,
+	}
+}
+
+#[test]
+fn empty_turn_detection() {
+	let call = ToolCall {
+		id: "toolu_a".to_string(),
+		name: "first".to_string(),
+		arguments: serde_json::json!({}),
+	};
+
+	for reason in ["end_turn", "tool_use"] {
+		assert!(is_empty_turn(&turn("", None, None, Some(reason))), "{reason}");
+		assert!(
+			is_empty_turn(&turn(" \n", None, None, Some(reason))),
+			"{reason} whitespace"
+		);
+		assert!(
+			!is_empty_turn(&turn("text", None, None, Some(reason))),
+			"{reason} with text"
+		);
+		assert!(
+			!is_empty_turn(&turn("", Some(vec![call.clone()]), None, Some(reason))),
+			"{reason} with tool calls"
+		);
+		assert!(
+			!is_empty_turn(&turn("", None, Some(serde_json::json!({"a": 1})), Some(reason))),
+			"{reason} with structured output"
+		);
+	}
+	for reason in [Some("max_tokens"), Some("length"), Some("refusal"), None] {
+		assert!(!is_empty_turn(&turn("", None, None, reason)), "{reason:?}");
+	}
+}
+
+#[test]
+fn add_usage_sums_every_counter_and_both_optionals() {
+	let usage = |scale: u64, cost: Option<f64>, request_time_ms: Option<u64>| TokenUsage {
+		input_tokens: scale,
+		cache_read_tokens: 2 * scale,
+		cache_write_tokens: 3 * scale,
+		output_tokens: 4 * scale,
+		reasoning_tokens: 5 * scale,
+		total_tokens: 15 * scale,
+		cost,
+		request_time_ms,
+	};
+
+	let mut total = usage(10, Some(0.5), Some(200));
+	add_usage(&mut total, &usage(1, Some(0.25), Some(100)));
+	assert_eq!(
+		(
+			total.input_tokens,
+			total.cache_read_tokens,
+			total.cache_write_tokens,
+			total.output_tokens,
+			total.reasoning_tokens,
+			total.total_tokens
+		),
+		(11, 22, 33, 44, 55, 165)
+	);
+	assert_eq!(total.cost, Some(0.75));
+	assert_eq!(total.request_time_ms, Some(300));
+
+	// One side unknown keeps the other; both unknown stays unknown.
+	let mut total = usage(1, None, None);
+	add_usage(&mut total, &usage(1, Some(0.25), Some(100)));
+	assert_eq!((total.cost, total.request_time_ms), (Some(0.25), Some(100)));
+	let mut total = usage(1, Some(0.25), Some(100));
+	add_usage(&mut total, &usage(1, None, None));
+	assert_eq!((total.cost, total.request_time_ms), (Some(0.25), Some(100)));
+	let mut total = usage(1, None, None);
+	add_usage(&mut total, &usage(1, None, None));
+	assert_eq!((total.cost, total.request_time_ms), (None, None));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn chat_completion_keeps_thinking_blocks_verbatim_and_skips_redacted_text() {
+	let body = r#"{"id":"mock-anthropic","content":[{"type":"thinking","thinking":"plan","signature":"sig-1"},{"type":"redacted_thinking","data":"opaque"},{"type":"text","text":"answer"}],"usage":{"input_tokens":10,"output_tokens":5},"stop_reason":"end_turn"}"#;
+	let mock = crate::test_support::mock_http::MockHttp::start(vec![(200, body.to_string())]);
+	let _env = EnvGuard::new().set("ANTHROPIC_API_URL", mock.url.clone());
+
+	let params =
+		ChatCompletionParams::new(&[Message::user("hi")], "claude-sonnet-4-6", 10).with_api_key("mock-key".to_owned());
+	let response = AnthropicProvider::new()
+		.chat_completion(params)
+		.await
+		.expect("mock completion");
+
+	assert_eq!(response.content, "answer");
+	assert_eq!(response.thinking.expect("thinking text").content, "plan");
+	let items = &response.exchange.response["output_items"];
+	assert_eq!(items["provider"], PROVIDER_NAME);
+	assert_eq!(items["items"][0]["signature"], "sig-1");
+	assert_eq!(items["items"][1]["type"], "redacted_thinking");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn chat_completion_continues_an_empty_turn_once_and_bills_both_calls() {
+	let empty = r#"{"id":"first","content":[{"type":"thinking","thinking":"This part of the response was interrupted before it finished.","signature":"s"}],"usage":{"input_tokens":10,"output_tokens":5},"stop_reason":"tool_use"}"#;
+	let answered = r#"{"id":"second","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":20,"output_tokens":7},"stop_reason":"end_turn"}"#;
+	let mock =
+		crate::test_support::mock_http::MockHttp::start(vec![(200, empty.to_string()), (200, answered.to_string())]);
+	let _env = EnvGuard::new().set("ANTHROPIC_API_URL", mock.url.clone());
+
+	let params =
+		ChatCompletionParams::new(&[Message::user("hi")], "claude-sonnet-4-6", 10).with_api_key("mock-key".to_owned());
+	let response = AnthropicProvider::new()
+		.chat_completion(params)
+		.await
+		.expect("mock completion");
+
+	assert_eq!(response.content, "done");
+	let requests = mock.requests();
+	assert_eq!(requests.len(), 2);
+	let first: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+	let second: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
+	assert_eq!(first["messages"].as_array().unwrap().len(), 1);
+	assert_eq!(
+		second["messages"][1],
+		serde_json::json!({"role": "user", "content": CONTINUATION_PROMPT})
+	);
+
+	let usage = response.exchange.usage.expect("usage present");
+	assert_eq!(usage.input_tokens, 30);
+	assert_eq!(usage.output_tokens + usage.reasoning_tokens, 12);
+	assert_eq!(usage.total_tokens, 42);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn chat_completion_does_not_loop_on_repeated_empty_turns() {
+	let empty = r#"{"id":"empty","content":[],"usage":{"input_tokens":10,"output_tokens":1},"stop_reason":"end_turn"}"#;
+	let mock = crate::test_support::mock_http::MockHttp::start(vec![(200, empty.to_string())]);
+	let _env = EnvGuard::new().set("ANTHROPIC_API_URL", mock.url.clone());
+
+	let params =
+		ChatCompletionParams::new(&[Message::user("hi")], "claude-sonnet-4-6", 10).with_api_key("mock-key".to_owned());
+	let response = AnthropicProvider::new()
+		.chat_completion(params)
+		.await
+		.expect("mock completion");
+
+	assert!(response.content.is_empty());
+	assert_eq!(mock.requests().len(), 2, "one retry, no more");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cache_prewarm_sends_zero_max_tokens_without_streaming_and_returns_cache_usage() {
+	let body = r#"{"id":"warm","content":[],"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":900},"stop_reason":"end_turn"}"#;
+	let mock = crate::test_support::mock_http::MockHttp::start(vec![(200, body.to_string())]);
+	let _env = EnvGuard::new().set("ANTHROPIC_API_URL", mock.url.clone());
+
+	let params = ChatCompletionParams::new(&[Message::user("hi")], "claude-sonnet-4-6", 10)
+		.with_api_key("mock-key".to_owned())
+		.with_cache_prewarm(true);
+	let response = AnthropicProvider::new()
+		.chat_completion(params)
+		.await
+		.expect("pre-warm completion");
+
+	assert!(response.content.is_empty());
+	assert_eq!(response.exchange.usage.expect("usage present").cache_read_tokens, 900);
+	let requests = mock.requests();
+	assert_eq!(requests.len(), 1, "empty pre-warm turn is not retried");
+	let req_body: serde_json::Value = serde_json::from_str(&requests[0].body).expect("request json");
+	assert_eq!(req_body["max_tokens"], 0);
+	assert_ne!(req_body["stream"], true);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn regular_requests_keep_streaming_and_the_effective_max_tokens() {
+	let body = r#"{"id":"mock","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1},"stop_reason":"end_turn"}"#;
+	let mock = crate::test_support::mock_http::MockHttp::start(vec![(200, body.to_string())]);
+	let _env = EnvGuard::new().set("ANTHROPIC_API_URL", mock.url.clone());
+
+	let params =
+		ChatCompletionParams::new(&[Message::user("hi")], "claude-sonnet-4-6", 0).with_api_key("mock-key".to_owned());
+	AnthropicProvider::new()
+		.chat_completion(params)
+		.await
+		.expect("mock completion");
+
+	let req_body: serde_json::Value = serde_json::from_str(&mock.requests()[0].body).expect("request json");
+	assert_eq!(req_body["max_tokens"], 128_000);
+	assert_eq!(req_body["stream"], true);
+}
+
+fn text_reply(id: &str, stop_reason: &str) -> String {
+	format!(
+		r#"{{"id":"{id}","content":[{{"type":"text","text":"reply"}}],"usage":{{"input_tokens":1,"output_tokens":1}},"stop_reason":"{stop_reason}"}}"#
+	)
+}
+
+fn thread_error(status: u16, code: &str) -> (u16, String) {
+	(
+		status,
+		format!(
+			r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"thread","details":{{"error_code":"{code}"}}}}}}"#
+		),
+	)
+}
+
+fn thread_params(messages: &[Message]) -> ChatCompletionParams {
+	let tool = crate::llm::types::FunctionDefinition {
+		name: "lookup".to_string(),
+		description: "Look something up".to_string(),
+		parameters: serde_json::json!({"type": "object", "properties": {}}),
+		cache_control: None,
+		freeform: None,
+	};
+	let mut params = ChatCompletionParams::new(messages, "claude-opus-5-5", 100).with_api_key("mock-key".to_owned());
+	params.tools = Some(vec![tool]);
+	params
+}
+
+async fn complete_threaded(url: &str, messages: &[Message]) -> Result<ProviderResponse> {
+	AnthropicProvider::new()
+		.complete(thread_params(messages), url.to_string(), true)
+		.await
+}
+
+fn request_json(mock: &crate::test_support::mock_http::MockHttp, index: usize) -> serde_json::Value {
+	serde_json::from_str(&mock.requests()[index].body).expect("request json")
+}
+
+fn first_turn() -> Vec<Message> {
+	vec![Message::system("Be brief."), Message::user("hi")]
+}
+
+/// The conversation after `first` answered [`first_turn`], with one new message.
+fn second_turn(first: &ProviderResponse) -> Vec<Message> {
+	let mut assistant = Message::assistant(&first.content);
+	assistant.id = first.id.clone();
+	let mut messages = first_turn();
+	messages.extend([assistant, Message::user("and now?")]);
+	messages
+}
+
+#[tokio::test]
+async fn thread_is_created_then_continued_with_only_the_new_messages() {
+	let mock = crate::test_support::mock_http::MockHttp::start(vec![
+		(200, text_reply("msg_1", "end_turn")),
+		(200, text_reply("msg_2", "end_turn")),
+	]);
+
+	let first = complete_threaded(&mock.url, &first_turn()).await.expect("first turn");
+	let first_id = first.id.clone().expect("response id");
+	assert!(first_id.starts_with(THREAD_ID_PREFIX) && first_id.ends_with(":msg_1"));
+
+	let create = request_json(&mock, 0);
+	assert_eq!(create["thread"], serde_json::json!({"type": "create"}));
+	assert_eq!(create["system"], "Be brief.");
+	assert_eq!(create["tools"][0]["name"], "lookup");
+	assert!(mock.requests()[0]
+		.header("anthropic-beta")
+		.is_some_and(|betas| betas.contains(MESSAGE_THREADS_BETA)));
+
+	let second = complete_threaded(&mock.url, &second_turn(&first))
+		.await
+		.expect("second turn");
+	assert!(second.id.expect("response id").ends_with(":msg_2"));
+
+	let continued = request_json(&mock, 1);
+	assert_eq!(
+		continued["thread"],
+		serde_json::json!({"type": "continue", "previous_message_id": "msg_1"})
+	);
+	assert_eq!(
+		continued["messages"],
+		serde_json::json!([{"role": "user", "content": [{"type": "text", "text": "and now?"}]}])
+	);
+	assert!(continued.get("system").is_none() && continued.get("tools").is_none());
+	// Fixed fields go out on every request of the thread.
+	assert_eq!(continued["tool_choice"], create["tool_choice"]);
+	assert_eq!(continued["model"], create["model"]);
+}
+
+#[tokio::test]
+async fn edited_history_or_moved_cache_marker_decide_whether_a_thread_continues() {
+	let mock = crate::test_support::mock_http::MockHttp::start(vec![
+		(200, text_reply("msg_1", "end_turn")),
+		(200, text_reply("msg_2", "end_turn")),
+		(200, text_reply("msg_3", "end_turn")),
+	]);
+	let first = complete_threaded(&mock.url, &first_turn()).await.expect("first turn");
+
+	// An earlier message changed: the thread holds the old one, so start anew.
+	let mut edited = second_turn(&first);
+	edited[1].content = "hello".to_string();
+	complete_threaded(&mock.url, &edited).await.expect("edited turn");
+	let create = request_json(&mock, 1);
+	assert_eq!(create["thread"]["type"], "create");
+	assert_eq!(create["messages"].as_array().expect("messages").len(), 3);
+
+	// Only a cache marker moved: the conversation is the same, so continue.
+	let mut marked = second_turn(&first);
+	marked[1].cached = true;
+	complete_threaded(&mock.url, &marked).await.expect("marked turn");
+	assert_eq!(request_json(&mock, 2)["thread"]["type"], "continue");
+}
+
+#[tokio::test]
+async fn changed_tools_start_a_new_thread() {
+	let mock = crate::test_support::mock_http::MockHttp::start(vec![
+		(200, text_reply("msg_1", "end_turn")),
+		(200, text_reply("msg_2", "end_turn")),
+	]);
+	let first = complete_threaded(&mock.url, &first_turn()).await.expect("first turn");
+
+	let mut params = thread_params(&second_turn(&first));
+	params.tools = None;
+	AnthropicProvider::new()
+		.complete(params, mock.url.clone(), true)
+		.await
+		.expect("second turn");
+	let create = request_json(&mock, 1);
+	assert_eq!(create["thread"]["type"], "create");
+	assert!(create.get("tools").is_none());
+}
+
+#[tokio::test]
+async fn a_thread_the_api_cannot_continue_is_replayed_in_full() {
+	for code in THREAD_REPLAY_CODES {
+		let mock = crate::test_support::mock_http::MockHttp::start(vec![
+			(200, text_reply("msg_1", "end_turn")),
+			thread_error(if code == "thread_not_found" { 404 } else { 400 }, code),
+			(200, text_reply("msg_2", "end_turn")),
+		]);
+		let first = complete_threaded(&mock.url, &first_turn()).await.expect("first turn");
+
+		let second = complete_threaded(&mock.url, &second_turn(&first))
+			.await
+			.expect("replayed turn");
+		assert!(second.id.expect("response id").ends_with(":msg_2"), "{code}");
+
+		assert_eq!(request_json(&mock, 1)["thread"]["type"], "continue", "{code}");
+		let replay = request_json(&mock, 2);
+		assert_eq!(replay["thread"], serde_json::json!({"type": "create"}), "{code}");
+		assert_eq!(replay["messages"].as_array().expect("messages").len(), 3, "{code}");
+		assert_eq!(replay["system"], "Be brief.", "{code}");
+	}
+}
+
+#[tokio::test]
+async fn unsupported_threads_fall_back_to_the_plain_request() {
+	let mock = crate::test_support::mock_http::MockHttp::start(vec![
+		thread_error(400, THREAD_UNSUPPORTED_CODE),
+		(200, text_reply("msg_1", "end_turn")),
+	]);
+	let response = complete_threaded(&mock.url, &first_turn())
+		.await
+		.expect("plain request");
+	assert_eq!(response.id.as_deref(), Some("msg_1"), "nothing to continue");
+
+	let plain = request_json(&mock, 1);
+	assert!(plain.get("thread").is_none());
+	assert!(!mock.requests()[1]
+		.header("anthropic-beta")
+		.is_some_and(|betas| betas.contains(MESSAGE_THREADS_BETA)));
+}
+
+#[tokio::test]
+async fn other_errors_of_a_continue_request_surface_unchanged() {
+	let mock = crate::test_support::mock_http::MockHttp::start(vec![
+		(200, text_reply("msg_1", "end_turn")),
+		(
+			400,
+			r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad request"}}"#.to_string(),
+		),
+	]);
+	let first = complete_threaded(&mock.url, &first_turn()).await.expect("first turn");
+	let err = complete_threaded(&mock.url, &second_turn(&first))
+		.await
+		.expect_err("error surfaces");
+	assert!(err.to_string().contains("Anthropic API error 400"));
+	assert_eq!(mock.requests().len(), 2, "no replay");
+}
+
+#[tokio::test]
+async fn a_refused_turn_is_not_continued() {
+	let mock = crate::test_support::mock_http::MockHttp::start(vec![(200, text_reply("msg_1", "refusal"))]);
+	let response = complete_threaded(&mock.url, &first_turn()).await.expect("refusal");
+	assert_eq!(response.id.as_deref(), Some("msg_1"));
+}
+
+#[tokio::test]
+async fn the_empty_turn_retry_stays_a_plain_request() {
+	let empty = r#"{"id":"msg_1","content":[],"usage":{"input_tokens":1,"output_tokens":1},"stop_reason":"end_turn"}"#;
+	let mock = crate::test_support::mock_http::MockHttp::start(vec![
+		(200, empty.to_string()),
+		(200, text_reply("msg_2", "end_turn")),
+	]);
+	let response = complete_threaded(&mock.url, &first_turn())
+		.await
+		.expect("continued turn");
+	assert_eq!(response.id.as_deref(), Some("msg_2"));
+	let retry = request_json(&mock, 1);
+	assert!(retry.get("thread").is_none());
+	assert_eq!(
+		retry["messages"][1],
+		serde_json::json!({"role": "user", "content": CONTINUATION_PROMPT})
+	);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_custom_endpoint_gets_no_thread() {
+	let mock = crate::test_support::mock_http::MockHttp::start(vec![(200, text_reply("msg_1", "end_turn"))]);
+	let _env = EnvGuard::new().set("ANTHROPIC_API_URL", mock.url.clone());
+	let response = AnthropicProvider::new()
+		.chat_completion(thread_params(&first_turn()))
+		.await
+		.expect("completion");
+	assert_eq!(response.id.as_deref(), Some("msg_1"));
+	assert!(request_json(&mock, 0).get("thread").is_none());
+}
+
+#[tokio::test]
+async fn a_1h_marker_coming_or_going_keeps_the_thread() {
+	let mock = crate::test_support::mock_http::MockHttp::start(vec![
+		(200, text_reply("msg_1", "end_turn")),
+		(200, text_reply("msg_2", "end_turn")),
+	]);
+	let mut opening = first_turn();
+	opening[1].cached = true;
+	opening[1].cache_ttl = Some("1h".to_string());
+	let first = complete_threaded(&mock.url, &opening).await.expect("first turn");
+
+	// The caller evicted the 1h marker; the thread must still continue.
+	complete_threaded(&mock.url, &second_turn(&first))
+		.await
+		.expect("second turn");
+	let requests = mock.requests();
+	assert_eq!(request_json(&mock, 1)["thread"]["type"], "continue");
+	assert_eq!(
+		requests[0].header("anthropic-beta"),
+		requests[1].header("anthropic-beta"),
+		"a thread fixes the beta set"
+	);
+}
+
+#[test]
+fn cache_lifetime_follows_the_marker_ttl_and_sets_the_keepalive_interval() {
+	let provider = AnthropicProvider::new();
+	let short = std::time::Duration::from_secs(300);
+	let long = std::time::Duration::from_secs(3600);
+	assert_eq!(provider.cache_lifetime("claude-sonnet-5-5", false), Some(short));
+	assert_eq!(provider.cache_lifetime("claude-sonnet-5-5", true), Some(long));
+	let ping = provider
+		.keepalive_policy("claude-sonnet-5-5", false)
+		.expect("5m policy");
+	assert_eq!(ping.interval, std::time::Duration::from_secs(270));
+}

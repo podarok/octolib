@@ -23,7 +23,7 @@
 //! ## API-Based Providers (require API keys)
 //!
 //! - **Voyage AI**: Latest reranker models with multilingual support
-//!   - Models: `rerank-2.5`, `rerank-2.5-lite`, `rerank-2`, `rerank-2-lite`
+//!   - Models: `rerank-3`, `rerank-3-lite`, `rerank-2.5`, `rerank-2.5-lite`, `rerank-2`, `rerank-2-lite`
 //!   - Requires: `VOYAGE_API_KEY` environment variable
 //!
 //! - **Cohere**: Enterprise-grade reranking with multiple language support
@@ -31,11 +31,11 @@
 //!   - Requires: `COHERE_API_KEY` environment variable
 //!
 //! - **Jina AI**: Multilingual reranking with automatic chunking for long documents
-//!   - Models: `jina-reranker-v3`, `jina-reranker-m0`, `jina-reranker-v2-base-multilingual`, `jina-colbert-v2`
+//!   - Models: `jina-reranker-v3.5`, `jina-reranker-v3`, `jina-reranker-m0`, `jina-reranker-v2-base-multilingual`, `jina-colbert-v2`
 //!   - Requires: `JINA_API_KEY` environment variable
 //!
 //! - **Mixedbread**: Open-source-friendly reranking with strong multilingual benchmarks
-//!   - Models: `mxbai-rerank-large-v2`, `mxbai-rerank-base-v2`, `mxbai-rerank-large-v1`, `mxbai-rerank-base-v1`
+//!   - Models: `mixedbread-ai/mxbai-rerank-v3.1-listwise`, `mxbai-rerank-large-v2`
 //!   - Requires: `MXBAI_API_KEY` environment variable
 //!
 //! ## Local Providers
@@ -68,7 +68,7 @@
 //!     ];
 //!
 //!     // Rerank with Voyage AI (requires VOYAGE_API_KEY)
-//!     let response = rerank(query, documents, "voyage", "rerank-2.5", Some(2)).await?;
+//!     let response = rerank(query, documents, "voyage", "rerank-3", Some(2)).await?;
 //!
 //!     for result in response.results {
 //!         println!("Score: {:.4} - {}", result.relevance_score, result.document);
@@ -142,7 +142,7 @@ pub use types::{parse_provider_model, RerankProviderType, RerankResponse, Rerank
 /// * `query` - The search query
 /// * `documents` - List of documents to rerank
 /// * `provider` - Provider name (e.g., "voyage")
-/// * `model` - Model name (e.g., "rerank-2.5")
+/// * `model` - Model name (e.g., "rerank-3")
 /// * `top_k` - Optional number of top results to return (None = all)
 ///
 /// # Returns
@@ -159,22 +159,22 @@ pub use types::{parse_provider_model, RerankProviderType, RerankResponse, Rerank
 ///     "machine learning",
 ///     vec!["AI tutorial".to_string(), "Cooking recipes".to_string()],
 ///     "voyage",
-///     "rerank-2.5",
+///     "rerank-3",
 ///     Some(1)
 /// ).await?;
 /// # Ok(())
 /// # }
 /// ```
 pub async fn rerank(
-    query: &str,
-    documents: Vec<String>,
-    provider: &str,
-    model: &str,
-    top_k: Option<usize>,
+	query: &str,
+	documents: Vec<String>,
+	provider: &str,
+	model: &str,
+	top_k: Option<usize>,
 ) -> Result<RerankResponse> {
-    let (provider_type, _) = parse_provider_model(&format!("{}:{}", provider, model))?;
-    let provider_impl = create_rerank_provider_from_parts(&provider_type, model).await?;
-    provider_impl.rerank(query, documents, top_k, true).await
+	let (provider_type, _) = parse_provider_model(&format!("{}:{}", provider, model))?;
+	let provider_impl = create_rerank_provider_from_parts(&provider_type, model).await?;
+	provider_impl.rerank(query, documents, top_k, true).await
 }
 
 /// Rerank documents with custom truncation setting
@@ -184,7 +184,7 @@ pub async fn rerank(
 /// * `query` - The search query
 /// * `documents` - List of documents to rerank
 /// * `provider` - Provider name (e.g., "voyage")
-/// * `model` - Model name (e.g., "rerank-2.5")
+/// * `model` - Model name (e.g., "rerank-3")
 /// * `top_k` - Optional number of top results to return
 /// * `truncation` - Whether to truncate long inputs (true = truncate, false = error on overflow)
 ///
@@ -192,135 +192,18 @@ pub async fn rerank(
 ///
 /// `RerankResponse` containing sorted results with relevance scores
 pub async fn rerank_with_truncation(
-    query: &str,
-    documents: Vec<String>,
-    provider: &str,
-    model: &str,
-    top_k: Option<usize>,
-    truncation: bool,
+	query: &str,
+	documents: Vec<String>,
+	provider: &str,
+	model: &str,
+	top_k: Option<usize>,
+	truncation: bool,
 ) -> Result<RerankResponse> {
-    let (provider_type, _) = parse_provider_model(&format!("{}:{}", provider, model))?;
-    let provider_impl = create_rerank_provider_from_parts(&provider_type, model).await?;
-    provider_impl
-        .rerank(query, documents, top_k, truncation)
-        .await
+	let (provider_type, _) = parse_provider_model(&format!("{}:{}", provider, model))?;
+	let provider_impl = create_rerank_provider_from_parts(&provider_type, model).await?;
+	provider_impl.rerank(query, documents, top_k, truncation).await
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_provider_model() {
-        let (provider, model) = parse_provider_model("voyage:rerank-2.5").unwrap();
-        assert_eq!(provider, RerankProviderType::Voyage);
-        assert_eq!(model, "rerank-2.5");
-
-        let (provider, model) = parse_provider_model("cohere:rerank-english-v3.0").unwrap();
-        assert_eq!(provider, RerankProviderType::Cohere);
-        assert_eq!(model, "rerank-english-v3.0");
-
-        let (provider, model) = parse_provider_model("jina:jina-reranker-v3").unwrap();
-        assert_eq!(provider, RerankProviderType::Jina);
-        assert_eq!(model, "jina-reranker-v3");
-
-        #[cfg(feature = "fastembed")]
-        {
-            let (provider, model) = parse_provider_model("fastembed:bge-reranker-base").unwrap();
-            assert_eq!(provider, RerankProviderType::FastEmbed);
-            assert_eq!(model, "bge-reranker-base");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_create_provider() {
-        // API-based providers - require API keys
-        let voyage =
-            create_rerank_provider_from_parts(&RerankProviderType::Voyage, "rerank-2.5").await;
-        match voyage {
-            Ok(_) => {}
-            Err(e) => {
-                // Expected if no API key is set
-                assert!(
-                    e.to_string().contains("API key") || e.to_string().contains("VOYAGE_API_KEY"),
-                    "Expected API key error, got: {}",
-                    e
-                );
-            }
-        }
-
-        let cohere =
-            create_rerank_provider_from_parts(&RerankProviderType::Cohere, "rerank-english-v3.0")
-                .await;
-        match cohere {
-            Ok(_) => {}
-            Err(e) => {
-                // Expected if no API key is set
-                assert!(
-                    e.to_string().contains("API key") || e.to_string().contains("COHERE_API_KEY"),
-                    "Expected API key error, got: {}",
-                    e
-                );
-            }
-        }
-
-        let jina =
-            create_rerank_provider_from_parts(&RerankProviderType::Jina, "jina-reranker-v3").await;
-        match jina {
-            Ok(_) => {}
-            Err(e) => {
-                // Expected if no API key is set
-                assert!(
-                    e.to_string().contains("API key") || e.to_string().contains("JINA_API_KEY"),
-                    "Expected API key error, got: {}",
-                    e
-                );
-            }
-        }
-
-        // FastEmbed - local provider, may require model download
-        #[cfg(feature = "fastembed")]
-        {
-            let fastembed = create_rerank_provider_from_parts(
-                &RerankProviderType::FastEmbed,
-                "bge-reranker-base",
-            )
-            .await;
-            match fastembed {
-                Ok(provider) => {
-                    assert!(provider.is_model_supported());
-                }
-                Err(e) => {
-                    // Model download may be needed - graceful handling for CI
-                    println!(
-                        "FastEmbed provider creation skipped (model download needed): {}",
-                        e
-                    );
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_invalid_models() {
-        let result =
-            create_rerank_provider_from_parts(&RerankProviderType::Voyage, "invalid-model").await;
-        assert!(result.is_err());
-
-        let result =
-            create_rerank_provider_from_parts(&RerankProviderType::Cohere, "invalid-model").await;
-        assert!(result.is_err());
-
-        let result =
-            create_rerank_provider_from_parts(&RerankProviderType::Jina, "invalid-model").await;
-        assert!(result.is_err());
-
-        #[cfg(feature = "fastembed")]
-        {
-            let result =
-                create_rerank_provider_from_parts(&RerankProviderType::FastEmbed, "invalid-model")
-                    .await;
-            assert!(result.is_err());
-        }
-    }
-}
+#[path = "mod_tests.rs"]
+mod tests;

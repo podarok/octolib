@@ -1,11 +1,11 @@
 [package]
 name = "octolib"
-version = "0.34.7"
+version = "0.56.0"
 edition = "2021"
 authors = ["Muvon Un Limited <contact@muvon.io>"]
 license = "Apache-2.0"
 description = "Self-sufficient AI provider library with multi-provider support, embedding models, model validation, and cost tracking"
-homepage = "https://octolib.muvon.io"
+homepage = "https://octomind.run/product/octolib"
 repository = "https://github.com/muvon/octolib"
 keywords = ["ai", "llm", "embeddings", "providers", "openai"]
 categories = ["api-bindings", "development-tools"]
@@ -14,35 +14,70 @@ categories = ["api-bindings", "development-tools"]
 exclude = ["scripts/"]
 
 [features]
-default = ["fastembed", "huggingface"]
-fastembed = ["dep:fastembed"]
-huggingface = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
+default = ["llm", "embeddings", "reranker", "media", "evaluation", "fastembed", "huggingface", "hindsight"]
 
-# Hardware acceleration — enable whichever matches your hardware.
-# Each feature activates the backend in both candle and fastembed (when those features are active).
-metal = ["fastembed?/metal", "candle-core?/metal", "candle-nn?/metal"]
-mkl = ["fastembed?/mkl", "candle-core?/mkl", "candle-nn?/mkl"]
-accelerate = ["fastembed?/accelerate", "candle-core?/accelerate", "candle-nn?/accelerate"]
-cuda = ["fastembed?/cuda", "candle-core?/cuda", "candle-nn?/cuda"]
-cudnn = ["fastembed?/cudnn", "candle-core?/cudnn", "candle-nn?/cudnn"]
+# Capability modules. Each gates one top-level module and the dependencies only
+# it needs, so an LLM-only build does not compile the media or embedding stack.
+llm = ["dep:jsonschema", "dep:jsonwebtoken", "dep:base64"]
+# Optional WebSocket transports; HTTP/SSE remains the per-request default.
+websockets = ["llm", "dep:reqwest-websocket", "dep:futures-util", "dep:tungstenite"]
+embeddings = ["dep:tiktoken-rs"]
+reranker = []
+media = ["dep:base64"]
+evaluation = ["dep:base64"]
+terminal = ["dep:crossterm", "dep:fuzzy-matcher"]
+
+# Local embedding backends. Both are useless without the embedding module, so
+# they enable it. Both also enable `onnx`, so the ONNX provider is present
+# whenever any local backend is — it is never a separate opt-in.
+fastembed = ["embeddings", "onnx", "dep:fastembed"]
+huggingface = ["embeddings", "onnx", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
+
+# ONNX Runtime embedding provider: runs a HF-hosted `onnx/` export through ORT
+# instead of candle. Not selected directly — `fastembed` and `huggingface` both
+# turn it on. It borrows the session builder from the fastembed crate, which is
+# why it pulls that dep even in a candle-only build, and names `ort` directly
+# because the one process-wide `Environment` (src/ort_env.rs) is built here.
+onnx = ["embeddings", "dep:fastembed", "dep:tokenizers", "dep:hf-hub", "dep:ort"]
+
+# hindsight: the calibrated next-turn-correction verifier for coding-agent
+# traces (`octolib::hindsight`), two ONNX graphs run through ort directly.
+# Needs `onnx` for the tokenizer, hf-hub download, the shared ort environment
+# and the ort binary that fastembed's feature set provides.
+hindsight = ["onnx"]
+
+# FastEmbed uses ONNX; these acceleration features configure the HuggingFace backend.
+# macOS local backends compile Metal support through target-specific dependencies below.
+# This feature selects Metal for HuggingFace at runtime; it is a no-op elsewhere.
+metal = []
+accelerate = ["candle-core?/accelerate", "candle-nn?/accelerate"]
+cuda = ["candle-core?/cuda", "candle-nn?/cuda"]
+cudnn = ["candle-core?/cudnn", "candle-nn?/cudnn"]
 
 [dependencies]
-async-trait = "0.1.89"
-anyhow = "1.0.102"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "gzip", "brotli", "zstd", "deflate", "http2", "charset"], default-features = false }
-tokio = { version = "1.52.3", features = ["time", "sync", "macros", "rt-multi-thread"] }
+async-trait = "0.1.92"
+anyhow = "1.0.104"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls", "rustls-tls-native-roots", "gzip", "brotli", "zstd", "deflate", "http2", "charset"], default-features = false }
+# 0.5.x shares the existing reqwest 0.12 client and its TLS/proxy configuration.
+reqwest-websocket = { version = "0.5.1", optional = true }
+futures-util = { version = "0.3", features = ["sink"], optional = true }
+tokio = { version = "1.54.1", features = ["time", "sync", "macros", "rt-multi-thread", "net", "io-util"] }
+# Only the `Layer`/`Service` traits, for the connect-timing layer.
+tower = { version = "0.5", default-features = false }
 arc-swap = "1"
-base64 = "0.22"
-thiserror = "2.0.18"
+base64 = { version = "0.22", optional = true }
+crossterm = { version = "0.29.0", optional = true }
+fuzzy-matcher = { version = "0.3.7", optional = true }
+thiserror = "2.0.21"
 tracing = "0.1.44"
-dirs = "6.0.0"
-jsonwebtoken = "10"
+dirs = "7.0.0"
+jsonwebtoken = { version = "10", optional = true }
 # Schema validation only — no $ref resolution over HTTP/file needed (client
 # schemas are self-contained), so default features (which pull in a second
 # reqwest/rustls stack) are disabled.
-jsonschema = { version = "0.46.9", default-features = false }
+jsonschema = { version = "0.46.10", default-features = false, optional = true }
 
 sha2 = "0.10"
 hex = "0.4"
@@ -50,30 +85,150 @@ hex = "0.4"
 # Configuration file handling (utils::config_migration / utils::config_file):
 # toml_edit preserves user comments and formatting across migrations, fs4 gives
 # the cross-platform advisory lock, uuid names the atomic-write temp file.
-toml_edit = "0.25.13"
+toml_edit = "0.25.19"
 fs4 = "0.8.4"
 uuid = { version = "1", features = ["v4"] }
 
 # Embedding dependencies
-tiktoken-rs = "0.9.1"
+tiktoken-rs = { version = "0.9.1", optional = true }
 
-# Optional embedding provider dependencies
-fastembed = { version = "5.13.4", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
-# Candle dependencies for HuggingFace support (optional)
-# Pinned to 0.10.2 to match fastembed's candle version (qwen3 feature)
-candle-core = { version = "0.10.2", optional = true }
-candle-nn = { version = "0.10.2", optional = true }
-candle-transformers = { version = "0.10.2", optional = true }
-tokenizers = { version = "0.22.2", optional = true }
+# Pinned to the exact version fastembed depends on so one ort links; the
+# runtime binary comes through fastembed's download feature. rc.15 allows one
+# `Environment` per process, built once in src/ort_env.rs.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "api-24"], optional = true }
+candle-transformers = { version = "0.11.1", optional = true }
+tokenizers = { version = "0.23.2", optional = true }
 # HuggingFace Hub - use rustls-tls to avoid native-tls dependency
-# Pinned to 0.4.x to share single version with fastembed (which uses hf-hub 0.4.1)
-hf-hub = { version = "0.4.3", default-features = false, features = ["tokio", "rustls-tls"], optional = true }
+# Pinned to 0.5.x to share single version with fastembed (which uses hf-hub 0.5.0)
+hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "rustls-tls"], optional = true }
+
+# Examples only build when the module they exercise is enabled.
+
+[[example]]
+name = "amazon_bedrock"
+required-features = ["llm"]
+
+[[example]]
+name = "anthropic_oauth"
+required-features = ["llm"]
+
+[[example]]
+name = "cloudflare_workers_ai"
+required-features = ["llm"]
+
+[[example]]
+name = "fireworks_chat"
+required-features = ["llm"]
+
+[[example]]
+name = "google_vertex_ai"
+required-features = ["llm"]
+
+[[example]]
+name = "hetzner_chat"
+required-features = ["llm"]
+
+[[example]]
+name = "inception_chat"
+required-features = ["llm"]
+
+[[example]]
+name = "cache_lifetime_probe"
+required-features = ["llm"]
+
+[[example]]
+name = "isoquant_chat"
+required-features = ["llm"]
+
+[[example]]
+name = "reflection_chat"
+required-features = ["llm"]
+
+[[example]]
+name = "xiaomi_chat"
+required-features = ["llm"]
+
+[[example]]
+name = "local_chat"
+required-features = ["llm"]
+
+[[example]]
+name = "meta_chat"
+required-features = ["llm"]
+
+[[example]]
+name = "minimax_chat"
+required-features = ["llm"]
+
+[[example]]
+name = "moonshot_vision"
+required-features = ["llm"]
+
+[[example]]
+name = "openai_oauth"
+required-features = ["llm"]
+
+[[example]]
+name = "structured_output"
+required-features = ["llm"]
+
+[[example]]
+name = "test_structured_output"
+required-features = ["llm"]
+
+[[example]]
+name = "tinker_chat"
+required-features = ["llm"]
+
+[[example]]
+name = "xai"
+required-features = ["llm"]
+
+[[example]]
+name = "webwright_chat"
+required-features = ["llm"]
+
+[[example]]
+name = "media_fal"
+required-features = ["media"]
+
+[[example]]
+name = "media_higgsfield"
+required-features = ["media"]
+
+[[example]]
+name = "media_openrouter"
+required-features = ["media"]
+
+[[example]]
+name = "media_openrouter_audio_video"
+required-features = ["media"]
+
+[[example]]
+name = "media_replicate"
+required-features = ["media"]
+
+[[example]]
+name = "openrouter_embeddings"
+required-features = ["embeddings"]
+
+[[example]]
+name = "reranker_basic"
+required-features = ["reranker"]
+
+[[example]]
+name = "reranker_comparison"
+required-features = ["reranker"]
 
 [dev-dependencies]
-serial_test = "3.4.0"
+tokio = { version = "1.54.1", features = ["test-util"] }
+tokio-tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }
+# Examples encode local media inline regardless of which features are on.
+base64 = "0.22"
+serial_test = "3.5.0"
 tracing-subscriber = "0.3"
 # Migration tests assert on the parsed result, not on the edited document.
-toml = "1.1"
+toml = "1.2"
 
 # Release build: optimized for distribution (no native-specific instructions)
 [profile.release]
@@ -81,3 +236,22 @@ opt-level = "z"
 lto = "thin"           # faster than "fat" lto, still significant gains
 codegen-units = 1      # max optimization, slower compile
 strip = "symbols"
+# Keep Apple dependencies off other platforms without a separate helper crate.
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "api-24", "coreml"], optional = true }
+fastembed = { version = "7.7.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
+candle-core = { version = "0.11.1", features = ["metal"], optional = true }
+candle-nn = { version = "0.11.1", features = ["metal"], optional = true }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+fastembed = { version = "7.7.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
+candle-core = { version = "0.11.1", optional = true }
+candle-nn = { version = "0.11.1", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tungstenite = { version = "0.27", default-features = false, optional = true }
+
+# Caches DNS answers for their TTL. Linux only: on macOS and Windows it would
+# skip per-domain DNS (VPN split DNS, /etc/resolver/*, .local names).
+[target.'cfg(target_os = "linux")'.dependencies]
+hickory-resolver = { version = "0.26.3", features = ["tokio"] }

@@ -15,151 +15,259 @@
 //! Anthropic provider implementation
 
 use super::shared;
-use crate::errors::ProviderError;
 use crate::llm::retry;
 use crate::llm::traits::{AiProvider, KeepalivePolicy};
 use crate::llm::types::{
-    ChatCompletionParams, Message, ProviderExchange, ProviderResponse, ReasoningEffort,
-    SamplingSupport, ThinkingBlock, TokenUsage, ToolCall,
+	ChatCompletionParams, Message, OutputFormat, ProviderExchange, ProviderResponse, ReasoningEffort, ThinkingBlock,
+	TokenUsage, ToolCall,
 };
-use crate::llm::utils::{
-    get_model_pricing, is_model_in_pricing_table, normalize_model_name, PricingTuple,
-};
+use crate::llm::utils::{get_model_pricing, is_model_in_pricing_table, normalize_model_name, PricingTuple};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::env;
 
 /// Anthropic pricing constants (per 1M tokens in USD)
 /// Model IDs sourced from Anthropic model docs / models API.
-/// Prices sourced from Anthropic pricing docs (verified Aug 26, 2026).
+/// Prices sourced from Anthropic pricing docs (verified Nov 10, 2026).
 /// Format: (model, input, output, cache_write, cache_read)
-const PRICING: &[PricingTuple] = &[
-    // Mythos-class (Fable 5): $10/$50, cache write 1.25x, cache read 0.1x
-    ("claude-fable-5", 10.00, 50.00, 12.50, 1.00),
-    // Claude Mythos 5 (Project Glasswing only): same pricing/capabilities as Fable 5
-    ("claude-mythos-5", 10.00, 50.00, 12.50, 1.00),
-    // Claude Opus 5
-    ("claude-opus-5", 5.00, 25.00, 6.25, 0.50),
-    // Claude 4.8
-    ("claude-opus-4-8", 5.00, 25.00, 6.25, 0.50),
-    // Claude 4.7
-    ("claude-opus-4-7", 5.00, 25.00, 6.25, 0.50),
-    // Claude Sonnet 5: $2/$10 introductory pricing was made permanent Aug 10, 2026.
-    // Cache write is the 5m rate (1.25x input); the 1h tier is $4.00 and isn't
-    // representable here.
-    ("claude-sonnet-5", 2.00, 10.00, 2.50, 0.20),
-    // Claude 4.6
-    ("claude-sonnet-4-6-20260217", 3.00, 15.00, 3.75, 0.30),
-    ("claude-sonnet-4-6", 3.00, 15.00, 3.75, 0.30),
-    ("claude-opus-4-6-20260217", 5.00, 25.00, 6.25, 0.50),
-    ("claude-opus-4-6", 5.00, 25.00, 6.25, 0.50),
-    // Claude 4.5
-    ("claude-opus-4-5-20251101", 5.00, 25.00, 6.25, 0.50),
-    ("claude-haiku-4-5-20251001", 1.00, 5.00, 1.25, 0.10),
-    ("claude-sonnet-4-5-20250929", 3.00, 15.00, 3.75, 0.30),
-    // Official API aliases (hyphenated)
-    ("claude-opus-4-5", 5.00, 25.00, 6.25, 0.50),
-    ("claude-haiku-4-5", 1.00, 5.00, 1.25, 0.10),
-    ("claude-sonnet-4-5", 3.00, 15.00, 3.75, 0.30),
-    // Claude 4 / 4.1
-    ("claude-opus-4-1-20250805", 15.00, 75.00, 18.75, 1.50),
-    ("claude-opus-4-20250514", 15.00, 75.00, 18.75, 1.50),
-    ("claude-sonnet-4-20250514", 3.00, 15.00, 3.75, 0.30),
-    ("claude-opus-4-1", 15.00, 75.00, 18.75, 1.50),
-    ("claude-opus-4-0", 15.00, 75.00, 18.75, 1.50),
-    ("claude-opus-4", 15.00, 75.00, 18.75, 1.50),
-    ("claude-sonnet-4-0", 3.00, 15.00, 3.75, 0.30),
-    ("claude-sonnet-4", 3.00, 15.00, 3.75, 0.30),
-    // Claude 3.7
-    ("claude-3-7-sonnet-20250219", 3.00, 15.00, 3.75, 0.30),
-    ("claude-3-7-sonnet", 3.00, 15.00, 3.75, 0.30),
-    // Claude 3.5 (hyphenated format)
-    ("claude-3-5-sonnet", 3.00, 15.00, 3.75, 0.30),
-    ("claude-3-5-haiku-20241022", 0.80, 4.00, 1.00, 0.08),
-    ("claude-3-5-haiku", 0.80, 4.00, 1.00, 0.08),
-    // Claude 3.5 (dot notation aliases - common user format)
-    ("claude-3.5-sonnet", 3.00, 15.00, 3.75, 0.30),
-    ("claude-3.5-haiku", 0.80, 4.00, 1.00, 0.08),
-    // Claude 3
-    ("claude-3-opus", 15.00, 75.00, 18.75, 1.50),
-    ("claude-3-sonnet", 3.00, 15.00, 3.75, 0.30),
-    ("claude-3-haiku-20240307", 0.25, 1.25, 0.30, 0.03),
-    ("claude-3-haiku", 0.25, 1.25, 0.30, 0.03),
+pub(crate) const PRICING: &[PricingTuple] = &[
+	// Mythos-class 5.2 and 5.1: cache write 1.25x, but cache read is 0.025x
+	// input; Opus 5.5 below is the other model off 0.1x.
+	// Must precede the 5 entries: lookup is a first-match substring scan.
+	("claude-fable-5-2", 8.00, 40.00, 10.00, 0.20),
+	("claude-mythos-5-2", 8.00, 40.00, 10.00, 0.20),
+	("claude-fable-5-1", 10.00, 50.00, 12.50, 0.25),
+	("claude-mythos-5-1", 10.00, 50.00, 12.50, 0.25),
+	// Mythos-class (Fable 5): $10/$50, cache write 1.25x, cache read 0.1x
+	("claude-fable-5", 10.00, 50.00, 12.50, 1.00),
+	// Claude Mythos 5 (Project Glasswing only): same pricing/capabilities as Fable 5
+	("claude-mythos-5", 10.00, 50.00, 12.50, 1.00),
+	// Claude Opus 5.5: cache read is 0.05x ($0.20). Must precede the Opus 5 row.
+	("claude-opus-5-5", 4.00, 20.00, 5.00, 0.20),
+	// Claude Opus 5
+	("claude-opus-5", 5.00, 25.00, 6.25, 0.50),
+	// Claude 4.8
+	("claude-opus-4-8", 5.00, 25.00, 6.25, 0.50),
+	// Claude 4.7
+	("claude-opus-4-7", 5.00, 25.00, 6.25, 0.50),
+	// Claude Sonnet 5.5: Sonnet 5 rates except cache read is 0.05x ($0.10).
+	// Must precede the Sonnet 5 row.
+	("claude-sonnet-5-5", 2.00, 10.00, 2.50, 0.10),
+	// Claude Sonnet 5: $2/$10 introductory pricing was made permanent Aug 10, 2026.
+	// Cache write is the 5m rate (1.25x input); the 1h tier is $4.00 and isn't
+	// representable here.
+	("claude-sonnet-5", 2.00, 10.00, 2.50, 0.20),
+	// Claude Haiku 5.5: base rates for prompts up to 100k tokens.
+	// Longer prompts multiply every rate by 5 in calculate_cost_with_cache.
+	("claude-haiku-5-5", 0.10, 0.50, 0.125, 0.01),
+	// Claude 4.6
+	("claude-sonnet-4-6", 3.00, 15.00, 3.75, 0.30),
+	("claude-opus-4-6", 5.00, 25.00, 6.25, 0.50),
+	// Claude 4.5
+	("claude-opus-4-5-20251101", 5.00, 25.00, 6.25, 0.50),
+	("claude-haiku-4-5-20251001", 1.00, 5.00, 1.25, 0.10),
+	// Official API aliases (hyphenated)
+	("claude-opus-4-5", 5.00, 25.00, 6.25, 0.50),
+	("claude-haiku-4-5", 1.00, 5.00, 1.25, 0.10),
 ];
 
 /// Token usage breakdown for cache-aware pricing
 struct CacheTokenUsage {
-    regular_input_tokens: u64,
-    cache_creation_tokens: u64,
-    cache_creation_tokens_1h: u64, // 1h TTL cache creation tokens (2x price)
-    cache_read_tokens: u64,
-    output_tokens: u64,
+	regular_input_tokens: u64,
+	cache_creation_tokens: u64,
+	cache_creation_tokens_1h: u64, // 1h TTL cache creation tokens (2x price)
+	cache_read_tokens: u64,
+	output_tokens: u64,
 }
-
-/// Models that reject ALL sampling parameters (temperature, top_p, top_k).
-const NO_SAMPLING_MODELS: &[&str] = &["fable-5", "mythos-5", "opus-5", "opus-4-8", "opus-4-7"];
 
 /// Models that support extended thinking via the `thinking` block.
 /// Substring match against `params.model`. Order matters only for documentation.
 const THINKING_MODELS: &[&str] = &[
-    "fable-5",
-    "mythos-5",
-    "opus-5",
-    "opus-4-8",
-    "opus-4-7",
-    "opus-4-6",
-    "opus-4-5",
-    "opus-4-1",
-    "opus-4",
-    "sonnet-4-7",
-    "sonnet-4-6",
-    "sonnet-4-5",
-    "sonnet-4",
-    "haiku-4-5",
-    "3-7-sonnet",
+	"fable-5",
+	"mythos-5",
+	"opus-5",
+	"opus-4-8",
+	"opus-4-7",
+	"opus-4-6",
+	"opus-4-5",
+	"sonnet-5",
+	"sonnet-4-6",
+	"haiku-4-5",
+	"haiku-5-5",
 ];
 
 /// Models that support (or require) adaptive thinking via `thinking.type: "adaptive"`.
 /// Opus 4.7 rejects manual `thinking.type: "enabled"` outright; on Opus 4.6 and
 /// Sonnet 4.6, manual mode is deprecated and will be removed.
 const ADAPTIVE_THINKING_MODELS: &[&str] = &[
-    "fable-5",
-    "mythos-5",
-    "opus-5",
-    "opus-4-8",
-    "opus-4-7",
-    "opus-4-6",
-    "sonnet-4-6",
+	"fable-5",
+	"mythos-5",
+	"opus-5",
+	"opus-4-8",
+	"opus-4-7",
+	"opus-4-6",
+	"sonnet-5",
+	"sonnet-4-6",
+	"haiku-5-5",
 ];
 
 /// Models where adaptive thinking is the ONLY accepted mode. Manual
 /// `thinking.type: "enabled"` returns a 400. These models also default
 /// `display: "omitted"`, so we opt in to `"summarized"` to keep thinking
 /// text visible in `ProviderResponse::thinking`.
-const ADAPTIVE_ONLY_MODELS: &[&str] = &["fable-5", "mythos-5", "opus-4-7"];
+const ADAPTIVE_ONLY_MODELS: &[&str] = &[
+	"fable-5",
+	"mythos-5",
+	"opus-5",
+	"opus-4-8",
+	"opus-4-7",
+	"sonnet-5",
+	"haiku-5-5",
+];
 
-/// Models that accept `output_config.effort`. Per Anthropic docs:
-/// Fable 5, Mythos 5, Opus 5, Opus 4.7, Opus 4.6, Sonnet 4.6, Opus 4.5.
+/// Models that accept `output_config.effort`. Per the models API capability
+/// report: Fable 5/5.1/5.2, Mythos 5/5.1/5.2, Opus 5, Opus 4.8, Opus 4.7, Opus 4.6,
+/// Sonnet 5, Sonnet 4.6, Opus 4.5, Haiku 5.5.
 const EFFORT_PARAM_MODELS: &[&str] = &[
-    "fable-5",
-    "mythos-5",
-    "opus-5",
-    "opus-4-7",
-    "opus-4-6",
-    "sonnet-4-6",
-    "opus-4-5",
+	"fable-5",
+	"mythos-5",
+	"opus-5",
+	"opus-4-8",
+	"opus-4-7",
+	"opus-4-6",
+	"sonnet-5",
+	"sonnet-4-6",
+	"opus-4-5",
+	"haiku-5-5",
 ];
 
-/// Models that reject top_p but accept temperature and top_k.
-const NO_TOP_P_MODELS: &[&str] = &[
-    "opus-4-1",
-    "opus-4-7",
-    "sonnet-4-5",
-    "haiku-4-5",
-    "sonnet-4-6",
-    "opus-4-5",
-    "opus-4-6",
+/// Models that accept `output_config.format` JSON outputs, per
+/// https://platform.claude.com/docs/en/build-with-claude/structured-outputs
+/// (Oct 2026): Fable/Mythos 5, 5.1 and 5.2, Opus 5.5/5/4.8/4.7/4.6/4.5, Sonnet
+/// 5.5/5/4.6/4.5, Haiku 5.5/4.5. Decoding is constrained to the schema.
+const STRUCTURED_OUTPUT_MODELS: &[&str] = &[
+	"fable-5",
+	"mythos-5",
+	"opus-5",
+	"opus-4-8",
+	"opus-4-7",
+	"opus-4-6",
+	"opus-4-5",
+	"sonnet-5",
+	"sonnet-4-6",
+	"sonnet-4-5",
+	"haiku-5-5",
+	"haiku-4-5",
 ];
+
+/// Schema keywords the structured-outputs grammar rejects with a 400 (same
+/// page): numeric and string bounds, and array bounds other than `minItems`
+/// 0 or 1. `minItems` is handled separately for that reason.
+const UNSUPPORTED_SCHEMA_KEYWORDS: &[&str] = &[
+	"minimum",
+	"maximum",
+	"exclusiveMinimum",
+	"exclusiveMaximum",
+	"multipleOf",
+	"minLength",
+	"maxLength",
+	"maxItems",
+	"uniqueItems",
+];
+
+/// The schema Claude can decode against: every object closed with
+/// `additionalProperties: false`, unsupported bounds moved into the field's
+/// description. This is the documented SDK transform (the helpers "remove
+/// unsupported constraints", "update descriptions" and "validate responses
+/// against your original schema"); here `schema_enforcement` does that last
+/// step, so a bound the decoder could not hold still fails closed.
+fn output_format_schema(schema: &serde_json::Value) -> serde_json::Value {
+	let mut schema = crate::llm::utils::normalize_strict_schema(schema, crate::llm::types::ResponseMode::Strict);
+	strip_unsupported_bounds(&mut schema);
+	schema
+}
+
+fn strip_unsupported_bounds(schema: &mut serde_json::Value) {
+	let Some(obj) = schema.as_object_mut() else {
+		return;
+	};
+
+	let mut moved = Vec::new();
+	for keyword in UNSUPPORTED_SCHEMA_KEYWORDS {
+		if let Some(value) = obj.remove(*keyword) {
+			moved.push(format!("{keyword}: {value}"));
+		}
+	}
+	if let Some(min) = obj.get("minItems").and_then(|v| v.as_u64()).filter(|min| *min > 1) {
+		obj.remove("minItems");
+		moved.push(format!("minItems: {min}"));
+	}
+	if !moved.is_empty() {
+		let bounds = format!("{{{}}}", moved.join(", "));
+		let description = match obj.get("description").and_then(|d| d.as_str()) {
+			Some(text) => format!("{text}\n\n{bounds}"),
+			None => bounds,
+		};
+		obj.insert("description".to_string(), serde_json::Value::String(description));
+	}
+
+	// Recurse only into subschemas, never into a `properties` map itself: a
+	// property may be named like a keyword.
+	for key in ["properties", "$defs", "definitions"] {
+		if let Some(children) = obj.get_mut(key).and_then(|c| c.as_object_mut()) {
+			for child in children.values_mut() {
+				strip_unsupported_bounds(child);
+			}
+		}
+	}
+	for key in ["items", "additionalProperties"] {
+		if let Some(child) = obj.get_mut(key) {
+			strip_unsupported_bounds(child);
+		}
+	}
+	for key in ["anyOf", "allOf", "oneOf"] {
+		if let Some(variants) = obj.get_mut(key).and_then(|v| v.as_array_mut()) {
+			for variant in variants {
+				strip_unsupported_bounds(variant);
+			}
+		}
+	}
+}
+
+/// Output ceiling per model family, used when the caller leaves `max_tokens`
+/// at 0 ("no limit"): the Messages API requires the field, so omitting it is a
+/// 400. Checked in order, so specific prefixes must precede the general ones
+/// they contain.
+const MAX_OUTPUT_TOKENS: &[(&str, u32)] = &[
+	("fable-5", 128_000),
+	("mythos-5", 128_000),
+	("opus-5", 128_000),
+	("opus-4-8", 128_000),
+	("opus-4-7", 128_000),
+	("opus-4-6", 128_000),
+	("sonnet-5", 128_000),
+	("sonnet-4-6", 128_000),
+	("haiku-5-5", 128_000),
+	("opus-4-5", 64_000),
+	("haiku-4-5", 64_000),
+];
+
+/// Fallback for models missing from [`MAX_OUTPUT_TOKENS`]; the lowest ceiling
+/// any served Claude model has, so it never exceeds the model's cap.
+const FALLBACK_MAX_OUTPUT_TOKENS: u32 = 4_096;
+
+/// Effective `max_tokens` for the request: the caller's cap, or the model's
+/// output ceiling when the caller passed 0.
+fn effective_max_tokens(model: &str, requested: u32) -> u32 {
+	if requested > 0 {
+		return requested;
+	}
+	MAX_OUTPUT_TOKENS
+		.iter()
+		.find(|(prefix, _)| model.contains(prefix))
+		.map_or(FALLBACK_MAX_OUTPUT_TOKENS, |&(_, max)| max)
+}
 
 /// Calculate cost for Anthropic models with cache-aware pricing (case-insensitive)
 /// - cache_creation_tokens: charged at 1.25x normal price (5m cache)
@@ -168,73 +276,115 @@ const NO_TOP_P_MODELS: &[&str] = &[
 /// - regular_input_tokens: charged at normal price
 /// - output_tokens: charged at normal price
 fn calculate_cost_with_cache(model: &str, usage: CacheTokenUsage) -> Option<f64> {
-    let (input_price, output_price, cache_write_price, cache_read_price) =
-        get_model_pricing(model, PRICING)?;
+	let (input_price, output_price, cache_write_price, cache_read_price) = get_model_pricing(model, PRICING)?;
 
-    // Regular input tokens at normal price
-    let regular_input_cost = (usage.regular_input_tokens as f64 / 1_000_000.0) * input_price;
+	// Regular input tokens at normal price
+	let regular_input_cost = (usage.regular_input_tokens as f64 / 1_000_000.0) * input_price;
 
-    // Anthropic cache-write pricing multipliers (relative to base input price):
-    //   5m TTL (default) = 1.25x base
-    //   1h TTL           = 2.00x base
-    // The PRICING table's `cache_write_price` already encodes 5m (= input * 1.25),
-    // so 5m uses it directly; 1h is derived from the base `input_price` to keep
-    // the spec multiplier explicit (no derived magic numbers).
-    let cache_creation_cost =
-        (usage.cache_creation_tokens as f64 / 1_000_000.0) * cache_write_price;
+	// Anthropic cache-write pricing multipliers (relative to base input price):
+	//   5m TTL (default) = 1.25x base
+	//   1h TTL           = 2.00x base
+	// The PRICING table's `cache_write_price` already encodes 5m (= input * 1.25),
+	// so 5m uses it directly; 1h is derived from the base `input_price` to keep
+	// the spec multiplier explicit (no derived magic numbers).
+	let cache_creation_cost = (usage.cache_creation_tokens as f64 / 1_000_000.0) * cache_write_price;
 
-    let cache_creation_cost_1h =
-        (usage.cache_creation_tokens_1h as f64 / 1_000_000.0) * input_price * 2.0;
+	let cache_creation_cost_1h = (usage.cache_creation_tokens_1h as f64 / 1_000_000.0) * input_price * 2.0;
 
-    // Cache read tokens at cache_read_price (0.1x price for most models)
-    let cache_read_cost = (usage.cache_read_tokens as f64 / 1_000_000.0) * cache_read_price;
+	// Cache read tokens at cache_read_price (0.1x price for most models)
+	let cache_read_cost = (usage.cache_read_tokens as f64 / 1_000_000.0) * cache_read_price;
 
-    // Output tokens at normal price (never cached)
-    let output_cost = (usage.output_tokens as f64 / 1_000_000.0) * output_price;
+	// Output tokens at normal price (never cached)
+	let output_cost = (usage.output_tokens as f64 / 1_000_000.0) * output_price;
 
-    let total_cost = regular_input_cost
-        + cache_creation_cost
-        + cache_creation_cost_1h
-        + cache_read_cost
-        + output_cost;
+	let total_cost = regular_input_cost + cache_creation_cost + cache_creation_cost_1h + cache_read_cost + output_cost;
 
-    Some(total_cost)
+	// Haiku 5.5's tier is selected by total prompt length, including both
+	// cache-write TTLs and cache reads; output tokens do not affect the tier.
+	const HAIKU_5_5_LONG_CONTEXT_THRESHOLD: u64 = 100_000;
+	const HAIKU_5_5_LONG_CONTEXT_MULTIPLIER: f64 = 5.0;
+	let prompt_tokens = usage.regular_input_tokens
+		+ usage.cache_creation_tokens
+		+ usage.cache_creation_tokens_1h
+		+ usage.cache_read_tokens;
+	let multiplier = if normalize_model_name(model).contains("claude-haiku-5-5")
+		&& prompt_tokens > HAIKU_5_5_LONG_CONTEXT_THRESHOLD
+	{
+		HAIKU_5_5_LONG_CONTEXT_MULTIPLIER
+	} else {
+		1.0
+	};
+	Some(total_cost * multiplier)
 }
 
 /// Simplified cost calculation for Anthropic models with cache support
 /// This is used by the helper function for individual token counts
 fn calculate_anthropic_cost(
-    model: &str,
-    input_tokens: u32,
-    output_tokens: u32,
-    cache_creation_5m_tokens: u32,
-    cache_creation_1h_tokens: u32,
-    cache_read_input_tokens: u32,
+	model: &str,
+	input_tokens: u32,
+	output_tokens: u32,
+	cache_creation_5m_tokens: u32,
+	cache_creation_1h_tokens: u32,
+	cache_read_input_tokens: u32,
 ) -> Option<f64> {
-    // input_tokens from API is ALREADY clean (non-cached regular tokens)
-    let regular_input_tokens = input_tokens;
+	// input_tokens from API is ALREADY clean (non-cached regular tokens)
+	let regular_input_tokens = input_tokens;
 
-    let usage = CacheTokenUsage {
-        regular_input_tokens: regular_input_tokens as u64,
-        cache_creation_tokens: cache_creation_5m_tokens as u64, // 5m TTL: 1.25x base
-        cache_creation_tokens_1h: cache_creation_1h_tokens as u64, // 1h TTL: 2x base
-        cache_read_tokens: cache_read_input_tokens as u64,
-        output_tokens: output_tokens as u64,
-    };
+	let usage = CacheTokenUsage {
+		regular_input_tokens: regular_input_tokens as u64,
+		cache_creation_tokens: cache_creation_5m_tokens as u64, // 5m TTL: 1.25x base
+		cache_creation_tokens_1h: cache_creation_1h_tokens as u64, // 1h TTL: 2x base
+		cache_read_tokens: cache_read_input_tokens as u64,
+		output_tokens: output_tokens as u64,
+	};
 
-    calculate_cost_with_cache(model, usage)
+	calculate_cost_with_cache(model, usage)
 }
 
 fn effort_value(model: &str, effort: ReasoningEffort, supports_adaptive: bool) -> &'static str {
-    let supports_xhigh = model.contains("opus-5") || model.contains("opus-4-7");
-    match effort {
-        ReasoningEffort::Low => "low",
-        ReasoningEffort::Medium => "medium",
-        ReasoningEffort::High => "high",
-        ReasoningEffort::XHigh if supports_xhigh => "xhigh",
-        ReasoningEffort::Max if supports_adaptive => "max",
-        ReasoningEffort::XHigh | ReasoningEffort::Max => "high",
-    }
+	const XHIGH_MODELS: &[&str] = &[
+		"fable-5",
+		"mythos-5",
+		"opus-5",
+		"opus-4-8",
+		"opus-4-7",
+		"sonnet-5",
+		"haiku-5-5",
+	];
+	let supports_xhigh = XHIGH_MODELS.iter().any(|p| model.contains(p));
+	match effort {
+		// Unreachable: callers only ask for a level when thinking is enabled.
+		ReasoningEffort::None | ReasoningEffort::Low => "low",
+		ReasoningEffort::Medium => "medium",
+		ReasoningEffort::High => "high",
+		ReasoningEffort::XHigh if supports_xhigh => "xhigh",
+		ReasoningEffort::Max if supports_adaptive => "max",
+		ReasoningEffort::XHigh | ReasoningEffort::Max => "high",
+	}
+}
+
+/// Apply `ReasoningEffort::None` (thinking off) for models whose thinking is
+/// not off by default. Per the per-model table in
+/// https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting
+/// and https://platform.claude.com/docs/en/build-with-claude/effort (verified Oct 2026):
+///   - Opus 5.5, Fable/Mythos 5, 5.1 and 5.2 always think; `"disabled"` is a 400.
+///     The lowest setting is effort "low" with `thinking` omitted.
+///   - Sonnet 5.5 rejects `"disabled"`; `"between_tools"` turns off up-front
+///     thinking at effort high or below (its default is high).
+///   - Opus 5, Sonnet 5 and Haiku 5.5 think by default and accept `"disabled"`
+///     at effort high or below (their defaults are high, high and medium).
+///   - Opus 4.8 and earlier default to off, so nothing is sent.
+fn apply_thinking_off(model: &str, request_body: &mut serde_json::Value) {
+	// "opus-5-5" must be matched before the "opus-5" substring below.
+	const ALWAYS_ON_MODELS: &[&str] = &["opus-5-5", "fable-5", "mythos-5"];
+	const DISABLE_MODELS: &[&str] = &["opus-5", "sonnet-5", "haiku-5-5"];
+	if ALWAYS_ON_MODELS.iter().any(|p| model.contains(p)) {
+		request_body["output_config"] = serde_json::json!({"effort": "low"});
+	} else if model.contains("sonnet-5-5") {
+		request_body["thinking"] = serde_json::json!({"type": "between_tools"});
+	} else if DISABLE_MODELS.iter().any(|p| model.contains(p)) {
+		request_body["thinking"] = serde_json::json!({"type": "disabled"});
+	}
 }
 
 /// Anthropic provider
@@ -242,45 +392,92 @@ fn effort_value(model: &str, effort: ReasoningEffort, supports_adaptive: bool) -
 pub struct AnthropicProvider;
 
 impl Default for AnthropicProvider {
-    fn default() -> Self {
-        Self::new()
-    }
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 impl AnthropicProvider {
-    pub fn new() -> Self {
-        Self
-    }
+	pub fn new() -> Self {
+		Self
+	}
+
+	fn auth_headers(&self, params: &ChatCompletionParams) -> Result<reqwest::header::HeaderMap> {
+		let mut headers = reqwest::header::HeaderMap::new();
+		if params.api_key.is_none() {
+			if let Ok(token) = env::var(ANTHROPIC_OAUTH_TOKEN_ENV) {
+				headers.insert("Authorization", shared::sensitive_header(&format!("Bearer {token}"))?);
+				return Ok(headers);
+			}
+		}
+		headers.insert(
+			"x-api-key",
+			shared::sensitive_header(&shared::resolve_api_key(self, params)?)?,
+		);
+		Ok(headers)
+	}
 }
 
 // Constants
-const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+pub(crate) const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const ANTHROPIC_OAUTH_TOKEN_ENV: &str = "ANTHROPIC_OAUTH_ACCESS_TOKEN";
 const ANTHROPIC_API_URL_ENV: &str = "ANTHROPIC_API_URL";
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_API_VERSION: &str = "2026-10-21";
+const PROVIDER_NAME: &str = "anthropic";
+const PROMPT_CACHING_BETA: &str = "prompt-caching-2024-07-31";
+const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
+const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+/// Block kinds that carry a `signature` Anthropic verifies when they come back.
+const THINKING_BLOCK_TYPES: [&str; 2] = ["thinking", "redacted_thinking"];
+/// `thinking.type` values for which `thinking.block_binding` is accepted; on
+/// `disabled` and `between_tools` it is a 400 (Sonnet/Haiku 5.5).
+const BLOCK_BINDING_THINKING_TYPES: [&str; 2] = ["adaptive", "enabled"];
+/// Stop reasons Anthropic returns with an empty turn (thinking only, or nothing)
+/// when generation was interrupted.
+const EMPTY_TURN_STOP_REASONS: [&str; 2] = ["end_turn", "tool_use"];
+/// Sample continuation message from Anthropic's "Handling stop reasons" doc.
+const CONTINUATION_PROMPT: &str = "Please continue";
+const MESSAGE_THREADS_BETA: &str = "message-threads-2026-08-12";
+/// Prefix of a response id the API stored in a message thread; the conversation
+/// fingerprint and the raw message id follow it, separated by a colon.
+const THREAD_ID_PREFIX: &str = "anthropic_thread:";
+/// Thread errors after which the full conversation in a new thread succeeds.
+const THREAD_REPLAY_CODES: [&str; 4] = [
+	"thread_not_found",
+	"thread_already_continued",
+	"thread_continue_in_flight",
+	"thread_fingerprint_mismatch",
+];
+/// The request uses a feature or organization setting threads don't support.
+const THREAD_UNSUPPORTED_CODE: &str = "thread_unsupported_request";
+/// Fields a thread keeps from its create request; a continue request that sends
+/// either one is a 400.
+const THREAD_CREATE_ONLY_FIELDS: [&str; 2] = ["system", "tools"];
+const REFUSAL_STOP_REASON: &str = "refusal";
 
 #[async_trait::async_trait]
 impl AiProvider for AnthropicProvider {
-    fn name(&self) -> &str {
-        "anthropic"
-    }
+	fn name(&self) -> &str {
+		PROVIDER_NAME
+	}
 
-    fn supports_model(&self, model: &str) -> bool {
-        // Anthropic Claude models - check against pricing table (strict)
-        is_model_in_pricing_table(model, PRICING)
-    }
+	fn supports_model(&self, model: &str) -> bool {
+		// Anthropic Claude models - check against pricing table (strict)
+		is_model_in_pricing_table(model, PRICING)
+	}
 
-    fn get_api_key(&self) -> Result<String> {
-        // Check for OAuth token first (priority)
-        if env::var(ANTHROPIC_OAUTH_TOKEN_ENV).is_ok() {
-            return Err(anyhow::anyhow!(
-                "Using OAuth authentication. API key not available when {} is set.",
-                ANTHROPIC_OAUTH_TOKEN_ENV
-            ));
-        }
+	fn get_api_key(&self) -> Result<String> {
+		// Check for OAuth token first (priority)
+		if env::var(ANTHROPIC_OAUTH_TOKEN_ENV).is_ok() {
+			return Err(anyhow::anyhow!(
+				"Using OAuth authentication. API key not available when {} is set.",
+				ANTHROPIC_OAUTH_TOKEN_ENV
+			));
+		}
 
-        // Fall back to API key
-        match env::var(ANTHROPIC_API_KEY_ENV) {
+		// Fall back to API key
+		match env::var(ANTHROPIC_API_KEY_ENV) {
             Ok(key) => Ok(key),
             Err(_) => Err(anyhow::anyhow!(
                 "Anthropic API key not found in environment variable: {}. Set either {} for API key auth or {} for OAuth.",
@@ -289,1092 +486,1104 @@ impl AiProvider for AnthropicProvider {
                 ANTHROPIC_OAUTH_TOKEN_ENV
             )),
         }
-    }
+	}
 
-    fn supports_caching(&self, _model: &str) -> bool {
-        true
-    }
+	fn supports_caching(&self, _model: &str) -> bool {
+		true
+	}
 
-    fn keepalive_policy(&self, _model: &str, use_long_cache: bool) -> Option<KeepalivePolicy> {
-        // Match the cache_ttl that to_octolib_params applies to system/tool blocks:
-        //   use_long_cache = true  → 1h cache → ping every 54m
-        //   use_long_cache = false → 5m cache → ping every 4m30s
-        // 90% of TTL leaves a 10% margin for network latency and scheduler jitter.
-        let ttl_secs = if use_long_cache { 3600 } else { 300 };
-        let interval_secs = ttl_secs * 9 / 10;
-        Some(KeepalivePolicy {
-            interval: std::time::Duration::from_secs(interval_secs),
-        })
-    }
+	fn keepalive_policy(&self, model: &str, use_long_cache: bool) -> Option<KeepalivePolicy> {
+		self.cache_lifetime(model, use_long_cache)
+			.map(KeepalivePolicy::before_expiry)
+	}
 
-    fn supports_vision(&self, model: &str) -> bool {
-        // Capability checks intentionally accept family shorthand and common
-        // aliases even when they are not exact pricing-table model IDs.
-        let model_lower = normalize_model_name(model);
-        model_lower.contains("claude-3")
-            || model_lower.contains("claude-4")
-            || model_lower.contains("claude-opus-4")
-            || model_lower.contains("claude-sonnet-4")
-            || model_lower.contains("claude-haiku-4")
-            || model_lower.contains("claude-opus-5")
-            || model_lower.contains("claude-sonnet-5")
-            || model_lower.contains("claude-haiku-5")
-            || model_lower.contains("claude-fable-5")
-            || model_lower.contains("claude-mythos-5")
-    }
+	/// Matches the cache_ttl that to_octolib_params applies to system/tool blocks.
+	fn cache_lifetime(&self, _model: &str, use_long_cache: bool) -> Option<std::time::Duration> {
+		Some(crate::llm::config::CacheTTL::from_long_cache_flag(use_long_cache).to_duration())
+	}
 
-    fn get_max_input_tokens(&self, model: &str) -> usize {
-        // Anthropic model context window limits (case-insensitive)
-        let model_lower = normalize_model_name(model);
-        if model_lower.contains("claude-opus-5")
-            || model_lower.contains("claude-fable-5")
-            || model_lower.contains("claude-mythos-5")
-            || model_lower.contains("claude-sonnet-5")
-            || model_lower.contains("claude-opus-4-8")
-            || model_lower.contains("claude-opus-4-7")
-            || model_lower.contains("claude-opus-4-6")
-            || model_lower.contains("claude-sonnet-4-6")
-        {
-            // Claude 4.6 and later models have 1M context at standard pricing.
-            1_000_000
-        } else if model_lower.contains("claude-opus-4")
-            || model_lower.contains("claude-sonnet-4")
-            || model_lower.contains("claude-haiku-4")
-        {
-            // Claude 4 and 4.5 models have 200k context
-            200_000
-        } else if model_lower.contains("claude-3-7") {
-            // Claude 3.7 has 200k context
-            200_000
-        } else if model_lower.contains("claude-3-5") {
-            // Claude 3.5 models have 200k context
-            200_000
-        } else if model_lower.contains("claude-3") {
-            // Claude 3 models have 200k context
-            200_000
-        } else {
-            // Default fallback for older models
-            100_000
-        }
-    }
+	fn supports_vision(&self, model: &str) -> bool {
+		// Capability checks intentionally accept family shorthand and common
+		// aliases even when they are not exact pricing-table model IDs.
+		let model_lower = normalize_model_name(model);
+		model_lower.contains("claude-opus-4")
+			|| model_lower.contains("claude-sonnet-4")
+			|| model_lower.contains("claude-haiku-4")
+			|| model_lower.contains("claude-opus-5")
+			|| model_lower.contains("claude-sonnet-5")
+			|| model_lower.contains("claude-haiku-5")
+			|| model_lower.contains("claude-fable-5")
+			|| model_lower.contains("claude-mythos-5")
+	}
 
-    fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
-        // Search through pricing table for matching model
-        let (input_price, output_price, cache_write_price, cache_read_price) =
-            get_model_pricing(model, PRICING)?;
+	fn supports_structured_output(&self, model: &str) -> bool {
+		STRUCTURED_OUTPUT_MODELS.iter().any(|p| model.contains(p))
+	}
 
-        Some(crate::llm::types::ModelPricing::new(
-            input_price,
-            output_price,
-            cache_write_price,
-            cache_read_price,
-        ))
-    }
+	fn get_max_input_tokens(&self, model: &str) -> usize {
+		// Anthropic model context window limits (case-insensitive)
+		let model_lower = normalize_model_name(model);
+		if model_lower.contains("claude-opus-5")
+			|| model_lower.contains("claude-fable-5")
+			|| model_lower.contains("claude-mythos-5")
+			|| model_lower.contains("claude-sonnet-5")
+			|| model_lower.contains("claude-haiku-5-5")
+			|| model_lower.contains("claude-opus-4-8")
+			|| model_lower.contains("claude-opus-4-7")
+			|| model_lower.contains("claude-opus-4-6")
+			|| model_lower.contains("claude-sonnet-4-6")
+		{
+			// Claude 4.6+ has 1M context; Haiku 5.5 has a long-prompt price tier.
+			1_000_000
+		} else if model_lower.contains("claude-opus-4") || model_lower.contains("claude-haiku-4") {
+			// Claude 4.5 models have 200k context
+			200_000
+		} else {
+			// Default fallback for older models
+			100_000
+		}
+	}
 
-    fn supported_sampling_params(&self, model: &str) -> SamplingSupport {
-        let rejects_all = NO_SAMPLING_MODELS.iter().any(|p| model.contains(p));
-        if rejects_all {
-            return SamplingSupport::NONE;
-        }
+	fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
+		// Search through pricing table for matching model
+		let (input_price, output_price, cache_write_price, cache_read_price) = get_model_pricing(model, PRICING)?;
 
-        let rejects_top_p = NO_TOP_P_MODELS.iter().any(|p| model.contains(p));
-        SamplingSupport {
-            temperature: true,
-            top_p: !rejects_top_p,
-            top_k: true,
-        }
-    }
+		Some(crate::llm::types::ModelPricing::new(
+			input_price,
+			output_price,
+			cache_write_price,
+			cache_read_price,
+		))
+	}
 
-    async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
-        // Check for OAuth token first (priority), otherwise use API key
-        let (auth_header_name, auth_header_value) =
-            if let Ok(oauth_token) = env::var(ANTHROPIC_OAUTH_TOKEN_ENV) {
-                (
-                    "Authorization".to_string(),
-                    format!("Bearer {}", oauth_token),
-                )
-            } else {
-                let api_key = self.get_api_key()?;
-                ("x-api-key".to_string(), api_key)
-            };
+	async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
+		let api_url = env::var(ANTHROPIC_API_URL_ENV).unwrap_or_else(|_| ANTHROPIC_API_URL.to_string());
+		// Only Anthropic's own endpoint is known to keep threads: a compatible
+		// proxy that ignored `thread` would answer a continue request without the
+		// earlier conversation. A pre-warm only refreshes the cache.
+		let use_threads = api_url == ANTHROPIC_API_URL && !params.cache_prewarm;
+		self.complete(params, api_url, use_threads).await
+	}
+}
 
-        // Convert messages to Anthropic format
-        let anthropic_messages = convert_messages(&params.messages);
+impl AnthropicProvider {
+	/// One Messages API turn. With `use_threads` the conversation rides a message
+	/// thread: only the messages after the last stored turn are sent, and the full
+	/// conversation goes out again whenever the API can't continue the thread.
+	async fn complete(
+		&self,
+		params: ChatCompletionParams,
+		api_url: String,
+		use_threads: bool,
+	) -> Result<ProviderResponse> {
+		let auth_headers = self.auth_headers(&params)?;
 
-        // Extract system message if present
-        let system_message = params
-            .messages
-            .iter()
-            .find(|m| m.role == "system")
-            .map(|m| m.content.clone())
-            .unwrap_or_else(|| "You are a helpful assistant.".to_string());
+		// Convert messages to Anthropic format
+		let anthropic_messages = convert_messages(&params.messages);
 
-        let system_cached = params
-            .messages
-            .iter()
-            .any(|m| m.role == "system" && m.cached);
+		// Extract system message if present
+		let system_message = params
+			.messages
+			.iter()
+			.find(|m| m.role == "system")
+			.map(|m| m.content.clone())
+			.unwrap_or_else(|| "You are a helpful assistant.".to_string());
 
-        // Create the request body
-        let mut request_body = serde_json::json!({
-            "model": params.model,
-            "messages": anthropic_messages,
-        });
+		let system_cached = params.messages.iter().any(|m| m.role == "system" && m.cached);
 
-        // Decide upfront whether extended thinking will be enabled. Anthropic
-        // rejects non-default `temperature`/`top_p`/`top_k` whenever thinking
-        // (manual or adaptive) is on — only `temperature=1` is accepted and
-        // top_p/top_k must be omitted. Skip them entirely in that case.
-        let thinking_enabled = params.reasoning_effort.is_some()
-            && THINKING_MODELS.iter().any(|p| params.model.contains(p));
+		// Create the request body
+		let mut request_body = serde_json::json!({
+			// Anthropic rejects `max_tokens: 0` combined with `stream: true`.
+			"stream": !params.cache_prewarm,
+			"model": params.model,
+			"messages": anthropic_messages,
+		});
 
-        if !thinking_enabled {
-            // Apply sampling parameters based on model support
-            let sampling = self.effective_sampling_params(&params);
-            if let Some(temp) = sampling.temperature {
-                request_body["temperature"] = serde_json::json!(temp);
-            }
-            if let Some(top_p) = sampling.top_p {
-                request_body["top_p"] = serde_json::json!(top_p);
-            }
-            if let Some(top_k) = sampling.top_k {
-                request_body["top_k"] = serde_json::json!(top_k);
-            }
-        }
+		// Decide upfront whether extended thinking will be enabled.
+		let thinking_enabled = params
+			.reasoning_effort
+			.is_some_and(|effort| effort != ReasoningEffort::None)
+			&& THINKING_MODELS.iter().any(|p| params.model.contains(p));
 
-        // Add max_tokens if specified (0 means don't include it in request)
-        if params.max_tokens > 0 {
-            request_body["max_tokens"] = serde_json::json!(params.max_tokens);
-        }
+		// The Messages API requires max_tokens; 0 means "no limit", so send the
+		// model's output ceiling instead of omitting the field. A cache pre-warm
+		// sends the documented literal 0 (cache-only, no output); the thinking
+		// budget below still derives from the normal value so the cached prefix
+		// matches a regular request.
+		let max_tokens = effective_max_tokens(&params.model, params.max_tokens);
+		request_body["max_tokens"] = serde_json::json!(if params.cache_prewarm { 0 } else { max_tokens });
 
-        // Add system message with cache control if needed
-        if system_cached {
-            let system_msg = params.messages.iter().find(|m| m.role == "system");
-            let cache_ttl = system_msg
-                .and_then(|m| m.cache_ttl.as_deref())
-                .and_then(|t| crate::llm::config::CacheTTL::from_string(t).ok())
-                .unwrap_or_else(crate::llm::config::CacheTTL::short);
-            request_body["system"] = serde_json::json!([{
-                "type": "text",
-                "text": system_message,
-                "cache_control": {
-                    "type": "ephemeral",
-                    "ttl": cache_ttl.to_string()
-                }
-            }]);
-        } else {
-            request_body["system"] = serde_json::json!(system_message);
-        }
+		// Add system message with cache control if needed
+		if system_cached {
+			let system_msg = params.messages.iter().find(|m| m.role == "system");
+			let cache_ttl = system_msg
+				.and_then(|m| m.cache_ttl.as_deref())
+				.and_then(|t| crate::llm::config::CacheTTL::from_string(t).ok())
+				.unwrap_or_else(crate::llm::config::CacheTTL::short);
+			request_body["system"] = serde_json::json!([{
+				"type": "text",
+				"text": system_message,
+				"cache_control": {
+					"type": "ephemeral",
+					"ttl": cache_ttl.to_string()
+				}
+			}]);
+		} else {
+			request_body["system"] = serde_json::json!(system_message);
+		}
 
-        // Add tools if available (Anthropic format)
-        if let Some(tools) = &params.tools {
-            if !tools.is_empty() {
-                // Sort tools by name for consistent ordering
-                let mut sorted_tools = tools.clone();
-                sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
+		// Add tools if available (Anthropic format)
+		if let Some(tools) = &params.tools {
+			if !tools.is_empty() {
+				// Sort tools by name for consistent ordering
+				let mut sorted_tools = tools.clone();
+				sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
 
-                let anthropic_tools = sorted_tools
-                    .iter()
-                    .map(|f| {
-                        let mut tool = serde_json::json!({
-                            "name": f.name,
-                            "description": f.description,
-                            "input_schema": f.parameters
-                        });
+				let anthropic_tools = sorted_tools
+					.iter()
+					.map(|f| {
+						let mut tool = serde_json::json!({
+							"name": f.name,
+							"description": f.description,
+							"input_schema": f.parameters
+						});
 
-                        // Add cache control if present
-                        if let Some(ref cache_control) = f.cache_control {
-                            tool["cache_control"] = cache_control.clone();
-                        }
+						// Add cache control if present
+						if let Some(ref cache_control) = f.cache_control {
+							tool["cache_control"] = cache_control.clone();
+						}
 
-                        tool
-                    })
-                    .collect::<Vec<_>>();
+						tool
+					})
+					.collect::<Vec<_>>();
 
-                request_body["tools"] = serde_json::json!(anthropic_tools);
+				request_body["tools"] = serde_json::json!(anthropic_tools);
 
-                // Be explicit: Anthropic's default is parallel-enabled `auto`, but
-                // sending the flag prevents wrappers/defaults from silently forcing
-                // the one-tool-at-a-time path.
-                request_body["tool_choice"] = serde_json::json!({
-                    "type": "auto",
-                    "disable_parallel_tool_use": false,
-                });
-            }
-        }
+				// Be explicit: Anthropic's default is parallel-enabled `auto`, but
+				// sending the flag prevents wrappers/defaults from silently forcing
+				// the one-tool-at-a-time path.
+				request_body["tool_choice"] = serde_json::json!({
+					"type": "auto",
+					"disable_parallel_tool_use": false,
+				});
+			}
+		}
 
-        // Translate `reasoning_effort` into Anthropic's thinking + effort knobs.
-        // The API surface diverged across model generations:
-        //   - Opus 5 defaults to adaptive thinking and supports low through max effort.
-        //   - Opus 4.7 only accepts `thinking.type: "adaptive"` (manual is 400).
-        //   - Opus 4.6 / Sonnet 4.6 accept adaptive (recommended) or manual; manual deprecated.
-        //   - Opus 4.5 keeps manual `budget_tokens` but also supports `output_config.effort`.
-        //   - Older Claude 4 / 3.7 keep manual `budget_tokens` only.
-        if let Some(effort) = params.reasoning_effort {
-            if thinking_enabled {
-                let supports_adaptive = ADAPTIVE_THINKING_MODELS
-                    .iter()
-                    .any(|p| params.model.contains(p));
-                let adaptive_only = ADAPTIVE_ONLY_MODELS
-                    .iter()
-                    .any(|p| params.model.contains(p));
-                let supports_effort_param =
-                    EFFORT_PARAM_MODELS.iter().any(|p| params.model.contains(p));
+		// Translate `reasoning_effort` into Anthropic's thinking + effort knobs.
+		// The API surface diverged across model generations:
+		//   - Opus 5 defaults to adaptive thinking and supports low through max effort.
+		//   - Opus 4.7 only accepts `thinking.type: "adaptive"` (manual is 400).
+		//   - Opus 4.6 / Sonnet 4.6 accept adaptive (recommended) or manual; manual deprecated.
+		//   - Opus 4.5 keeps manual `budget_tokens` but also supports `output_config.effort`.
+		//   - Older Claude 4 keeps manual `budget_tokens` only.
+		if let Some(effort) = params.reasoning_effort {
+			if thinking_enabled {
+				let supports_adaptive = ADAPTIVE_THINKING_MODELS.iter().any(|p| params.model.contains(p));
+				let adaptive_only = ADAPTIVE_ONLY_MODELS.iter().any(|p| params.model.contains(p));
+				let supports_effort_param = EFFORT_PARAM_MODELS.iter().any(|p| params.model.contains(p));
 
-                if supports_adaptive {
-                    // Adaptive: Claude decides depth, `output_config.effort` guides it.
-                    // On Opus 4.7, `display` defaults to "omitted" — set "summarized"
-                    // so the thinking field carries text we can surface to callers.
-                    let mut thinking_obj = serde_json::json!({"type": "adaptive"});
-                    if adaptive_only {
-                        thinking_obj["display"] = serde_json::json!("summarized");
-                    }
-                    request_body["thinking"] = thinking_obj;
-                } else {
-                    // Manual: budget_tokens must be < max_tokens. Clamp if needed.
-                    let mut budget: u32 = match effort {
-                        ReasoningEffort::Low => 2_048,
-                        ReasoningEffort::Medium => 8_192,
-                        ReasoningEffort::High => 16_384,
-                        ReasoningEffort::XHigh => 32_768,
-                        ReasoningEffort::Max => 65_536,
-                    };
-                    if params.max_tokens > 0 {
-                        let max = params.max_tokens;
-                        if budget >= max {
-                            budget = max.saturating_sub(1024).max(1024);
-                        }
-                    }
-                    request_body["thinking"] = serde_json::json!({
-                        "type": "enabled",
-                        "budget_tokens": budget,
-                    });
-                }
+				if supports_adaptive {
+					// Adaptive: Claude decides depth, `output_config.effort` guides it.
+					// On Opus 4.7, `display` defaults to "omitted" — set "summarized"
+					// so the thinking field carries text we can surface to callers.
+					let mut thinking_obj = serde_json::json!({"type": "adaptive"});
+					if adaptive_only {
+						thinking_obj["display"] = serde_json::json!("summarized");
+					}
+					request_body["thinking"] = thinking_obj;
+				} else {
+					// Manual: budget_tokens must be < max_tokens. Clamp if needed.
+					let mut budget: u32 = match effort {
+						// Unreachable: `thinking_enabled` excludes None.
+						ReasoningEffort::None | ReasoningEffort::Low => 2_048,
+						ReasoningEffort::Medium => 8_192,
+						ReasoningEffort::High => 16_384,
+						ReasoningEffort::XHigh => 32_768,
+						ReasoningEffort::Max => 65_536,
+					};
+					if budget >= max_tokens {
+						budget = max_tokens.saturating_sub(1024).max(1024);
+					}
+					request_body["thinking"] = serde_json::json!({
+						"type": "enabled",
+						"budget_tokens": budget,
+					});
+				}
 
-                if supports_effort_param {
-                    // Per-model value constraints:
-                    //   "xhigh" — Opus 5 and Opus 4.7
-                    //   "max"   — adaptive models (NOT Opus 4.5)
-                    // Downgrade unsupported levels to "high" rather than 400ing the call.
-                    let effort_str = effort_value(&params.model, effort, supports_adaptive);
-                    request_body["output_config"] = serde_json::json!({"effort": effort_str});
-                }
-            }
-        }
+				if supports_effort_param {
+					// Per-model value constraints:
+					//   "xhigh" — Fable/Mythos 5+, Opus 5, Opus 4.8/4.7, Sonnet 5
+					//   "max"   — adaptive models (NOT Opus 4.5)
+					// Downgrade unsupported levels to "high" rather than 400ing the call.
+					let effort_str = effort_value(&params.model, effort, supports_adaptive);
+					request_body["output_config"] = serde_json::json!({"effort": effort_str});
+				}
+			} else if effort == ReasoningEffort::None {
+				apply_thinking_off(&params.model, &mut request_body);
+			}
+		}
 
-        // Check if any message uses extended cache TTL
-        let needs_extended_cache = params.messages.iter().any(|m| m.cache_ttl.is_some());
+		// JSON outputs ride `output_config` next to `effort`, so merge rather
+		// than replace it.
+		let requested_schema = params
+			.response_format
+			.as_ref()
+			.filter(|f| matches!(f.format, OutputFormat::JsonSchema))
+			.and_then(|f| f.schema.clone());
+		if let Some(schema) = &requested_schema {
+			request_body["output_config"]["format"] = serde_json::json!({
+				"type": "json_schema",
+				"schema": output_format_schema(schema),
+			});
+		}
 
-        // Execute the request with retry logic
-        let api_url =
-            env::var(ANTHROPIC_API_URL_ENV).unwrap_or_else(|_| ANTHROPIC_API_URL.to_string());
+		// convert_messages runs before the thinking config is decided, so the
+		// replayed thinking blocks are reconciled with it here.
+		apply_thinking_replay_policy(&mut request_body);
 
-        let response = execute_anthropic_request(
-            auth_header_name,
-            auth_header_value,
-            api_url,
-            request_body,
-            params.max_retries,
-            params.retry_timeout,
-            params.request_timeout,
-            params.cancellation_token.as_ref(),
-            needs_extended_cache,
-            params.extra_headers.clone(),
-        )
-        .await?;
+		// Manual thinking needs `budget_tokens < max_tokens`, so the API rejects
+		// it with a pre-warm's `max_tokens: 0`, and dropping thinking would change
+		// the cached prefix. Fail before sending instead of billing a 400.
+		if params.cache_prewarm && request_body["thinking"]["type"] == "enabled" {
+			return Err(anyhow::anyhow!(
+				"Cache pre-warm is not supported with a manual thinking budget ({})",
+				params.model
+			));
+		}
 
-        Ok(response)
-    }
+		// Execute the request with retry logic
+		let send = |body: serde_json::Value| {
+			execute_anthropic_request(
+				auth_headers.clone(),
+				api_url.clone(),
+				body,
+				params.max_retries,
+				params.retry_timeout,
+				params.request_timeout,
+				params.stream_timeout,
+				params.cancellation_token.as_ref(),
+				params.extra_headers.clone(),
+				params.api_key.as_ref(),
+				params.retry_observer.as_ref(),
+			)
+		};
+
+		// Continue the thread when the API stored the last turn of this very
+		// conversation; otherwise, or when it can't continue, start a new thread
+		// with the full conversation. A request threads don't support goes out as
+		// it did before threads.
+		let mut threaded = use_threads;
+		let mut response = None;
+		if threaded {
+			if let Some((message_id, new_messages)) =
+				thread_continuation(&params.messages, &system_message, &request_body["tools"])
+			{
+				match send(continue_thread_body(&request_body, message_id, new_messages)).await {
+					Ok(continued) => response = Some(continued),
+					Err(err) => match thread_failure(&err) {
+						Some(ThreadFailure::Replay) => {
+							tracing::debug!(error = %err, "Anthropic thread can't be continued; starting a new one")
+						}
+						Some(ThreadFailure::Unsupported) => threaded = false,
+						None => return Err(err),
+					},
+				}
+			}
+		}
+		if threaded && response.is_none() {
+			let mut body = request_body.clone();
+			body["thread"] = serde_json::json!({"type": "create"});
+			match send(body).await {
+				Ok(created) => response = Some(created),
+				Err(err) if matches!(thread_failure(&err), Some(ThreadFailure::Unsupported)) => threaded = false,
+				Err(err) => return Err(err),
+			}
+		}
+		let mut response = match response {
+			Some(response) => response,
+			None => send(request_body.clone()).await?,
+		};
+
+		// A refused turn may already sit in the thread and can't be taken out, so
+		// the next turn starts a new thread without it.
+		let mut thread_fingerprint = (threaded && response.finish_reason.as_deref() != Some(REFUSAL_STOP_REASON))
+			.then(|| conversation_fingerprint(&system_message, &request_body["tools"], &params.messages));
+
+		// A pre-warm has empty content by design: no continuation retry and no
+		// schema validation, only the cache usage matters.
+		if params.cache_prewarm {
+			return Ok(response);
+		}
+
+		// Anthropic ("Handling stop reasons"): on an empty turn, add a continuation
+		// prompt in a new user message rather than retrying with the empty response.
+		// Once only; a second empty turn goes back to the caller as is.
+		if is_empty_turn(&response) {
+			tracing::warn!(
+				finish_reason = ?response.finish_reason,
+				"Empty Anthropic turn; retrying once with a continuation prompt"
+			);
+			request_body["messages"]
+				.as_array_mut()
+				.expect("messages are built as an array")
+				.push(serde_json::json!({"role": "user", "content": CONTINUATION_PROMPT}));
+			let mut continued = send(request_body).await?;
+			// Both calls were billed.
+			if let (Some(total), Some(first_call)) =
+				(continued.exchange.usage.as_mut(), response.exchange.usage.as_ref())
+			{
+				add_usage(total, first_call);
+			}
+			response = continued;
+			// The retry is a plain request, so there is no thread to continue.
+			thread_fingerprint = None;
+		}
+
+		if let Some(fingerprint) = thread_fingerprint {
+			response.id = response.id.map(|id| format!("{THREAD_ID_PREFIX}{fingerprint}:{id}"));
+		}
+
+		// The bounds moved out of the sent schema are held here, against the
+		// caller's original.
+		match requested_schema {
+			Some(schema) => crate::llm::schema_enforcement::validate_response(
+				response,
+				&schema,
+				PROVIDER_NAME,
+				params.api_key.as_ref(),
+			),
+			None => Ok(response),
+		}
+	}
 }
 
 // Anthropic API structures
 #[derive(Serialize, Deserialize, Debug)]
 struct AnthropicMessage {
-    role: String,
-    content: Vec<AnthropicContent>,
+	role: String,
+	content: Vec<AnthropicContent>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
 enum AnthropicContent {
-    #[serde(rename = "text")]
-    Text {
-        text: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<serde_json::Value>,
-    },
-    #[serde(rename = "image")]
-    Image {
-        source: ImageSource,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<serde_json::Value>,
-    },
-    #[serde(rename = "tool_result")]
-    ToolResult {
-        tool_use_id: String,
-        content: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<serde_json::Value>,
-    },
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
+	#[serde(rename = "text")]
+	Text {
+		text: String,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		cache_control: Option<serde_json::Value>,
+	},
+	#[serde(rename = "image")]
+	Image {
+		source: ImageSource,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		cache_control: Option<serde_json::Value>,
+	},
+	#[serde(rename = "tool_result")]
+	ToolResult {
+		tool_use_id: String,
+		content: serde_json::Value,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		cache_control: Option<serde_json::Value>,
+	},
+	#[serde(rename = "tool_use")]
+	ToolUse {
+		id: String,
+		name: String,
+		input: serde_json::Value,
+	},
+	/// A captured content block sent back exactly as Anthropic returned it
+	/// (thinking blocks must keep their `signature`). Must stay last.
+	#[serde(untagged)]
+	Raw(serde_json::Value),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ImageSource {
-    #[serde(rename = "type")]
-    source_type: String,
-    media_type: String,
-    data: String,
+	#[serde(rename = "type")]
+	source_type: String,
+	media_type: String,
+	data: String,
 }
 
 #[derive(Deserialize, Debug)]
 struct AnthropicResponse {
-    id: String,
-    content: Vec<AnthropicResponseContent>,
-    usage: AnthropicUsage,
-    #[serde(default)]
-    stop_reason: Option<String>,
+	id: String,
+	content: Vec<AnthropicResponseContent>,
+	usage: AnthropicUsage,
+	#[serde(default)]
+	stop_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type")]
 enum AnthropicResponseContent {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "thinking")]
-    Thinking(#[serde(default)] serde_json::Value),
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
+	#[serde(rename = "text")]
+	Text { text: String },
+	#[serde(rename = "thinking")]
+	Thinking(#[serde(default)] serde_json::Value),
+	/// Opaque encrypted reasoning; contributes no text. Its raw block travels in
+	/// `output_items` for replay.
+	#[serde(rename = "redacted_thinking")]
+	RedactedThinking,
+	#[serde(rename = "tool_use")]
+	ToolUse {
+		id: String,
+		name: String,
+		input: serde_json::Value,
+	},
 }
 
 #[derive(Deserialize, Debug, Default)]
 struct AnthropicCacheCreation {
-    #[serde(default)]
-    ephemeral_5m_input_tokens: u64,
-    #[serde(default)]
-    ephemeral_1h_input_tokens: u64,
+	#[serde(default)]
+	ephemeral_5m_input_tokens: u64,
+	#[serde(default)]
+	ephemeral_1h_input_tokens: u64,
 }
 
 #[derive(Deserialize, Debug)]
 struct AnthropicUsage {
-    input_tokens: u64,
-    output_tokens: u64,
-    #[serde(default)]
-    cache_creation_input_tokens: Option<u64>,
-    #[serde(default)]
-    cache_read_input_tokens: Option<u64>,
-    /// Per-TTL breakdown of cache creation tokens.
-    /// Anthropic returns this nested object whenever any prompt block uses
-    /// `cache_control` (including the default 5m TTL). When absent, all cache
-    /// creation is assumed to be 5m -- which is Anthropic's default TTL when
-    /// `ttl` is omitted from `cache_control`. Treating an unknown TTL as 1h
-    /// (2x base price) over-charges by ~60% for typical 5m usage; treating it
-    /// as 5m matches Anthropic's billing default.
-    #[serde(default)]
-    cache_creation: Option<AnthropicCacheCreation>,
+	input_tokens: u64,
+	output_tokens: u64,
+	#[serde(default)]
+	cache_creation_input_tokens: Option<u64>,
+	#[serde(default)]
+	cache_read_input_tokens: Option<u64>,
+	/// Per-TTL breakdown of cache creation tokens.
+	/// Anthropic returns this nested object whenever any prompt block uses
+	/// `cache_control` (including the default 5m TTL). When absent, all cache
+	/// creation is assumed to be 5m -- which is Anthropic's default TTL when
+	/// `ttl` is omitted from `cache_control`. Treating an unknown TTL as 1h
+	/// (2x base price) over-charges by ~60% for typical 5m usage; treating it
+	/// as 5m matches Anthropic's billing default.
+	#[serde(default)]
+	cache_creation: Option<AnthropicCacheCreation>,
 }
 
 // Convert our session messages to Anthropic format
 fn convert_messages(messages: &[Message]) -> Vec<AnthropicMessage> {
-    let mut result = Vec::new();
-    let mut index = 0;
+	let mut result = Vec::new();
+	let mut index = 0;
 
-    while index < messages.len() {
-        let message = &messages[index];
+	while index < messages.len() {
+		let message = &messages[index];
 
-        // Skip system messages - they're handled separately
-        if message.role == "system" {
-            index += 1;
-            continue;
-        }
+		// Skip system messages - they're handled separately
+		if message.role == "system" {
+			index += 1;
+			continue;
+		}
 
-        match message.role.as_str() {
-            "tool" => {
-                let mut content = Vec::new();
+		if message.role == "assistant" {
+			if let Some(content) = replayed_assistant_content(message) {
+				result.push(AnthropicMessage {
+					role: message.role.clone(),
+					content,
+				});
+				index += 1;
+				continue;
+			}
+		}
 
-                while index < messages.len() && messages[index].role == "tool" {
-                    let tool_message = &messages[index];
-                    let tool_call_id = tool_message.tool_call_id.as_deref().unwrap_or("");
+		match message.role.as_str() {
+			"tool" => {
+				let mut content = Vec::new();
 
-                    content.push(AnthropicContent::ToolResult {
-                        tool_use_id: tool_call_id.to_string(),
-                        content: tool_message.content.clone(),
-                        cache_control: shared::maybe_cache_control_with_ttl(
-                            tool_message.cached,
-                            tool_message.cache_ttl.as_deref(),
-                        ),
-                    });
-                    index += 1;
-                }
+				while index < messages.len() && messages[index].role == "tool" {
+					let tool_message = &messages[index];
+					let tool_call_id = tool_message.tool_call_id.as_deref().unwrap_or("");
 
-                if index < messages.len() && messages[index].role == "user" {
-                    append_regular_content(&messages[index], &mut content);
-                    index += 1;
-                }
+					content.push(AnthropicContent::ToolResult {
+						tool_use_id: tool_call_id.to_string(),
+						content: shared::anthropic_tool_content(tool_message),
+						cache_control: shared::maybe_cache_control_with_ttl(
+							tool_message.cached,
+							tool_message.cache_ttl.as_deref(),
+						),
+					});
+					index += 1;
+				}
 
-                result.push(AnthropicMessage {
-                    role: "user".to_string(),
-                    content,
-                });
-            }
-            "assistant" if message.tool_calls.is_some() => {
-                // Assistant message with tool calls - reconstruct tool_use blocks
-                let mut content = Vec::new();
+				if index < messages.len() && messages[index].role == "user" {
+					append_regular_content(&messages[index], &mut content);
+					index += 1;
+				}
 
-                // Add text content if not empty
-                if !message.content.trim().is_empty() {
-                    content.push(AnthropicContent::Text {
-                        text: message.content.clone(),
-                        cache_control: shared::maybe_cache_control_with_ttl(
-                            message.cached,
-                            message.cache_ttl.as_deref(),
-                        ),
-                    });
-                }
+				result.push(AnthropicMessage {
+					role: "user".to_string(),
+					content,
+				});
+			}
+			"assistant" if message.tool_calls.is_some() => {
+				// Assistant message with tool calls - reconstruct tool_use blocks
+				let mut content = Vec::new();
 
-                // Add tool_use blocks from stored tool_calls in unified GenericToolCall format
-                for call in
-                    shared::parse_generic_tool_calls_lossy(message.tool_calls.as_ref(), "anthropic")
-                {
-                    content.push(AnthropicContent::ToolUse {
-                        id: call.id,
-                        name: call.name,
-                        input: call.arguments,
-                    });
-                }
+				// Add text content if not empty
+				if !message.content.trim().is_empty() {
+					content.push(AnthropicContent::Text {
+						text: message.content.clone(),
+						cache_control: shared::maybe_cache_control_with_ttl(
+							message.cached,
+							message.cache_ttl.as_deref(),
+						),
+					});
+				}
 
-                result.push(AnthropicMessage {
-                    role: message.role.clone(),
-                    content,
-                });
-                index += 1;
-            }
-            _ => {
-                // Handle regular user and assistant messages
-                let mut content = Vec::new();
-                append_regular_content(message, &mut content);
+				// Add tool_use blocks from stored tool_calls in unified GenericToolCall format
+				for call in shared::parse_generic_tool_calls_lossy(message.tool_calls.as_ref(), PROVIDER_NAME) {
+					content.push(AnthropicContent::ToolUse {
+						id: call.id,
+						name: call.name,
+						input: call.arguments,
+					});
+				}
 
-                // Skip messages with no content blocks — an empty content array is
-                // equally invalid and would cause the same API rejection.
-                if !content.is_empty() {
-                    result.push(AnthropicMessage {
-                        role: message.role.clone(),
-                        content,
-                    });
-                }
-                index += 1;
-            }
-        }
-    }
+				result.push(AnthropicMessage {
+					role: message.role.clone(),
+					content,
+				});
+				index += 1;
+			}
+			_ => {
+				// Handle regular user and assistant messages
+				let mut content = Vec::new();
+				append_regular_content(message, &mut content);
 
-    result
+				// Skip messages with no content blocks — an empty content array is
+				// equally invalid and would cause the same API rejection.
+				if !content.is_empty() {
+					result.push(AnthropicMessage {
+						role: message.role.clone(),
+						content,
+					});
+				}
+				index += 1;
+			}
+		}
+	}
+
+	result
 }
 
 fn append_regular_content(message: &Message, content: &mut Vec<AnthropicContent>) {
-    // Only add text block when content is non-empty — Anthropic rejects
-    // empty text blocks with "text content blocks must be non-empty".
-    // This can happen when the AI responds with only tool_use blocks
-    // (no accompanying text), leaving content = "" in the stored message.
-    if !message.content.trim().is_empty() {
-        content.push(AnthropicContent::Text {
-            text: message.content.clone(),
-            cache_control: shared::maybe_cache_control_with_ttl(
-                message.cached,
-                message.cache_ttl.as_deref(),
-            ),
-        });
-    }
+	// Only add text block when content is non-empty — Anthropic rejects
+	// empty text blocks with "text content blocks must be non-empty".
+	// This can happen when the AI responds with only tool_use blocks
+	// (no accompanying text), leaving content = "" in the stored message.
+	if !message.content.trim().is_empty() {
+		content.push(AnthropicContent::Text {
+			text: message.content.clone(),
+			cache_control: shared::maybe_cache_control_with_ttl(message.cached, message.cache_ttl.as_deref()),
+		});
+	}
 
-    // Add images if present
-    if let Some(images) = &message.images {
-        for image in images {
-            if let crate::llm::types::ImageData::Base64(data) = &image.data {
-                content.push(AnthropicContent::Image {
-                    source: ImageSource {
-                        source_type: "base64".to_string(),
-                        media_type: image.media_type.clone(),
-                        data: data.clone(),
-                    },
-                    cache_control: None,
-                });
-            }
-        }
-    }
+	// Add images if present
+	if let Some(images) = &message.images {
+		for image in images {
+			if let crate::llm::types::ImageData::Base64(data) = &image.data {
+				content.push(AnthropicContent::Image {
+					source: ImageSource {
+						source_type: "base64".to_string(),
+						media_type: image.media_type.clone(),
+						data: data.clone(),
+					},
+					cache_control: None,
+				});
+			}
+		}
+	}
+}
+
+fn is_thinking_block(block: &serde_json::Value) -> bool {
+	THINKING_BLOCK_TYPES.iter().any(|kind| block["type"] == *kind)
+}
+
+/// Keep the response's content blocks verbatim when they include thinking:
+/// Anthropic wants returned thinking blocks back unchanged and in order, which
+/// the parsed thinking text alone cannot reproduce (the `signature` is lost).
+fn set_response_output_items(response_json: &mut serde_json::Value) {
+	let has_thinking = response_json["content"]
+		.as_array()
+		.is_some_and(|blocks| blocks.iter().any(is_thinking_block));
+	if has_thinking {
+		response_json["output_items"] = serde_json::json!({
+			"provider": PROVIDER_NAME,
+			"items": response_json["content"].clone(),
+		});
+	}
+}
+
+/// The assistant message's captured content blocks, ready to send back as they
+/// came. They only stand for the message while they come from this provider and
+/// their `tool_use` blocks are exactly its tool calls; otherwise the caller
+/// rebuilds the content from the stored fields.
+fn replayed_assistant_content(message: &Message) -> Option<Vec<AnthropicContent>> {
+	let captured = message.provider_items.as_ref()?;
+	if captured["provider"] != PROVIDER_NAME {
+		return None;
+	}
+	let items = captured["items"].as_array()?;
+	let calls = match message.tool_calls.as_ref() {
+		Some(tool_calls) => shared::parse_generic_tool_calls_strict(tool_calls, PROVIDER_NAME).ok()?,
+		None => Vec::new(),
+	};
+	let mut message_call_ids: Vec<&str> = calls.iter().map(|call| call.id.as_str()).collect();
+	let mut item_call_ids: Vec<&str> = items
+		.iter()
+		.filter(|item| item["type"] == "tool_use")
+		.map(|item| item["id"].as_str().unwrap_or_default())
+		.collect();
+	message_call_ids.sort_unstable();
+	item_call_ids.sort_unstable();
+	if item_call_ids != message_call_ids {
+		return None;
+	}
+
+	let mut items = items.clone();
+	if let Some(cache_control) = shared::maybe_cache_control_with_ttl(message.cached, message.cache_ttl.as_deref()) {
+		// Anthropic rejects cache_control on thinking blocks, so the breakpoint
+		// goes on the last text block, where the reconstructed message has it.
+		if let Some(text) = items.iter_mut().rev().find(|item| item["type"] == "text") {
+			text["cache_control"] = cache_control;
+		}
+	}
+	Some(items.into_iter().map(AnthropicContent::Raw).collect())
+}
+
+/// Reconcile replayed thinking blocks with the thinking config of the request.
+///
+/// With adaptive/enabled thinking, ask Anthropic to drop a returned block that
+/// no longer matches: accounts created on/after 2026-08-31 get a 400 when a
+/// returned block fails the prefix check (tools or earlier messages changed)
+/// unless `drop_block` is set. With any other thinking mode `block_binding` is
+/// a 400, so the blocks are removed instead, which the docs allow.
+fn apply_thinking_replay_policy(request_body: &mut serde_json::Value) {
+	let binds = request_body["thinking"]["type"]
+		.as_str()
+		.is_some_and(|kind| BLOCK_BINDING_THINKING_TYPES.contains(&kind));
+	if binds {
+		// Set on every request, not only those that replay thinking: the thinking
+		// config is rendered into the prompt, so adding it from turn two on would
+		// start a new cache prefix ("Thinking and prompt caching").
+		request_body["thinking"]["block_binding"] = serde_json::json!({"prefix_mismatch_behavior": "drop_block"});
+		return;
+	}
+	// A message left with no blocks is invalid, so it goes too.
+	request_body["messages"]
+		.as_array_mut()
+		.expect("messages are built as an array")
+		.retain_mut(|message| {
+			let blocks = message["content"]
+				.as_array_mut()
+				.expect("message content is built as an array");
+			let before = blocks.len();
+			blocks.retain(|block| !is_thinking_block(block));
+			blocks.len() == before || !blocks.is_empty()
+		});
+}
+
+/// An assistant turn that produced nothing to act on: no text, tool call or
+/// structured output, and a stop reason that says it was not cut by the
+/// output limit.
+fn is_empty_turn(response: &ProviderResponse) -> bool {
+	response.content.trim().is_empty()
+		&& response.tool_calls.is_none()
+		&& response.structured_output.is_none()
+		&& response
+			.finish_reason
+			.as_deref()
+			.is_some_and(|reason| EMPTY_TURN_STOP_REASONS.contains(&reason))
+}
+
+/// Fold an earlier call's usage into the call that replaced it.
+fn add_usage(total: &mut TokenUsage, earlier: &TokenUsage) {
+	total.input_tokens += earlier.input_tokens;
+	total.cache_read_tokens += earlier.cache_read_tokens;
+	total.cache_write_tokens += earlier.cache_write_tokens;
+	total.output_tokens += earlier.output_tokens;
+	total.reasoning_tokens += earlier.reasoning_tokens;
+	total.total_tokens += earlier.total_tokens;
+	total.cost = [total.cost, earlier.cost].into_iter().flatten().reduce(|a, b| a + b);
+	total.request_time_ms = [total.request_time_ms, earlier.request_time_ms]
+		.into_iter()
+		.flatten()
+		.reduce(|a, b| a + b);
+}
+
+/// Hash of what a continue request leaves out, so a turn continues only the
+/// thread that holds exactly this conversation. Cache breakpoints are left out:
+/// callers move them between turns, and a thread keeps the ones it was sent.
+fn conversation_fingerprint(system: &str, tools: &serde_json::Value, messages: &[Message]) -> String {
+	let mut conversation = serde_json::json!({
+		"system": system,
+		"tools": tools,
+		"messages": convert_messages(messages),
+	});
+	strip_cache_control(&mut conversation);
+	format!("{:x}", Sha256::digest(conversation.to_string()))
+}
+
+fn strip_cache_control(value: &mut serde_json::Value) {
+	match value {
+		serde_json::Value::Object(fields) => {
+			fields.remove("cache_control");
+			fields.values_mut().for_each(strip_cache_control);
+		}
+		serde_json::Value::Array(items) => items.iter_mut().for_each(strip_cache_control),
+		_ => {}
+	}
+}
+
+/// The stored turn a request can continue from, and the messages after it. The
+/// last assistant turn must carry a thread id made for the conversation before
+/// it, and there must be something new to send.
+fn thread_continuation<'a>(
+	messages: &'a [Message],
+	system: &str,
+	tools: &serde_json::Value,
+) -> Option<(&'a str, Vec<AnthropicMessage>)> {
+	let anchor = messages.iter().rposition(|m| m.role == "assistant")?;
+	let (fingerprint, message_id) = messages[anchor]
+		.id
+		.as_deref()?
+		.strip_prefix(THREAD_ID_PREFIX)?
+		.split_once(':')?;
+	let new_messages = convert_messages(&messages[anchor + 1..]);
+	(!new_messages.is_empty() && fingerprint == conversation_fingerprint(system, tools, &messages[..anchor]))
+		.then_some((message_id, new_messages))
+}
+
+/// The full request reduced to a continue request: the fixed fields stay, the
+/// thread already holds `system`, `tools` and the earlier messages.
+fn continue_thread_body(
+	full_body: &serde_json::Value,
+	message_id: &str,
+	new_messages: Vec<AnthropicMessage>,
+) -> serde_json::Value {
+	let mut body: serde_json::Map<String, serde_json::Value> = full_body
+		.as_object()
+		.into_iter()
+		.flatten()
+		.filter(|(field, _)| field.as_str() != "messages" && !THREAD_CREATE_ONLY_FIELDS.contains(&field.as_str()))
+		.map(|(field, value)| (field.clone(), value.clone()))
+		.collect();
+	body.insert("messages".to_string(), serde_json::json!(new_messages));
+	body.insert(
+		"thread".to_string(),
+		serde_json::json!({"type": "continue", "previous_message_id": message_id}),
+	);
+	body.into()
+}
+
+/// A request the API refused for its `thread` before the model ran: no tokens
+/// were used and the thread is unchanged.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct ThreadRejected {
+	code: String,
+	message: String,
+}
+
+enum ThreadFailure {
+	/// The API can't continue the thread; the full conversation starts a new one.
+	Replay,
+	/// Threads aren't available for this request; it goes out without one.
+	Unsupported,
+}
+
+fn thread_failure(err: &anyhow::Error) -> Option<ThreadFailure> {
+	let code = err.downcast_ref::<ThreadRejected>()?.code.as_str();
+	if THREAD_REPLAY_CODES.contains(&code) {
+		Some(ThreadFailure::Replay)
+	} else if code == THREAD_UNSUPPORTED_CODE {
+		Some(ThreadFailure::Unsupported)
+	} else {
+		None
+	}
+}
+
+fn thread_error_code(body: &str) -> Option<String> {
+	let body: serde_json::Value = serde_json::from_str(body).ok()?;
+	body["error"]["details"]["error_code"].as_str().map(str::to_string)
+}
+
+fn build_beta_header(request_body: &serde_json::Value) -> String {
+	// The 1h cache TTL beta goes on every request, used or not: a thread fixes the
+	// set of betas, so one that came and went with a 1h marker would end it.
+	let mut betas = vec![PROMPT_CACHING_BETA, EXTENDED_CACHE_TTL_BETA];
+	if request_body["thinking"].get("block_binding").is_some() {
+		betas.push(THINKING_BINDING_BETA);
+	}
+	if request_body.get("thread").is_some() {
+		betas.push(MESSAGE_THREADS_BETA);
+	}
+	betas.join(",")
 }
 
 // Execute a single Anthropic HTTP request with smart retry delay calculation
 #[allow(clippy::too_many_arguments)]
 async fn execute_anthropic_request(
-    auth_header_name: String,
-    auth_header_value: String,
-    api_url: String,
-    request_body: serde_json::Value,
-    max_retries: u32,
-    base_timeout: std::time::Duration,
-    request_timeout: Option<std::time::Duration>,
-    cancellation_token: Option<&tokio::sync::watch::Receiver<bool>>,
-    extended_cache_ttl: bool,
-    extra_headers: Option<std::collections::HashMap<String, String>>,
+	auth_headers: reqwest::header::HeaderMap,
+	api_url: String,
+	request_body: serde_json::Value,
+	max_retries: u32,
+	base_timeout: std::time::Duration,
+	request_timeout: Option<std::time::Duration>,
+	stream_timeout: Option<std::time::Duration>,
+	cancellation_token: Option<&tokio::sync::watch::Receiver<bool>>,
+	extra_headers: Option<std::collections::HashMap<String, String>>,
+	per_call_api_key: Option<&crate::llm::types::PerCallApiKey>,
+	retry_observer: Option<&crate::llm::retry::RetryObserver>,
 ) -> Result<ProviderResponse> {
-    let start_time = std::time::Instant::now();
+	let start_time = std::time::Instant::now();
 
-    // Build beta header: always include prompt-caching, add extended-cache-ttl when needed
-    let beta_header = if extended_cache_ttl {
-        "prompt-caching-2024-07-31,extended-cache-ttl-2025-04-11"
-    } else {
-        "prompt-caching-2024-07-31"
-    };
+	// The other betas ride only the requests that use them
+	let beta_header = build_beta_header(&request_body);
 
-    let response = retry::retry_with_exponential_backoff(
-        || {
-            let client = shared::http_client();
-            let extra_headers = extra_headers.clone();
-            let auth_header_name = auth_header_name.clone();
-            let auth_header_value = auth_header_value.clone();
-            let api_url = api_url.clone();
-            let request_body = request_body.clone();
-            let beta_header = beta_header.to_string();
-            Box::pin(async move {
-                let req = client
-                    .post(&api_url)
-                    .header("Content-Type", "application/json")
-                    .header(&auth_header_name, &auth_header_value)
-                    .header("anthropic-version", "2023-06-01")
-                    .header("anthropic-beta", &beta_header)
-                    .json(&request_body);
+	let response = retry::retry_provider_request(
+		|| {
+			let client = shared::http_client();
+			let extra_headers = extra_headers.clone();
+			let auth_headers = auth_headers.clone();
+			let api_url = api_url.clone();
+			let request_body = request_body.clone();
+			let beta_header = beta_header.to_string();
+			Box::pin(async move {
+				let req = client
+					.post(&api_url)
+					.header("Content-Type", "application/json")
+					.headers(auth_headers)
+					.header("anthropic-version", ANTHROPIC_API_VERSION)
+					.header("anthropic-beta", &beta_header)
+					.json(&request_body);
 
-                let captured =
-                    shared::send_and_read(req, request_timeout, extra_headers.as_ref()).await?;
+				// Pre-warm requests are non-streaming (no `stream: true`), so read plain JSON.
+				let captured = if request_body["stream"] == true {
+					super::streaming::send_and_read(
+						req,
+						request_timeout,
+						stream_timeout,
+						extra_headers.as_ref(),
+						super::streaming::Format::Messages,
+					)
+					.await?
+				} else {
+					shared::send_and_read(req, request_timeout, extra_headers.as_ref()).await?
+				};
 
-                // Return Err for retryable HTTP errors so the retry loop catches them
-                if retry::is_retryable_status(captured.status.as_u16()) {
-                    return Err(anyhow::anyhow!(
-                        "Anthropic API error {}: {}",
-                        captured.status,
-                        captured.body
-                    ));
-                }
+				// Return Err for retryable HTTP errors so the retry loop catches them
+				if retry::is_retryable_status(captured.status.as_u16()) {
+					return Err(retry::retryable_status_error(
+						&captured,
+						format!("Anthropic API error {}: {}", captured.status, captured.body),
+					));
+				}
 
-                Ok(captured)
-            })
-        },
-        max_retries,
-        base_timeout,
-        cancellation_token,
-        || ProviderError::Cancelled.into(),
-        |e| {
-            matches!(
-                e.downcast_ref::<ProviderError>(),
-                Some(ProviderError::Cancelled)
-            )
-        },
-        |e: &anyhow::Error| shared::is_connection_error(e),
-    )
-    .await?;
+				Ok(captured)
+			})
+		},
+		max_retries,
+		base_timeout,
+		cancellation_token,
+		per_call_api_key,
+		retry_observer,
+	)
+	.await?;
 
-    let request_time_ms = start_time.elapsed().as_millis() as u64;
+	let request_time_ms = start_time.elapsed().as_millis() as u64;
 
-    // Extract rate limit headers before consuming response
-    let mut rate_limit_headers = std::collections::HashMap::new();
-    let headers = &response.headers;
+	// Extract rate limit headers before consuming response
+	let mut rate_limit_headers = std::collections::HashMap::new();
+	let headers = &response.headers;
 
-    // Anthropic rate limit headers
-    if let Some(tokens_limit) = headers
-        .get("anthropic-ratelimit-tokens-limit")
-        .and_then(|h| h.to_str().ok())
-    {
-        rate_limit_headers.insert("tokens_limit".to_string(), tokens_limit.to_string());
-    }
-    if let Some(tokens_remaining) = headers
-        .get("anthropic-ratelimit-tokens-remaining")
-        .and_then(|h| h.to_str().ok())
-    {
-        rate_limit_headers.insert("tokens_remaining".to_string(), tokens_remaining.to_string());
-    }
-    if let Some(input_tokens_limit) = headers
-        .get("anthropic-ratelimit-input-tokens-limit")
-        .and_then(|h| h.to_str().ok())
-    {
-        rate_limit_headers.insert(
-            "input_tokens_limit".to_string(),
-            input_tokens_limit.to_string(),
-        );
-    }
-    if let Some(input_tokens_remaining) = headers
-        .get("anthropic-ratelimit-input-tokens-remaining")
-        .and_then(|h| h.to_str().ok())
-    {
-        rate_limit_headers.insert(
-            "input_tokens_remaining".to_string(),
-            input_tokens_remaining.to_string(),
-        );
-    }
-    if let Some(output_tokens_limit) = headers
-        .get("anthropic-ratelimit-output-tokens-limit")
-        .and_then(|h| h.to_str().ok())
-    {
-        rate_limit_headers.insert(
-            "output_tokens_limit".to_string(),
-            output_tokens_limit.to_string(),
-        );
-    }
-    if let Some(output_tokens_remaining) = headers
-        .get("anthropic-ratelimit-output-tokens-remaining")
-        .and_then(|h| h.to_str().ok())
-    {
-        rate_limit_headers.insert(
-            "output_tokens_remaining".to_string(),
-            output_tokens_remaining.to_string(),
-        );
-    }
+	// Anthropic rate limit headers
+	if let Some(tokens_limit) = headers
+		.get("anthropic-ratelimit-tokens-limit")
+		.and_then(|h| h.to_str().ok())
+	{
+		rate_limit_headers.insert("tokens_limit".to_string(), tokens_limit.to_string());
+	}
+	if let Some(tokens_remaining) = headers
+		.get("anthropic-ratelimit-tokens-remaining")
+		.and_then(|h| h.to_str().ok())
+	{
+		rate_limit_headers.insert("tokens_remaining".to_string(), tokens_remaining.to_string());
+	}
+	if let Some(input_tokens_limit) = headers
+		.get("anthropic-ratelimit-input-tokens-limit")
+		.and_then(|h| h.to_str().ok())
+	{
+		rate_limit_headers.insert("input_tokens_limit".to_string(), input_tokens_limit.to_string());
+	}
+	if let Some(input_tokens_remaining) = headers
+		.get("anthropic-ratelimit-input-tokens-remaining")
+		.and_then(|h| h.to_str().ok())
+	{
+		rate_limit_headers.insert("input_tokens_remaining".to_string(), input_tokens_remaining.to_string());
+	}
+	if let Some(output_tokens_limit) = headers
+		.get("anthropic-ratelimit-output-tokens-limit")
+		.and_then(|h| h.to_str().ok())
+	{
+		rate_limit_headers.insert("output_tokens_limit".to_string(), output_tokens_limit.to_string());
+	}
+	if let Some(output_tokens_remaining) = headers
+		.get("anthropic-ratelimit-output-tokens-remaining")
+		.and_then(|h| h.to_str().ok())
+	{
+		rate_limit_headers.insert(
+			"output_tokens_remaining".to_string(),
+			output_tokens_remaining.to_string(),
+		);
+	}
 
-    if !response.status.is_success() {
-        return Err(anyhow::anyhow!(
-            "Anthropic API error {}: {}",
-            response.status,
-            response.body
-        ));
-    }
+	if !response.status.is_success() {
+		let message = format!("Anthropic API error {}: {}", response.status, response.body);
+		return Err(
+			match request_body
+				.get("thread")
+				.and_then(|_| thread_error_code(&response.body))
+			{
+				Some(code) => ThreadRejected { code, message }.into(),
+				None => anyhow::anyhow!(message),
+			},
+		);
+	}
 
-    let response_text = response.body;
-    let anthropic_response: AnthropicResponse = serde_json::from_str(&response_text)?;
+	let anthropic_response: AnthropicResponse = shared::parse_response(&response.body, per_call_api_key)?;
 
-    // Extract content, thinking blocks, and tool calls
-    let mut content_parts = Vec::new();
-    let mut thinking_parts = Vec::new();
-    let mut tool_calls = Vec::new();
+	// Extract content, thinking blocks, and tool calls
+	let mut content_parts = Vec::new();
+	let mut thinking_parts = Vec::new();
+	let mut tool_calls = Vec::new();
 
-    for content in anthropic_response.content {
-        match content {
-            AnthropicResponseContent::Text { text } => {
-                content_parts.push(text);
-            }
-            AnthropicResponseContent::Thinking(value) => {
-                // Extract thinking content from the JSON value
-                if let Some(thinking_str) = value.get("thinking").and_then(|v| v.as_str()) {
-                    thinking_parts.push(thinking_str.to_string());
-                }
-            }
-            AnthropicResponseContent::ToolUse { id, name, input } => {
-                tool_calls.push(ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    arguments: input,
-                });
-            }
-        }
-    }
+	for content in anthropic_response.content {
+		match content {
+			AnthropicResponseContent::Text { text } => {
+				content_parts.push(text);
+			}
+			AnthropicResponseContent::Thinking(value) => {
+				// Extract thinking content from the JSON value
+				if let Some(thinking_str) = value.get("thinking").and_then(|v| v.as_str()) {
+					thinking_parts.push(thinking_str.to_string());
+				}
+			}
+			AnthropicResponseContent::RedactedThinking => {}
+			AnthropicResponseContent::ToolUse { id, name, input } => {
+				tool_calls.push(ToolCall {
+					id: id.clone(),
+					name: name.clone(),
+					arguments: input,
+				});
+			}
+		}
+	}
 
-    let content = content_parts.join("\n");
+	let content = content_parts.join("\n");
+	// JSON outputs arrive as the text block (structured-outputs docs).
+	let structured_output = request_body["output_config"]
+		.get("format")
+		.and_then(|_| shared::parse_structured_output_from_text(&content));
 
-    // Extract thinking as a separate ThinkingBlock
-    let (thinking, reasoning_tokens) = if thinking_parts.is_empty() {
-        (None, 0)
-    } else {
-        let thinking_content = thinking_parts.join("\n\n");
-        let estimated = (thinking_content.len() / 4) as u64;
-        (
-            Some(ThinkingBlock {
-                content: thinking_content,
-                tokens: estimated,
-            }),
-            estimated,
-        )
-    };
+	// Extract thinking as a separate ThinkingBlock
+	let (thinking, reasoning_tokens) = if thinking_parts.is_empty() {
+		(None, 0)
+	} else {
+		let thinking_content = thinking_parts.join("\n\n");
+		let estimated = (thinking_content.len() / 4) as u64;
+		(
+			Some(ThinkingBlock {
+				content: thinking_content,
+				tokens: estimated,
+			}),
+			estimated,
+		)
+	};
 
-    // Calculate cost with proper cache pricing
-    let cache_read_tokens = anthropic_response
-        .usage
-        .cache_read_input_tokens
-        .unwrap_or(0);
+	// Calculate cost with proper cache pricing
+	let cache_read_tokens = anthropic_response.usage.cache_read_input_tokens.unwrap_or(0);
 
-    // Cache creation token breakdown by TTL.
-    // Prefer the explicit `cache_creation` nested object when the API returns
-    // it (per-TTL split). When absent, treat the legacy aggregate
-    // `cache_creation_input_tokens` as 5m TTL — this matches Anthropic's
-    // default `cache_control` TTL when `ttl` is omitted, and avoids
-    // over-charging by ~60% (1h is billed at 2x base, 5m at 1.25x base).
-    let (cache_creation_5m_tokens, cache_creation_1h_tokens) =
-        match anthropic_response.usage.cache_creation.as_ref() {
-            Some(split) => (
-                split.ephemeral_5m_input_tokens,
-                split.ephemeral_1h_input_tokens,
-            ),
-            None => (
-                anthropic_response
-                    .usage
-                    .cache_creation_input_tokens
-                    .unwrap_or(0),
-                0,
-            ),
-        };
-    let cache_creation_tokens = cache_creation_5m_tokens + cache_creation_1h_tokens;
+	// Cache creation token breakdown by TTL.
+	// Prefer the explicit `cache_creation` nested object when the API returns
+	// it (per-TTL split). When absent, treat the legacy aggregate
+	// `cache_creation_input_tokens` as 5m TTL — this matches Anthropic's
+	// default `cache_control` TTL when `ttl` is omitted, and avoids
+	// over-charging by ~60% (1h is billed at 2x base, 5m at 1.25x base).
+	let (cache_creation_5m_tokens, cache_creation_1h_tokens) = match anthropic_response.usage.cache_creation.as_ref() {
+		Some(split) => (split.ephemeral_5m_input_tokens, split.ephemeral_1h_input_tokens),
+		None => (anthropic_response.usage.cache_creation_input_tokens.unwrap_or(0), 0),
+	};
+	let cache_creation_tokens = cache_creation_5m_tokens + cache_creation_1h_tokens;
 
-    // CRITICAL: input_tokens from API is ALREADY clean (non-cached)
-    // According to Anthropic docs:
-    // - input_tokens = regular non-cached tokens only (NEW tokens in this request)
-    // - cache_creation_input_tokens = tokens written to cache (separate)
-    // - cache_read_input_tokens = tokens read from cache (separate)
-    let input_tokens_clean = anthropic_response.usage.input_tokens;
+	// CRITICAL: input_tokens from API is ALREADY clean (non-cached)
+	// According to Anthropic docs:
+	// - input_tokens = regular non-cached tokens only (NEW tokens in this request)
+	// - cache_creation_input_tokens = tokens written to cache (separate)
+	// - cache_read_input_tokens = tokens read from cache (separate)
+	let input_tokens_clean = anthropic_response.usage.input_tokens;
 
-    let cost = calculate_anthropic_cost(
-        request_body["model"].as_str().unwrap_or(""),
-        anthropic_response.usage.input_tokens as u32,
-        anthropic_response.usage.output_tokens as u32,
-        cache_creation_5m_tokens as u32,
-        cache_creation_1h_tokens as u32,
-        cache_read_tokens as u32,
-    );
+	let cost = calculate_anthropic_cost(
+		request_body["model"].as_str().unwrap_or(""),
+		anthropic_response.usage.input_tokens as u32,
+		anthropic_response.usage.output_tokens as u32,
+		cache_creation_5m_tokens as u32,
+		cache_creation_1h_tokens as u32,
+		cache_read_tokens as u32,
+	);
 
-    // Anthropic bills thinking inside output_tokens and exposes no reasoning
-    // field, so reasoning is estimated from the emitted thinking text and must be
-    // carved out of output rather than added on top of it.
-    let (output_tokens, reasoning_tokens) =
-        TokenUsage::split_output(anthropic_response.usage.output_tokens, reasoning_tokens);
+	// Anthropic bills thinking inside output_tokens and exposes no reasoning
+	// field, so reasoning is estimated from the emitted thinking text and must be
+	// carved out of output rather than added on top of it.
+	let (output_tokens, reasoning_tokens) =
+		TokenUsage::split_output(anthropic_response.usage.output_tokens, reasoning_tokens);
 
-    let usage = TokenUsage {
-        input_tokens: input_tokens_clean,          // CLEAN input (no cache)
-        cache_read_tokens,                         // Tokens read from cache
-        cache_write_tokens: cache_creation_tokens, // Tokens written to cache
-        output_tokens,
-        reasoning_tokens,
-        // input_tokens is already cache-free, so cache reads and writes are their
-        // own terms in the total.
-        total_tokens: input_tokens_clean
-            + cache_read_tokens
-            + cache_creation_tokens
-            + anthropic_response.usage.output_tokens,
-        cost,
-        request_time_ms: Some(request_time_ms),
-    };
+	let usage = TokenUsage {
+		input_tokens: input_tokens_clean,          // CLEAN input (no cache)
+		cache_read_tokens,                         // Tokens read from cache
+		cache_write_tokens: cache_creation_tokens, // Tokens written to cache
+		output_tokens,
+		reasoning_tokens,
+		// input_tokens is already cache-free, so cache reads and writes are their
+		// own terms in the total.
+		total_tokens: input_tokens_clean
+			+ cache_read_tokens
+			+ cache_creation_tokens
+			+ anthropic_response.usage.output_tokens,
+		cost,
+		request_time_ms: Some(request_time_ms),
+	};
 
-    // Create response JSON that stores tool_calls in unified GenericToolCall format
-    let mut response_json: serde_json::Value = serde_json::from_str(&response_text)?;
+	// Create response JSON that stores tool_calls in unified GenericToolCall format
+	let mut response_json: serde_json::Value = shared::parse_response(&response.body, per_call_api_key)?;
 
-    // Store tool_calls in unified GenericToolCall format for conversation history
-    shared::set_response_tool_calls(&mut response_json, &tool_calls, None);
+	// Store tool_calls in unified GenericToolCall format for conversation history
+	shared::set_response_tool_calls(&mut response_json, &tool_calls, None);
+	set_response_output_items(&mut response_json);
 
-    let exchange = if rate_limit_headers.is_empty() {
-        ProviderExchange::new(request_body, response_json, Some(usage), "anthropic")
-    } else {
-        ProviderExchange::with_rate_limit_headers(
-            request_body,
-            response_json,
-            Some(usage),
-            "anthropic",
-            rate_limit_headers,
-        )
-    };
+	let exchange = if rate_limit_headers.is_empty() {
+		ProviderExchange::new(request_body, response_json, Some(usage), PROVIDER_NAME)
+	} else {
+		ProviderExchange::with_rate_limit_headers(
+			request_body,
+			response_json,
+			Some(usage),
+			PROVIDER_NAME,
+			rate_limit_headers,
+		)
+	};
 
-    Ok(ProviderResponse {
-        content,
-        thinking,
-        exchange,
-        tool_calls: if tool_calls.is_empty() {
-            None
-        } else {
-            Some(tool_calls)
-        },
-        finish_reason: anthropic_response.stop_reason,
-        structured_output: None, // Anthropic doesn't support structured output
-        id: Some(anthropic_response.id),
-    })
+	Ok(ProviderResponse {
+		content,
+		thinking,
+		exchange,
+		tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+		finish_reason: anthropic_response.stop_reason,
+		structured_output,
+		id: Some(anthropic_response.id),
+	})
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serial_test::serial;
-
-    #[test]
-    #[serial]
-    fn test_oauth_token_priority() {
-        let provider = AnthropicProvider::new();
-
-        // Set OAuth token
-        env::set_var(ANTHROPIC_OAUTH_TOKEN_ENV, "test-oauth-token");
-
-        // get_api_key should return error when OAuth is set
-        let result = provider.get_api_key();
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("OAuth authentication"));
-
-        // Clean up
-        env::remove_var(ANTHROPIC_OAUTH_TOKEN_ENV);
-    }
-
-    #[test]
-    #[serial]
-    fn test_api_key_fallback() {
-        let provider = AnthropicProvider::new();
-
-        // Remove OAuth token if set
-        env::remove_var(ANTHROPIC_OAUTH_TOKEN_ENV);
-
-        // Set API key
-        env::set_var(ANTHROPIC_API_KEY_ENV, "test-api-key");
-
-        // get_api_key should return the API key
-        let result = provider.get_api_key();
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "test-api-key");
-
-        // Clean up
-        env::remove_var(ANTHROPIC_API_KEY_ENV);
-    }
-
-    #[test]
-    #[serial]
-    fn test_no_auth_error() {
-        let provider = AnthropicProvider::new();
-
-        // Remove both OAuth and API key
-        env::remove_var(ANTHROPIC_OAUTH_TOKEN_ENV);
-        env::remove_var(ANTHROPIC_API_KEY_ENV);
-
-        // get_api_key should return error
-        let result = provider.get_api_key();
-        assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
-        assert!(
-            error_msg.contains("ANTHROPIC_API_KEY") || error_msg.contains("ANTHROPIC_OAUTH_TOKEN")
-        );
-    }
-
-    #[test]
-    fn test_supports_model_case_insensitive() {
-        let provider = AnthropicProvider::new();
-
-        // Test lowercase (already working)
-        assert!(provider.supports_model("claude-3-haiku"));
-        assert!(provider.supports_model("claude-3-5-sonnet"));
-        assert!(provider.supports_model("claude-sonnet-4-6"));
-        assert!(provider.supports_model("claude-opus-4-7"));
-
-        // Test uppercase
-        assert!(provider.supports_model("CLAUDE-3-HAIKU"));
-        assert!(provider.supports_model("CLAUDE-3-5-SONNET"));
-        assert!(provider.supports_model("CLAUDE-SONNET-4-6"));
-        assert!(provider.supports_model("CLAUDE-OPUS-4-7"));
-        // Test mixed case
-        assert!(provider.supports_model("ClaUde-3-Haiku"));
-        assert!(provider.supports_model("CLAUDE-3-7-sonnet"));
-    }
-
-    #[test]
-    fn test_supports_vision_case_insensitive() {
-        let provider = AnthropicProvider::new();
-
-        assert!(provider.supports_vision("claude-sonnet-5"));
-        assert!(provider.supports_vision("claude-opus-4-6"));
-        assert!(provider.supports_vision("claude-sonnet-4-6"));
-        assert!(provider.supports_vision("claude-haiku-4-5"));
-
-        // Test lowercase
-        assert!(provider.supports_vision("claude-3-haiku"));
-        assert!(provider.supports_vision("claude-3-5-sonnet"));
-
-        // Test uppercase
-        assert!(provider.supports_vision("CLAUDE-3-HAIKU"));
-        assert!(provider.supports_vision("CLAUDE-3-5-SONNET"));
-        // Test mixed case
-        assert!(provider.supports_vision("ClaUde-3-7"));
-    }
-
-    #[test]
-    fn test_get_model_pricing() {
-        let provider = AnthropicProvider::new();
-
-        // Test Sonnet 4.6 pricing
-        let pricing = provider.get_model_pricing("claude-sonnet-4-6").unwrap();
-        assert_eq!(pricing.input_price_per_1m, 3.0);
-        assert_eq!(pricing.output_price_per_1m, 15.0);
-        assert_eq!(pricing.cache_write_price_per_1m, 3.75);
-        assert_eq!(pricing.cache_read_price_per_1m, 0.30);
-
-        // Test Opus 4.7 pricing
-        let pricing = provider.get_model_pricing("claude-opus-4-7").unwrap();
-        assert_eq!(pricing.input_price_per_1m, 5.0);
-        assert_eq!(pricing.output_price_per_1m, 25.0);
-        assert_eq!(pricing.cache_write_price_per_1m, 6.25);
-        assert_eq!(pricing.cache_read_price_per_1m, 0.50);
-
-        // Test Opus 4.7 context window
-        assert_eq!(provider.get_max_input_tokens("claude-opus-4-7"), 1_000_000);
-
-        // Test Opus 4.7 does not support any sampling parameters
-        let sp = provider.supported_sampling_params("claude-opus-4-7");
-        assert_eq!(sp, SamplingSupport::NONE);
-
-        // Test Opus 4.1 supports temperature+top_k but not top_p
-        let sp = provider.supported_sampling_params("claude-opus-4-1");
-        assert!(sp.temperature);
-        assert!(!sp.top_p);
-        assert!(sp.top_k);
-
-        // Test older Claude 3 supports all sampling params
-        let sp = provider.supported_sampling_params("claude-3-haiku");
-        assert!(sp.temperature);
-        assert!(sp.top_p);
-        assert!(sp.top_k);
-
-        // Test Sonnet 4 pricing (from the pricing table)
-        let pricing = provider.get_model_pricing("claude-sonnet-4").unwrap();
-        assert_eq!(pricing.input_price_per_1m, 3.0);
-        assert_eq!(pricing.output_price_per_1m, 15.0);
-        assert_eq!(pricing.cache_write_price_per_1m, 3.75); // from pricing table
-        assert_eq!(pricing.cache_read_price_per_1m, 0.30); // from pricing table
-
-        // Test Haiku 3 pricing
-        let pricing = provider.get_model_pricing("claude-3-haiku").unwrap();
-        assert_eq!(pricing.input_price_per_1m, 0.25);
-        assert_eq!(pricing.output_price_per_1m, 1.25);
-        assert_eq!(pricing.cache_write_price_per_1m, 0.30); // from pricing table
-        assert_eq!(pricing.cache_read_price_per_1m, 0.03); // from pricing table
-
-        // Test case insensitive
-        let pricing = provider.get_model_pricing("CLAUDE-SONNET-4").unwrap();
-        assert_eq!(pricing.input_price_per_1m, 3.0);
-
-        // Test unknown model
-        assert!(provider.get_model_pricing("unknown-model").is_none());
-    }
-
-    #[test]
-    fn test_opus_5() {
-        let provider = AnthropicProvider::new();
-        let model = "claude-opus-5";
-
-        assert!(provider.supports_model(model));
-
-        let pricing = provider.get_model_pricing(model).unwrap();
-        assert_eq!(pricing.input_price_per_1m, 5.0);
-        assert_eq!(pricing.output_price_per_1m, 25.0);
-        assert_eq!(pricing.cache_write_price_per_1m, 6.25);
-        assert_eq!(pricing.cache_read_price_per_1m, 0.50);
-
-        assert_eq!(provider.get_max_input_tokens(model), 1_000_000);
-        assert!(provider.supports_vision(model));
-        assert_eq!(
-            provider.supported_sampling_params(model),
-            SamplingSupport::NONE
-        );
-
-        assert!(THINKING_MODELS.contains(&"opus-5"));
-        assert!(ADAPTIVE_THINKING_MODELS.contains(&"opus-5"));
-        assert!(EFFORT_PARAM_MODELS.contains(&"opus-5"));
-        assert_eq!(effort_value(model, ReasoningEffort::XHigh, true), "xhigh");
-        assert_eq!(effort_value(model, ReasoningEffort::Max, true), "max");
-    }
-
-    #[test]
-    fn test_fable_5() {
-        let provider = AnthropicProvider::new();
-
-        let model = "claude-fable-5";
-        assert!(provider.supports_model(model));
-
-        // $10/$50, cache write 1.25x = 12.50, cache read 0.1x = 1.00
-        let pricing = provider.get_model_pricing(model).unwrap();
-        assert_eq!(pricing.input_price_per_1m, 10.0);
-        assert_eq!(pricing.output_price_per_1m, 50.0);
-        assert_eq!(pricing.cache_write_price_per_1m, 12.50);
-        assert_eq!(pricing.cache_read_price_per_1m, 1.00);
-
-        // 1M context window and vision (ID lacks claude-3/claude-4 substrings)
-        assert_eq!(provider.get_max_input_tokens(model), 1_000_000);
-        assert!(provider.supports_vision(model));
-
-        // Mythos-class is adaptive-only: rejects ALL sampling parameters
-        assert_eq!(
-            provider.supported_sampling_params(model),
-            SamplingSupport::NONE
-        );
-    }
-
-    #[test]
-    fn test_mythos_5() {
-        let provider = AnthropicProvider::new();
-
-        // Project Glasswing only, but same pricing/capabilities as Fable 5
-        let model = "claude-mythos-5";
-        assert!(provider.supports_model(model));
-
-        // $10/$50, cache write 1.25x = 12.50, cache read 0.1x = 1.00
-        let pricing = provider.get_model_pricing(model).unwrap();
-        assert_eq!(pricing.input_price_per_1m, 10.0);
-        assert_eq!(pricing.output_price_per_1m, 50.0);
-        assert_eq!(pricing.cache_write_price_per_1m, 12.50);
-        assert_eq!(pricing.cache_read_price_per_1m, 1.00);
-
-        // 1M context window and vision (ID lacks claude-3/claude-4 substrings)
-        assert_eq!(provider.get_max_input_tokens(model), 1_000_000);
-        assert!(provider.supports_vision(model));
-
-        // Adaptive-only: rejects ALL sampling parameters
-        assert_eq!(
-            provider.supported_sampling_params(model),
-            SamplingSupport::NONE
-        );
-    }
-
-    #[test]
-    fn parallel_tool_results_share_one_user_message() {
-        let mut assistant = Message::assistant("");
-        assistant.tool_calls = Some(serde_json::json!([
-            {"id": "toolu_a", "name": "first", "arguments": {}, "meta": null},
-            {"id": "toolu_b", "name": "second", "arguments": {}, "meta": null}
-        ]));
-
-        let messages = vec![
-            assistant,
-            Message::tool("result A", "toolu_a", "first"),
-            Message::tool("result B", "toolu_b", "second"),
-        ];
-
-        let converted = convert_messages(&messages);
-        assert_eq!(converted.len(), 2);
-        assert_eq!(converted[0].role, "assistant");
-        assert_eq!(converted[1].role, "user");
-
-        let user_content = serde_json::to_value(&converted[1].content).unwrap();
-        let blocks = user_content.as_array().unwrap();
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0]["type"], "tool_result");
-        assert_eq!(blocks[0]["tool_use_id"], "toolu_a");
-        assert_eq!(blocks[1]["type"], "tool_result");
-        assert_eq!(blocks[1]["tool_use_id"], "toolu_b");
-    }
-
-    #[test]
-    fn tool_results_merge_following_user_hint() {
-        let messages = vec![
-            Message::tool("result A", "toolu_a", "first"),
-            Message::tool("result B", "toolu_b", "second"),
-            Message::user("Please use those results."),
-        ];
-
-        let converted = convert_messages(&messages);
-        assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].role, "user");
-
-        let content = serde_json::to_value(&converted[0].content).unwrap();
-        let blocks = content.as_array().unwrap();
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0]["tool_use_id"], "toolu_a");
-        assert_eq!(blocks[1]["tool_use_id"], "toolu_b");
-        assert_eq!(blocks[2]["type"], "text");
-        assert_eq!(blocks[2]["text"], "Please use those results.");
-    }
-}
+#[path = "anthropic_tests.rs"]
+mod tests;

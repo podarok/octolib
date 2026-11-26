@@ -16,139 +16,223 @@
 
 use crate::errors::ToolCallError;
 use crate::llm::tool_calls::GenericToolCall;
-use crate::llm::types::ToolCall;
-use arc_swap::ArcSwap;
-use std::sync::LazyLock;
+use crate::llm::types::{ReasoningEffort, ToolCall};
 use std::time::Duration;
 
-/// Process-wide shared HTTP client, swappable on connection errors.
-///
-/// `reqwest::Client` holds a connection pool internally — reusing it across
-/// all provider requests enables connection keep-alive, HTTP/2 multiplexing
-/// (when the server supports it via ALPN), and avoids the per-request TLS
-/// handshake overhead that causes connection-reset errors under load.
-///
-/// When a connection error is detected (DNS failure, TCP reset, TLS handshake
-/// failure, network unreachable), `refresh_http_client()` atomically swaps
-/// in a fresh client with a new connection pool, so subsequent retries don't
-/// reuse stale/broken connections.
-///
-/// # HTTP stack tuning
-///
-/// Total request timeouts are applied per call via `apply_request_timeout()`.
-/// The client itself only limits connection establishment, so slow LLM
-/// generation is not affected by the connect timeout.
-///
-/// **Transport / pool reliability**
-/// - `connect_timeout(20s)`: bound DNS, TCP, and TLS establishment without
-///   limiting how long an established LLM request may run
-/// - `tcp_keepalive(10s)` + `tcp_keepalive_interval(5s)`: OS-level probes
-///   detect dead connections before reuse. The first probe fires at 10s —
-///   before `pool_idle_timeout` evicts the connection — so stale sockets are
-///   surfaced and removed rather than reused. Subsequent probes every 5s
-///   catch connections that go bad while idle in the pool.
-/// - `tcp_nodelay(true)`: disable Nagle's algorithm — request bodies ship
-///   immediately instead of waiting for ACK coalescing (lower latency)
-/// - `pool_idle_timeout(15s)`: evict idle pooled connections before NAT/firewall
-///   or the upstream edge silently drops them. Some upstream edges (notably
-///   CN-hosted endpoints like DeepSeek / Moonshot, and Alibaba Token Plan NLBs
-///   in ap-southeast-1) close idle keep-alive connections aggressively; reusing
-///   such a half-closed socket produces "error sending request" / TCP RST
-///   mid-write. 15s is short enough to stay ahead of most NLB idle timeouts
-///   (typically 60s) while still allowing connection reuse for rapid
-///   successive requests.
-///
-/// **HTTP/2 keep-alive (only takes effect when ALPN negotiates h2)**
-/// - `http2_keep_alive_interval(10s)`: PING frames detect dead peers
-///   proactively and prevent NAT/firewall idle-timeout from silently dropping
-///   the multiplexed connection. 10s is well within any NLB idle timeout and
-///   shorter than `pool_idle_timeout` so stale h2 connections are torn down
-///   before reuse. PING frames count as data transfer for L4 NLB idle
-///   timeouts, keeping the connection alive.
-/// - `http2_keep_alive_while_idle(true)`: keep PINGing even with no active streams
-/// - `http2_keep_alive_timeout(10s)`: drop conn if PING unACKed within 10s
-///
-/// **Design principle**: keepalive intervals (10s) < pool_idle_timeout (15s) <
-/// NLB idle timeout (typically 60s). This ensures stale connections are
-/// probed and removed before they can be reused, regardless of whether the
-/// connection is HTTP/2 (PING-based detection) or HTTP/1.1 (TCP keepalive
-/// probe-based detection).
-static HTTP_CLIENT: LazyLock<ArcSwap<reqwest::Client>> =
-    LazyLock::new(|| ArcSwap::from_pointee(build_http_client()));
+pub(crate) use crate::http::http_client;
+pub use crate::http::set_user_agent;
 
-fn build_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(20))
-        .tcp_keepalive(Duration::from_secs(10))
-        .tcp_keepalive_interval(Duration::from_secs(5))
-        .tcp_nodelay(true)
-        .pool_idle_timeout(Duration::from_secs(15))
-        .http2_keep_alive_interval(Duration::from_secs(10))
-        .http2_keep_alive_while_idle(true)
-        .http2_keep_alive_timeout(Duration::from_secs(10))
-        .build()
-        .expect("failed to build HTTP client")
+/// Resolve request credentials before accessing any process-wide credentials.
+pub(super) fn resolve_api_key(
+	provider: &dyn crate::llm::traits::AiProvider,
+	params: &crate::llm::types::ChatCompletionParams,
+) -> anyhow::Result<String> {
+	match &params.api_key {
+		Some(key) => Ok(key.as_str().to_owned()),
+		None => provider.get_api_key(),
+	}
 }
 
-/// Returns a cloned handle to the process-wide shared HTTP client.
-///
-/// `reqwest::Client` is internally `Arc`-based, so cloning is cheap and
-/// always points to the current client (even after `refresh_http_client()`
-/// swaps the global).
-pub(super) fn http_client() -> reqwest::Client {
-    // load_full() clones the Arc (cheap atomic increment),
-    // then dereference and clone the Client (cheap — Client is Arc internally)
-    (*HTTP_CLIENT.load_full()).clone()
+pub(super) fn reject_api_key(provider: &str, params: &crate::llm::types::ChatCompletionParams) -> anyhow::Result<()> {
+	if params.api_key.is_some() {
+		return Err(crate::errors::ProviderError::UnsupportedOperation {
+			provider: provider.to_owned(),
+			operation: "per-call API key authentication".to_owned(),
+		}
+		.into());
+	}
+	Ok(())
 }
 
-/// Atomically replace the shared HTTP client with a fresh instance.
-///
-/// Call this when a connection error is detected (DNS failure, TCP reset,
-/// TLS handshake failure, network unreachable). The new client gets a fresh
-/// connection pool, so subsequent requests — including retry attempts —
-/// won't reuse stale/broken connections from the old pool.
-///
-/// The old client is dropped once all outstanding references to it are gone,
-/// which closes its idle connections.
-pub(crate) fn refresh_http_client() {
-    let fresh = build_http_client();
-    HTTP_CLIENT.store(std::sync::Arc::new(fresh));
-    tracing::debug!("HTTP client refreshed with new connection pool");
+pub(super) fn sensitive_header(value: &str) -> anyhow::Result<reqwest::header::HeaderValue> {
+	let mut header = reqwest::header::HeaderValue::from_str(value)?;
+	header.set_sensitive(true);
+	Ok(header)
 }
 
-/// Returns true if the error is a connection-level failure that indicates
-/// the HTTP client's connection pool may contain stale/broken connections.
-///
-/// Such errors include: DNS resolution failure, TCP connection refused/reset,
-/// TLS handshake failure, network unreachable, and similar transport errors.
-///
-/// Also catches `is_request()` errors: a stale pooled connection that gets
-/// TCP-reset mid-request (e.g. server closed idle connection, NAT timeout)
-/// produces `is_request()=true, is_connect()=false`. Without this, the pool
-/// is never refreshed and all retries reuse the same broken connection.
-///
-/// Also catches `is_body()` errors: the connection is killed AFTER response
-/// headers arrive but WHILE the body is streaming. This is the classic
-/// mid-stream RST — DPI inspecting the payload, an overloaded upstream or LB
-/// dropping a slow response, or a NAT/firewall resetting a long generation.
-/// Without this, a body-read failure is neither retried nor pool-refreshed.
-///
-/// Callers should call `refresh_http_client()` before retrying.
-pub(crate) fn is_connection_error(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<reqwest::Error>()
-        .is_some_and(|e| e.is_connect() || e.is_request() || e.is_body())
+pub(crate) fn redact_text(text: &str, api_key: Option<&crate::llm::types::PerCallApiKey>) -> String {
+	match api_key.filter(|key| !key.as_str().is_empty()) {
+		Some(key) => text.replace(key.as_str(), "[redacted]"),
+		None => text.to_owned(),
+	}
 }
 
-/// A fully-buffered HTTP response: status, headers, and body read to completion.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct RedactedError {
+	message: String,
+	transport_error: Option<TransportErrorKind>,
+	terminal_stream_error: bool,
+}
+
+pub(crate) fn redact_error(error: anyhow::Error, api_key: Option<&crate::llm::types::PerCallApiKey>) -> anyhow::Error {
+	let Some(key) = api_key.filter(|key| !key.as_str().is_empty()) else {
+		return error;
+	};
+	let message = format!("{error:#}");
+	if !message.contains(key.as_str()) {
+		return error;
+	}
+	// A retryable status keeps its type: the retry loop reads its status and
+	// `Retry-After`, and it has no source chain to leak through.
+	if let Some(status) = error.downcast_ref::<crate::llm::retry::RetryableStatusError>() {
+		return status.with_message(redact_text(&message, Some(key))).into();
+	}
+	// Retaining the original source would expose the credential through error chains.
+	RedactedError {
+		message: redact_text(&message, Some(key)),
+		transport_error: transport_error_kind(&error),
+		terminal_stream_error: is_terminal_stream_error(&error),
+	}
+	.into()
+}
+
+pub(crate) fn is_terminal_stream_error(error: &anyhow::Error) -> bool {
+	error.is::<super::streaming::TerminalStreamError>()
+		|| error
+			.downcast_ref::<RedactedError>()
+			.is_some_and(|error| error.terminal_stream_error)
+}
+
+pub(super) fn parse_response<T: serde::de::DeserializeOwned>(
+	body: &str,
+	api_key: Option<&crate::llm::types::PerCallApiKey>,
+) -> anyhow::Result<T> {
+	serde_json::from_str(body).map_err(|error| redact_error(error.into(), api_key))
+}
+
+/// Chat Completions tool content is text-only. Deliver images as attributed user
+/// turns after the entire tool-result batch, never between a call and its results.
+pub(super) fn chat_completion_messages(
+	messages: &[crate::llm::types::Message],
+) -> std::borrow::Cow<'_, [crate::llm::types::Message]> {
+	use crate::llm::types::Message;
+	use std::borrow::Cow;
+	if !messages
+		.iter()
+		.any(|message| message.role == "tool" && message.images.as_ref().is_some_and(|images| !images.is_empty()))
+	{
+		return Cow::Borrowed(messages);
+	}
+	let mut result = Vec::with_capacity(messages.len());
+	let mut image_turns = Vec::new();
+	for message in messages {
+		if message.role != "tool" {
+			result.append(&mut image_turns);
+		}
+		let mut message = message.clone();
+		if message.role == "tool" && message.images.as_ref().is_some_and(|images| !images.is_empty()) {
+			let mut image_turn = Message::user(&format!(
+				"Images returned by tool {} (tool_call_id: {}):",
+				message.name.as_deref().unwrap_or_default(),
+				message.tool_call_id.as_deref().unwrap_or_default(),
+			));
+			image_turn.timestamp = message.timestamp;
+			image_turn.images = message.images.take();
+			image_turns.push(image_turn);
+		}
+		result.push(message);
+	}
+	result.append(&mut image_turns);
+	Cow::Owned(result)
+}
+
+/// Anthropic-compatible tool results accept text or nested image content blocks.
+pub(super) fn anthropic_tool_content(message: &crate::llm::types::Message) -> serde_json::Value {
+	use crate::llm::types::ImageData;
+	let images = message.images.as_deref().unwrap_or_default();
+	if images.is_empty() {
+		return serde_json::json!(message.content);
+	}
+	let mut blocks = Vec::new();
+	if !message.content.trim().is_empty() {
+		blocks.push(serde_json::json!({"type": "text", "text": message.content}));
+	}
+	for image in images {
+		let source = match &image.data {
+			ImageData::Base64(data) => serde_json::json!({
+				"type": "base64", "media_type": image.media_type, "data": data,
+			}),
+			ImageData::Url(url) => serde_json::json!({"type": "url", "url": url}),
+		};
+		blocks.push(serde_json::json!({"type": "image", "source": source}));
+	}
+	serde_json::Value::Array(blocks)
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TransportErrorKind {
+	Timeout,
+	Connect,
+	Request,
+	Body,
+	Decode,
+}
+
+impl TransportErrorKind {
+	pub(crate) fn reason(self) -> &'static str {
+		match self {
+			Self::Timeout => "request timed out",
+			Self::Connect => "connection establishment failed",
+			Self::Request => "request transport failed",
+			Self::Body => "body transport failed",
+			Self::Decode => "response decoding failed",
+		}
+	}
+}
+
+pub(crate) fn transport_error_kind(error: &anyhow::Error) -> Option<TransportErrorKind> {
+	#[cfg(feature = "websockets")]
+	if matches!(
+		error.downcast_ref::<super::websocket_transport::ConnectionError>(),
+		Some(
+			super::websocket_transport::ConnectionError::HeartbeatTimeout
+				| super::websocket_transport::ConnectionError::WriteTimeout
+		)
+	) {
+		return Some(TransportErrorKind::Timeout);
+	}
+
+	if error.is::<super::streaming::StreamTimeout>() {
+		return Some(TransportErrorKind::Timeout);
+	}
+	if error.is::<super::streaming::IncompleteStream>() {
+		return Some(TransportErrorKind::Body);
+	}
+	if let Some(error) = error.downcast_ref::<RedactedError>() {
+		return error.transport_error;
+	}
+	if matches!(
+		error.downcast_ref::<crate::errors::ProviderError>(),
+		Some(crate::errors::ProviderError::TimeoutError { .. })
+	) {
+		return Some(TransportErrorKind::Timeout);
+	}
+	let error = error.chain().find_map(|cause| cause.downcast_ref::<reqwest::Error>())?;
+	if error.is_timeout() {
+		Some(TransportErrorKind::Timeout)
+	} else if error.is_connect() {
+		Some(TransportErrorKind::Connect)
+	} else if error.is_request() {
+		Some(TransportErrorKind::Request)
+	} else if error.is_body() {
+		Some(TransportErrorKind::Body)
+	} else if error.is_decode() {
+		Some(TransportErrorKind::Decode)
+	} else {
+		None
+	}
+}
+
+/// A complete HTTP response: status, headers, and a buffered or accumulated body.
 ///
-/// Produced by [`send_and_read`], which reads the body INSIDE the retried unit
+/// Produced by [`send_and_read`] or the SSE reader, which consume the body INSIDE the retried unit
 /// so that a mid-stream connection reset surfaces as a retryable error instead
 /// of escaping the retry loop. Callers inspect `status`/`headers` and parse
 /// `body` without any further `.await` on the (already consumed) connection.
-pub(super) struct CapturedResponse {
-    pub status: reqwest::StatusCode,
-    pub headers: reqwest::header::HeaderMap,
-    pub body: String,
+pub(crate) struct CapturedResponse {
+	pub status: reqwest::StatusCode,
+	pub headers: reqwest::header::HeaderMap,
+	pub body: String,
 }
 
 /// Fold caller-supplied extra headers into a request builder, LAST, with
@@ -158,27 +242,27 @@ pub(super) struct CapturedResponse {
 /// Invalid header names/values are skipped with a warning — a malformed extra
 /// header must not fail the request it was riding on.
 pub(super) fn apply_extra_headers(
-    request: reqwest::RequestBuilder,
-    extra: Option<&std::collections::HashMap<String, String>>,
+	request: reqwest::RequestBuilder,
+	extra: Option<&std::collections::HashMap<String, String>>,
 ) -> reqwest::RequestBuilder {
-    let Some(map) = extra.filter(|m| !m.is_empty()) else {
-        return request;
-    };
-    let mut headers = reqwest::header::HeaderMap::new();
-    for (name, value) in map {
-        match (
-            name.parse::<reqwest::header::HeaderName>(),
-            value.parse::<reqwest::header::HeaderValue>(),
-        ) {
-            (Ok(n), Ok(v)) => {
-                headers.insert(n, v);
-            }
-            _ => {
-                tracing::warn!(header = %name, "skipping invalid extra header");
-            }
-        }
-    }
-    request.headers(headers)
+	let Some(map) = extra.filter(|m| !m.is_empty()) else {
+		return request;
+	};
+	let mut headers = reqwest::header::HeaderMap::new();
+	for (name, value) in map {
+		match (
+			name.parse::<reqwest::header::HeaderName>(),
+			value.parse::<reqwest::header::HeaderValue>(),
+		) {
+			(Ok(n), Ok(v)) => {
+				headers.insert(n, v);
+			}
+			_ => {
+				tracing::warn!(header = %name, "skipping invalid extra header");
+			}
+		}
+	}
+	request.headers(headers)
 }
 
 /// Send a request and read its entire body, all within one awaited unit.
@@ -186,34 +270,30 @@ pub(super) fn apply_extra_headers(
 /// Both the `send()` (connect/headers) and the body read happen here, so any
 /// transport failure — including a mid-body RST that only manifests during
 /// `text()` — is returned as an `Err` to the surrounding retry loop, where
-/// `is_connection_error` classifies it and `refresh_http_client` runs before
-/// the next attempt. Status and headers are cloned before the body is consumed.
+/// transport errors are classified before the next attempt. Reqwest manages
+/// failed connections. Status and headers are cloned before consuming the body.
 ///
 /// `extra_headers` ([`ChatCompletionParams::extra_headers`]) are folded in here
-/// — the one choke point every provider's chat path goes through — so the
-/// upsert semantics hold uniformly no matter which provider built the request.
+/// through [`apply_extra_headers`], also used by the SSE reader, so the upsert
+/// semantics hold uniformly no matter which provider built the request.
 ///
 /// [`ChatCompletionParams::extra_headers`]: crate::llm::types::ChatCompletionParams
 pub(super) async fn send_and_read(
-    request: reqwest::RequestBuilder,
-    timeout: Option<Duration>,
-    extra_headers: Option<&std::collections::HashMap<String, String>>,
+	request: reqwest::RequestBuilder,
+	timeout: Option<Duration>,
+	extra_headers: Option<&std::collections::HashMap<String, String>>,
 ) -> anyhow::Result<CapturedResponse> {
-    let request = apply_extra_headers(request, extra_headers);
-    let response = apply_request_timeout(request, timeout)
-        .send()
-        .await
-        .map_err(anyhow::Error::from)?;
+	let request = apply_extra_headers(request, extra_headers);
+	let response = apply_request_timeout(request, timeout)
+		.send()
+		.await
+		.map_err(anyhow::Error::from)?;
 
-    let status = response.status();
-    let headers = response.headers().clone();
-    let body = response.text().await.map_err(anyhow::Error::from)?;
+	let status = response.status();
+	let headers = response.headers().clone();
+	let body = response.text().await.map_err(anyhow::Error::from)?;
 
-    Ok(CapturedResponse {
-        status,
-        headers,
-        body,
-    })
+	Ok(CapturedResponse { status, headers, body })
 }
 
 /// Apply an optional per-request timeout to a RequestBuilder.
@@ -222,148 +302,143 @@ pub(super) async fn send_and_read(
 /// `Some(d)` sets a hard timeout on the whole HTTP request; exceeding it aborts with
 /// a reqwest timeout error that surfaces as a retryable failure.
 pub(super) fn apply_request_timeout(
-    req: reqwest::RequestBuilder,
-    timeout: Option<Duration>,
+	req: reqwest::RequestBuilder,
+	timeout: Option<Duration>,
 ) -> reqwest::RequestBuilder {
-    match timeout {
-        Some(d) => req.timeout(d),
-        None => req,
-    }
+	match timeout {
+		Some(d) => req.timeout(d),
+		None => req,
+	}
 }
 
 const MAX_JSON_INPUT_BYTES: usize = 1_000_000;
 
 /// Standard cache marker used by providers that support ephemeral prompt caching.
 pub(super) fn ephemeral_cache_control() -> serde_json::Value {
-    serde_json::json!({ "type": "ephemeral" })
+	serde_json::json!({ "type": "ephemeral" })
 }
 
 /// Return ephemeral cache control with optional TTL override.
 /// When `ttl` is Some (e.g. "1h"), includes it in the cache_control block.
 /// Only Anthropic supports TTL — other providers ignore the field.
 pub(super) fn ephemeral_cache_control_with_ttl(ttl: Option<&str>) -> serde_json::Value {
-    match ttl {
-        Some(t) => serde_json::json!({ "type": "ephemeral", "ttl": t }),
-        None => serde_json::json!({ "type": "ephemeral" }),
-    }
+	match ttl {
+		Some(t) => serde_json::json!({ "type": "ephemeral", "ttl": t }),
+		None => serde_json::json!({ "type": "ephemeral" }),
+	}
 }
 
 /// Return ephemeral cache control metadata when a message is marked cached.
 pub(super) fn maybe_ephemeral_cache_control(cached: bool) -> Option<serde_json::Value> {
-    cached.then(ephemeral_cache_control)
+	cached.then(ephemeral_cache_control)
 }
 
 /// Return cache control with optional TTL when message is cached.
-pub(super) fn maybe_cache_control_with_ttl(
-    cached: bool,
-    ttl: Option<&str>,
-) -> Option<serde_json::Value> {
-    if cached {
-        Some(ephemeral_cache_control_with_ttl(ttl))
-    } else {
-        None
-    }
+pub(super) fn maybe_cache_control_with_ttl(cached: bool, ttl: Option<&str>) -> Option<serde_json::Value> {
+	if cached {
+		Some(ephemeral_cache_control_with_ttl(ttl))
+	} else {
+		None
+	}
 }
 
 /// Parse stored tool calls in our unified history format.
 /// Returns empty vec on parse failures to preserve legacy lossy behavior.
 pub(super) fn parse_generic_tool_calls_lossy(
-    tool_calls: Option<&serde_json::Value>,
-    provider: &str,
+	tool_calls: Option<&serde_json::Value>,
+	provider: &str,
 ) -> Vec<GenericToolCall> {
-    let Some(tool_calls) = tool_calls else {
-        return Vec::new();
-    };
+	let Some(tool_calls) = tool_calls else {
+		return Vec::new();
+	};
 
-    match serde_json::from_value::<Vec<GenericToolCall>>(tool_calls.clone()) {
-        Ok(calls) => calls,
-        Err(err) => {
-            tracing::warn!(
-                provider = provider,
-                error = %err,
-                "Failed to parse GenericToolCall list; dropping malformed tool_calls"
-            );
-            Vec::new()
-        }
-    }
+	match serde_json::from_value::<Vec<GenericToolCall>>(tool_calls.clone()) {
+		Ok(calls) => calls,
+		Err(err) => {
+			tracing::warn!(
+				provider = provider,
+				error = %err,
+				"Failed to parse GenericToolCall list; dropping malformed tool_calls"
+			);
+			Vec::new()
+		}
+	}
 }
 
 /// Parse stored tool calls in our unified history format with strict validation.
 pub(super) fn parse_generic_tool_calls_strict(
-    tool_calls: &serde_json::Value,
-    provider: &str,
+	tool_calls: &serde_json::Value,
+	provider: &str,
 ) -> Result<Vec<GenericToolCall>, ToolCallError> {
-    serde_json::from_value::<Vec<GenericToolCall>>(tool_calls.clone()).map_err(|_| {
-        ToolCallError::InvalidFormat {
-            provider: provider.to_string(),
-            reason: "tool_calls must be Vec<GenericToolCall>".to_string(),
-        }
-    })
+	serde_json::from_value::<Vec<GenericToolCall>>(tool_calls.clone()).map_err(|_| ToolCallError::InvalidFormat {
+		provider: provider.to_string(),
+		reason: "tool_calls must be Vec<GenericToolCall>".to_string(),
+	})
 }
 
 /// Convert runtime tool calls into unified history format with shared meta.
 pub(super) fn to_generic_tool_calls_with_meta(
-    calls: &[ToolCall],
-    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+	calls: &[ToolCall],
+	meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Vec<GenericToolCall> {
-    let meta = meta.cloned();
-    calls
-        .iter()
-        .map(|call| GenericToolCall {
-            id: call.id.clone(),
-            name: call.name.clone(),
-            arguments: call.arguments.clone(),
-            meta: meta.clone(),
-        })
-        .collect()
+	let meta = meta.cloned();
+	calls
+		.iter()
+		.map(|call| GenericToolCall {
+			id: call.id.clone(),
+			name: call.name.clone(),
+			arguments: call.arguments.clone(),
+			meta: meta.clone(),
+		})
+		.collect()
 }
 
 /// Persist tool calls into provider exchange response JSON in unified format.
 pub(super) fn set_response_tool_calls(
-    response_json: &mut serde_json::Value,
-    calls: &[ToolCall],
-    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+	response_json: &mut serde_json::Value,
+	calls: &[ToolCall],
+	meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) {
-    if calls.is_empty() {
-        return;
-    }
+	if calls.is_empty() {
+		return;
+	}
 
-    let generic_calls = to_generic_tool_calls_with_meta(calls, meta);
-    match serde_json::to_value(&generic_calls) {
-        Ok(value) => response_json["tool_calls"] = value,
-        Err(err) => tracing::warn!(error = %err, "Failed to serialize tool_calls for response"),
-    }
+	let generic_calls = to_generic_tool_calls_with_meta(calls, meta);
+	match serde_json::to_value(&generic_calls) {
+		Ok(value) => response_json["tool_calls"] = value,
+		Err(err) => tracing::warn!(error = %err, "Failed to serialize tool_calls for response"),
+	}
 }
 
 /// Serialize JSON arguments to function-call argument strings.
 pub(super) fn arguments_to_json_string(arguments: &serde_json::Value) -> String {
-    match serde_json::to_string(arguments) {
-        Ok(v) => v,
-        Err(err) => {
-            tracing::warn!(error = %err, "Failed to serialize tool-call arguments");
-            String::new()
-        }
-    }
+	match serde_json::to_string(arguments) {
+		Ok(v) => v,
+		Err(err) => {
+			tracing::warn!(error = %err, "Failed to serialize tool-call arguments");
+			String::new()
+		}
+	}
 }
 
 /// Parse function-call arguments from provider responses.
 /// Falls back to preserving the raw argument string to avoid silent data loss.
 pub(super) fn parse_tool_call_arguments_lossy(raw_arguments: &str) -> serde_json::Value {
-    if raw_arguments.len() > MAX_JSON_INPUT_BYTES {
-        tracing::warn!(
-            length = raw_arguments.len(),
-            "Tool-call arguments exceed size limit; preserving as raw string"
-        );
-        return serde_json::json!({ "raw_arguments": raw_arguments });
-    }
+	if raw_arguments.len() > MAX_JSON_INPUT_BYTES {
+		tracing::warn!(
+			length = raw_arguments.len(),
+			"Tool-call arguments exceed size limit; preserving as raw string"
+		);
+		return serde_json::json!({ "raw_arguments": raw_arguments });
+	}
 
-    match serde_json::from_str(raw_arguments) {
-        Ok(v) => v,
-        Err(err) => {
-            tracing::warn!(error = %err, "Failed to parse tool-call arguments JSON");
-            serde_json::json!({ "raw_arguments": raw_arguments })
-        }
-    }
+	match serde_json::from_str(raw_arguments) {
+		Ok(v) => v,
+		Err(err) => {
+			tracing::warn!(error = %err, "Failed to parse tool-call arguments JSON");
+			serde_json::json!({ "raw_arguments": raw_arguments })
+		}
+	}
 }
 
 /// Parse structured output directly from textual model content.
@@ -371,135 +446,84 @@ pub(super) fn parse_tool_call_arguments_lossy(raw_arguments: &str) -> serde_json
 /// `pub(crate)` (rather than `pub(super)`): also reused by
 /// `llm::schema_enforcement`'s best-effort fallback candidate extraction.
 pub(crate) fn parse_structured_output_from_text(content: &str) -> Option<serde_json::Value> {
-    let trimmed = content.trim();
-    if trimmed.len() > MAX_JSON_INPUT_BYTES {
-        tracing::warn!(
-            length = trimmed.len(),
-            "Structured output candidate exceeds size limit; skipping JSON parse"
-        );
-        return None;
-    }
+	let trimmed = content.trim();
+	if trimmed.len() > MAX_JSON_INPUT_BYTES {
+		tracing::warn!(
+			length = trimmed.len(),
+			"Structured output candidate exceeds size limit; skipping JSON parse"
+		);
+		return None;
+	}
 
-    if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        match serde_json::from_str(trimmed) {
-            Ok(value) => Some(value),
-            Err(err) => {
-                tracing::debug!(error = %err, "Failed to parse structured output JSON");
-                None
-            }
-        }
-    } else {
-        None
-    }
+	let candidate = if let Some(fenced) = trimmed.strip_prefix("```") {
+		let newline = fenced.find('\n')?;
+		let language = fenced[..newline].trim();
+		if !language.is_empty() && !language.eq_ignore_ascii_case("json") {
+			return None;
+		}
+		fenced[newline + 1..].strip_suffix("```")?.trim()
+	} else {
+		trimmed
+	};
+
+	if candidate.starts_with('{') || candidate.starts_with('[') {
+		match serde_json::from_str(candidate) {
+			Ok(value) => Some(value),
+			Err(err) => {
+				tracing::debug!(error = %err, "Failed to parse structured output JSON");
+				None
+			}
+		}
+	} else {
+		None
+	}
+}
+
+/// `(host, model substring)` pairs whose thinking cannot be switched off.
+///
+/// GLM-5.3: Model Studio rejects `enable_thinking=false` ("restricted to
+/// True") and `reasoning_effort="none"`, and Z.AI's `thinking: disabled`
+/// still reasons (verified live, Sep 2026). Ollama Cloud lists no `false`
+/// level for it and runs an omitted effort at its `max` default (`/api/show`,
+/// Oct 2026); NVIDIA NIM documents `low|high|max` with default `max`
+/// (z-ai-glm-5-3 reference, Oct 2026); models.dev lists the same levels with
+/// no off toggle on OpenCode Zen/Go and Fireworks (Oct 2026).
+///
+/// Model Studio (deep-thinking and Kimi pages, Oct 2026): kimi-k3 and
+/// qwen3.8-2.4t-a95b are thinking-only. Fireworks' qwen3p8-2p4t-a95b lists
+/// `low|medium|xhigh` with no off toggle (models.dev, Oct 2026).
+const ALWAYS_THINKS: &[(&str, &str)] = &[
+	("alibaba", "glm-5.3"),
+	("alibaba", "kimi-k3"),
+	("alibaba", "qwen3.8-2.4t-a95b"),
+	("zai", "glm-5.3"),
+	("ollama", "glm-5.3"),
+	("nvidia", "glm-5.3"),
+	("opencode-zen", "glm-5.3"),
+	("opencode-go", "glm-5.3"),
+	("fireworks", "glm-5p3"),
+	("fireworks", "qwen3p8-2p4t"),
+	("reflection", "beam"),
+];
+
+/// The effort `provider_name` can run `model` at. On a model in
+/// [`ALWAYS_THINKS`] a request for no reasoning runs at the lowest level
+/// instead.
+pub(super) fn supported_reasoning_effort(provider_name: &str, model: &str, effort: ReasoningEffort) -> ReasoningEffort {
+	let always_thinks = ALWAYS_THINKS.iter().any(|(host, pattern)| {
+		provider_name.eq_ignore_ascii_case(host) && crate::llm::utils::contains_ignore_ascii_case(model, pattern)
+	});
+	if always_thinks && effort == ReasoningEffort::None {
+		ReasoningEffort::Low
+	} else {
+		effort
+	}
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "shared_tests.rs"]
+pub(super) mod tests;
 
-    #[test]
-    fn test_maybe_ephemeral_cache_control() {
-        assert!(maybe_ephemeral_cache_control(false).is_none());
-        assert_eq!(
-            maybe_ephemeral_cache_control(true),
-            Some(serde_json::json!({"type": "ephemeral"}))
-        );
-    }
-
-    #[test]
-    fn test_parse_generic_tool_calls_lossy() {
-        let calls = serde_json::json!([{
-            "id": "call_1",
-            "name": "lookup",
-            "arguments": { "q": "rust" },
-            "meta": null
-        }]);
-        assert_eq!(
-            parse_generic_tool_calls_lossy(Some(&calls), "test").len(),
-            1
-        );
-        assert!(
-            parse_generic_tool_calls_lossy(Some(&serde_json::json!({"bad": true})), "test")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn test_parse_generic_tool_calls_strict() {
-        let calls = serde_json::json!([{
-            "id": "call_1",
-            "name": "lookup",
-            "arguments": { "q": "rust" },
-            "meta": null
-        }]);
-        assert!(parse_generic_tool_calls_strict(&calls, "test").is_ok());
-        assert!(
-            parse_generic_tool_calls_strict(&serde_json::json!({"bad": true}), "test").is_err()
-        );
-    }
-
-    #[test]
-    fn test_set_response_tool_calls() {
-        let calls = vec![ToolCall {
-            id: "call_1".to_string(),
-            name: "lookup".to_string(),
-            arguments: serde_json::json!({"q": "rust"}),
-        }];
-        let mut response = serde_json::json!({});
-        set_response_tool_calls(&mut response, &calls, None);
-        assert!(response.get("tool_calls").is_some());
-    }
-
-    #[test]
-    fn test_parse_structured_output_from_text() {
-        assert!(parse_structured_output_from_text("{\"x\":1}").is_some());
-        assert!(parse_structured_output_from_text("[1,2]").is_some());
-        assert!(parse_structured_output_from_text("not json").is_none());
-        assert!(parse_structured_output_from_text("{not-json").is_none());
-    }
-
-    #[test]
-    fn test_apply_extra_headers_upserts_and_preserves() {
-        let mut extra = std::collections::HashMap::new();
-        extra.insert("X-Model-Purpose".to_string(), "compression".to_string());
-        extra.insert("Authorization".to_string(), "Bearer override".to_string());
-        extra.insert("bad name!".to_string(), "ignored".to_string());
-
-        let builder = http_client()
-            .post("http://localhost/never-sent")
-            .header("Authorization", "Bearer original")
-            .header("Content-Type", "application/json");
-        let req = apply_extra_headers(builder, Some(&extra)).build().unwrap();
-
-        // Override wins, without duplicating the header.
-        let auth: Vec<_> = req.headers().get_all("Authorization").iter().collect();
-        assert_eq!(auth.len(), 1);
-        assert_eq!(auth[0], "Bearer override");
-        // New name lands; provider-set names not in the map survive.
-        assert_eq!(req.headers()["X-Model-Purpose"], "compression");
-        assert_eq!(req.headers()["Content-Type"], "application/json");
-        // Invalid names are skipped, not fatal.
-        assert!(req.headers().get("bad name!").is_none());
-
-        // None / empty map are no-ops.
-        let untouched = apply_extra_headers(
-            http_client().post("http://localhost/x").header("A", "1"),
-            None,
-        )
-        .build()
-        .unwrap();
-        assert_eq!(untouched.headers()["A"], "1");
-    }
-
-    #[test]
-    fn test_parse_tool_call_arguments_lossy() {
-        assert_eq!(
-            parse_tool_call_arguments_lossy("{\"a\":1}"),
-            serde_json::json!({"a": 1})
-        );
-        assert_eq!(
-            parse_tool_call_arguments_lossy("{invalid"),
-            serde_json::json!({"raw_arguments": "{invalid"})
-        );
-    }
-}
+#[cfg(test)]
+#[path = "shared_transport_tests.rs"]
+mod transport_tests;

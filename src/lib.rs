@@ -24,19 +24,33 @@
 //! - **Structured output**: JSON and JSON Schema support for OpenAI, xAI, OpenRouter, DeepSeek, and Z.ai
 //! - **Cost tracking**: Automatic token usage and cost calculation
 //! - **Vision support**: Image attachment support for compatible models
+//! - **Media generation**: Images, asynchronous video, speech, and transcription through ElevenLabs, fal, Higgsfield, OpenRouter, Replicate, and Runway, with unit-aware reference pricing
 //! - **Caching support**: Automatic detection of caching-capable models
 //! - **Retry logic**: Exponential backoff with smart rate limit handling
 //! - **Embeddings**: Multi-provider embedding support (Jina, Voyage, Google, OpenAI, FastEmbed, HuggingFace)
 //! - **Reranking**: Document relevance scoring with cross-encoder models (Voyage AI)
+//! - **Hindsight**: Local, calibrated next-turn-correction verifier for coding-agent traces (ONNX, CPU)
 //! - **Configuration migration**: Comment-preserving TOML upgrades with locking, backups, and atomic writes
 //! - **Self-sufficient**: No external dependencies on application-specific types
 //! - **CLI provider**: `cli:<backend>/<model>` proxies CLIs; tool calling/MCP is not used or controllable (prompt-only)
+//!
+//! ## Cargo features
+//!
+//! Capability modules are enabled by default; the `websockets` transport
+//! is opt-in. Turn defaults off to compile only
+//! what you use: `llm`, `embeddings`, `reranker`, and `media` — each gates the
+//! module of the same name. The local embedding backends `fastembed` and
+//! `huggingface` both imply `embeddings`; `hindsight` implies `onnx`. The
+//! `errors`, `storage` and `utils` modules and `set_user_agent` are always
+//! compiled.
 //!
 //! ## Usage
 //!
 //! ### Basic Chat Completion
 //!
 //! ```rust,no_run
+//! # #[cfg(feature = "llm")]
+//! # mod chat {
 //! use octolib::llm::{ProviderFactory, ChatCompletionParams, Message};
 //!
 //! // This example shows basic usage but requires API keys to run
@@ -50,7 +64,7 @@
 //!     ];
 //!
 //!     // Create completion parameters
-//!     let params = ChatCompletionParams::new(&messages, &model, 0.7, 1.0, 50, 1000);
+//!     let params = ChatCompletionParams::new(&messages, &model, 1000);
 //!
 //!     // Get completion (requires OPENAI_API_KEY environment variable)
 //!     let response = provider.chat_completion(params).await?;
@@ -58,11 +72,34 @@
 //!
 //!     Ok(())
 //! }
+//! # }
+//! ```
+
+//! ## Media generation
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "media")]
+//! # mod media {
+//! use octolib::{generate_image, ImageGenerationRequest};
+//!
+//! # async fn example() -> octolib::MediaResult<()> {
+//! let request = ImageGenerationRequest::new("A red panda astronaut");
+//! let result = generate_image(
+//!     "openrouter:openai/gpt-image-1",
+//!     request,
+//! ).await?;
+//! let cost = result.usage.as_ref().and_then(|usage| usage.best_available_cost());
+//! # let _ = cost;
+//! # Ok(())
+//! # }
+//! # }
 //! ```
 //!
 //! ### Structured Output
 //!
 //! ```rust,no_run
+//! # #[cfg(feature = "llm")]
+//! # mod structured {
 //! use octolib::llm::{ProviderFactory, ChatCompletionParams, Message, StructuredOutputRequest};
 //! use serde::{Deserialize, Serialize};
 //!
@@ -75,7 +112,7 @@
 //!
 //! async fn structured_example() -> anyhow::Result<()> {
 //!     // Works with OpenAI, OpenRouter, and DeepSeek
-//!     let (provider, model) = ProviderFactory::get_provider_for_model("deepseek:deepseek-v4-flash")?;
+//!     let (provider, model) = ProviderFactory::get_provider_for_model("deepseek:deepseek-flash")?;
 //!
 //!     // Check if provider supports structured output
 //!     if !provider.supports_structured_output(&model) {
@@ -88,7 +125,7 @@
 //!
 //!     // Request structured JSON output
 //!     let structured_request = StructuredOutputRequest::json();
-//!     let params = ChatCompletionParams::new(&messages, &model, 0.7, 1.0, 50, 1000)
+//!     let params = ChatCompletionParams::new(&messages, &model, 1000)
 //!         .with_structured_output(structured_request);
 //!
 //!     let response = provider.chat_completion(params).await?;
@@ -100,39 +137,85 @@
 //!
 //!     Ok(())
 //! }
+//! # }
 //! ```
 
+#[cfg(feature = "embeddings")]
 pub mod embedding;
 pub mod errors;
+#[cfg(feature = "evaluation")]
+pub mod evaluation;
+#[cfg(feature = "hindsight")]
+pub mod hindsight;
+pub mod http;
+#[cfg(feature = "llm")]
 pub mod llm;
+#[cfg(feature = "media")]
+pub mod media;
+#[cfg(feature = "onnx")]
+pub(crate) mod ort_env;
+#[cfg(feature = "reranker")]
 pub mod reranker;
 pub mod storage;
+#[cfg(feature = "terminal")]
+pub mod terminal;
+#[cfg(all(test, any(feature = "llm", feature = "media", feature = "evaluation")))]
+mod test_support;
 pub mod utils;
 
+pub use http::set_user_agent;
+
 // Re-export main types and traits for easy access (backward compatibility)
+#[cfg(feature = "embeddings")]
 pub use embedding::{
-    calculate_embedding_cost, count_tokens, create_embedding_provider_from_parts,
-    generate_embeddings, generate_embeddings_batch, split_texts_into_token_limited_batches,
-    truncate_output, EmbeddingProvider, EmbeddingProviderType, InputType, LocalEmbeddingProvider,
-    OctoHubEmbeddingProvider,
+	calculate_embedding_cost, count_tokens, create_embedding_provider_from_parts, generate_embeddings,
+	generate_embeddings_batch, split_texts_into_token_limited_batches, truncate_output, EmbeddingProvider,
+	EmbeddingProviderType, InputType, LocalEmbeddingProvider, OctoHubEmbeddingProvider,
 };
 pub use errors::{
-    ConfigError, ConfigResult, MessageError, MessageResult, ProviderError, ProviderResult,
-    StructuredOutputError, StructuredOutputResult, ToolCallError, ToolCallResult,
+	ConfigError, ConfigResult, MessageError, MessageResult, ProviderError, ProviderResult, StructuredOutputError,
+	StructuredOutputResult, ToolCallError, ToolCallResult,
 };
+#[cfg(feature = "evaluation")]
+pub use evaluation::factory::EvaluationProviderSetupInfo;
+#[cfg(feature = "evaluation")]
+pub use evaluation::{
+	evaluate, Answer, BoundingBox, EvaluationError, EvaluationImageFormat, EvaluationProvider,
+	EvaluationProviderFactory, EvaluationRequest, EvaluationResponse, EvaluationResult, EvaluationUsage, ImageAsset,
+	Question,
+};
+#[cfg(feature = "llm")]
 pub use llm::{
-    chat_completion_enforced, AiProvider, AmazonBedrockProvider, AnthropicProvider, CacheConfig,
-    CacheTTL, CacheType, CerebrasProvider, ChatCompletionParams, CloudflareWorkersAiProvider,
-    DeepSeekProvider, EffectiveSamplingParams, FireworksProvider, FunctionDefinition,
-    GenericToolCall, GoogleStudioProvider, GoogleVertexProvider, ImageAttachment, ImageData,
-    LocalProvider, Message, MessageBuilder, MinimaxProvider, ModelLimits, MoonshotProvider,
-    OllamaProvider, OpenAiProvider, OpenRouterProvider, OutputFormat, ProviderExchange,
-    ProviderFactory, ProviderResponse, ProviderStrategy, ProviderToolCalls, ReasoningEffort,
-    ResponseMode, SamplingSupport, SourceType, StrategyFactory, StructuredOutputRequest,
-    ThinkingBlock, TogetherProvider, TokenUsage, ToolCall, ToolResult, VideoAttachment, VideoData,
-    XaiProvider, ZaiProvider,
+	chat_completion_enforced, AiProvider, AmazonBedrockProvider, AnthropicProvider, CacheConfig, CacheTTL, CacheType,
+	CerebrasProvider, ChatCompletionParams, ChatGptTransport, CloudflareWorkersAiProvider, DeepSeekProvider,
+	FireworksProvider, FunctionDefinition, GenericToolCall, GoogleStudioProvider, GoogleVertexProvider,
+	ImageAttachment, ImageData, LocalProvider, Message, MessageBuilder, MetaProvider, MinimaxProvider, ModelLimits,
+	MoonshotProvider, OctoHubTransport, OllamaProvider, OpenAiProvider, OpenRouterProvider, OutputFormat,
+	ProviderExchange, ProviderFactory, ProviderResponse, ProviderStrategy, ProviderToolCalls, ReasoningEffort,
+	ResponseMode, SourceType, StrategyFactory, StructuredOutputRequest, ThinkingBlock, TogetherProvider, TokenUsage,
+	ToolCall, ToolChoice, ToolResult, VideoAttachment, VideoData, WebWrightProvider, XaiProvider, ZaiProvider,
 };
+#[cfg(feature = "media")]
+pub use media::{
+	download_artifact, generate_image, generate_video, reference_cost_estimate, synthesize_speech, transcribe,
+	ArtifactSource, AudioFormat, AudioOutputSpec, CapabilitySupport, CostEstimate, Dimensions, ElevenLabsMediaOptions,
+	ElevenLabsMediaProvider, FailureCategory, FalMediaOptions, FalMediaProvider, HiggsfieldMediaOptions,
+	HiggsfieldMediaProvider, ImageCapabilities, ImageFormat, ImageGenerationMode, ImageGenerationProvider,
+	ImageGenerationRequest, ImageGenerationResult, JobHandle, MediaArtifact, MediaError, MediaKind, MediaLimits,
+	MediaModelDescriptor, MediaModelPricing, MediaProviderFactory, MediaResult, MediaSource, MediaTask, MediaUsage,
+	Modality, OpenRouterMediaOptions, OpenRouterMediaProvider, Operation, OperationStatus, OutputGeometry,
+	ParameterCapabilities, ProviderOptions, ProviderWarning, ReplicateMediaOptions, ReplicateMediaProvider,
+	RequestOptions, RunwayMediaOptions, RunwayMediaProvider, SafetyReport, SafetyStatus, SpeechCapabilities,
+	SpeechStream, SpeechSynthesisProvider, SpeechSynthesisRequest, SpeechSynthesisResult, TimestampGranularity,
+	TranscriptSegment, TranscriptWord, TranscriptionCapabilities, TranscriptionProvider, TranscriptionRequest,
+	TranscriptionResult, UnsupportedParameterPolicy, UsageLineItem, UsageUnit, VideoCapabilities, VideoFormat,
+	VideoGenerationMode, VideoGenerationProvider, VideoGenerationRequest, VideoGenerationResult, WarningCode,
+};
+#[cfg(feature = "reranker")]
 pub use reranker::{
-    create_rerank_provider_from_parts, parse_provider_model as parse_rerank_provider_model, rerank,
-    rerank_with_truncation, RerankProvider, RerankProviderType, RerankResponse, RerankResult,
+	create_rerank_provider_from_parts, parse_provider_model as parse_rerank_provider_model, rerank,
+	rerank_with_truncation, RerankProvider, RerankProviderType, RerankResponse, RerankResult,
 };
+/// The tokenizer type handed out by [`EmbeddingProvider::tokenizer`].
+#[cfg(any(feature = "huggingface", feature = "onnx"))]
+pub use tokenizers::Tokenizer;

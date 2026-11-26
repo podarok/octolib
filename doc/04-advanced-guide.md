@@ -17,12 +17,15 @@
 | NVIDIA NIM | ✅ Full Support | 100+ Hosted Models, Tools, Structured Output, Reference Pricing |
 | Together AI | ✅ Full Support | Multi-Provider Proxy, Vision, Tools, Structured Output |
 | Cerebras | ✅ Full Support | Fast Inference, Structured Output |
+| Isoquant | ✅ Supported | Models Read From Its Catalog, Vision, Tools, Structured Output, Caching, Zero Data Retention |
+| Reflection AI | ✅ Supported | Beam Reasoning Model, Tools, Structured Output, Caching |
 | OctoHub | ✅ Supported | Local AI Serving |
 | Google Vertex AI | ✅ Supported | Enterprise AI Integration |
 | Google AI Studio | ✅ Supported | Gemini API, API-Key Auth |
 | Amazon Bedrock | ✅ Supported | Cloud AI Services |
 | Cloudflare Workers AI | ✅ Supported | Edge AI Compute |
 | Local LLM | ✅ Supported | Ollama, LM Studio, LocalAI, Jan, vLLM |
+| WebWright | ✅ Supported | OpenAI-Compatible Chat, Caching |
 | CLI Proxy | ✅ Supported | Codex, Claude, Gemini, Cursor |
 
 ## 🚀 Key Features
@@ -60,7 +63,7 @@ async fn example() -> anyhow::Result<()> {
     ];
 
     // Create completion parameters
-    let params = ChatCompletionParams::new(&messages, &model, 0.7, 1.0, 50, 1000);
+    let params = ChatCompletionParams::new(&messages, &model, 1000);
 
     // Get completion (requires OPENAI_API_KEY environment variable)
     let response = provider.chat_completion(params).await?;
@@ -89,6 +92,7 @@ Each provider requires its specific API key:
 - `GOOGLE_VERTEX_CREDENTIAL_FILE` (or `GOOGLE_APPLICATION_CREDENTIALS`): Google Vertex AI credentials
 - `GOOGLE_VERTEX_PROJECT_ID`, `GOOGLE_VERTEX_LOCATION`: Optional Vertex project/location overrides (default location: `us-central1`)
 - `GOOGLE_STUDIO_API_KEY`: Google AI Studio (Gemini API) key
+- `WEBWRIGHT_API_KEY`: WebWright API key
 - `AWS_ACCESS_KEY_ID` & `AWS_SECRET_ACCESS_KEY`: Amazon Bedrock credentials
 
 ### Custom API Endpoints (Optional)
@@ -113,6 +117,7 @@ All providers support custom API URLs via environment variables. If not set, def
 | OctoHub | `OCTOHUB_API_KEY` | `OCTOHUB_API_URL` | `http://127.0.0.1:8080` |
 | Google Studio | `GOOGLE_STUDIO_API_KEY` | `GOOGLE_STUDIO_API_URL` | `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions` |
 | Google Vertex | `GOOGLE_VERTEX_CREDENTIAL_FILE` (service account) | `GOOGLE_VERTEX_API_URL` | Derived from `GOOGLE_VERTEX_PROJECT_ID`/`GOOGLE_VERTEX_LOCATION` |
+| WebWright | `WEBWRIGHT_API_KEY` | `WEBWRIGHT_API_URL` | `https://webwright.ai/v1/chat/completions` |
 
 Example usage with custom endpoints:
 
@@ -150,7 +155,7 @@ See `examples/openai_oauth.rs` and `examples/anthropic_oauth.rs` for usage examp
 
 ```rust
 // Get provider dynamically
-let (provider, model) = ProviderFactory::get_provider_for_model("anthropic:claude-3.5-sonnet")?;
+let (provider, model) = ProviderFactory::get_provider_for_model("anthropic:claude-sonnet-5-5")?;
 ```
 
 ### Tool Calling
@@ -219,7 +224,7 @@ async fn structured_output_example() -> anyhow::Result<()> {
 
     // Basic JSON output
     let structured_request = StructuredOutputRequest::json();
-    let params = ChatCompletionParams::new(&messages, &model, 0.7, 1.0, 50, 1000)
+    let params = ChatCompletionParams::new(&messages, &model, 1000)
         .with_structured_output(structured_request);
 
     let response = provider.chat_completion(params).await?;
@@ -249,7 +254,7 @@ async fn structured_output_example() -> anyhow::Result<()> {
     let structured_request = StructuredOutputRequest::json_schema(schema)
         .with_strict_mode();
 
-    let params = ChatCompletionParams::new(&messages, &model, 0.7, 1.0, 50, 1000)
+    let params = ChatCompletionParams::new(&messages, &model, 1000)
         .with_structured_output(structured_request);
 
     let response = provider.chat_completion(params).await?;

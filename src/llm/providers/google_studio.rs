@@ -27,14 +27,12 @@
 //! chat_completion() call. The list is cached for the lifetime of the process.
 
 use crate::llm::providers::google_vertex::{
-    calculate_usage_cost, fetch_available_models, gemini_max_input_tokens, gemini_sampling_support,
-    get_cached_input_limit, is_model_cached, CachedModel, PRICING,
+	calculate_usage_cost, fetch_available_models, gemini_max_input_tokens, get_cached_input_limit, is_model_cached,
+	CachedModel, PRICING,
 };
-use crate::llm::providers::openai_compat::{
-    chat_completion_with_sampling, get_api_url, OpenAiCompatConfig,
-};
+use crate::llm::providers::openai_compat::{chat_completion, get_api_url, OpenAiCompatConfig};
 use crate::llm::traits::AiProvider;
-use crate::llm::types::{ChatCompletionParams, ProviderResponse, SamplingSupport};
+use crate::llm::types::{ChatCompletionParams, ProviderResponse};
 use crate::llm::utils::{get_model_pricing, normalize_model_name};
 use anyhow::Result;
 use std::env;
@@ -45,226 +43,149 @@ use tokio::sync::OnceCell;
 pub struct GoogleStudioProvider;
 
 impl GoogleStudioProvider {
-    pub fn new() -> Self {
-        Self
-    }
+	pub fn new() -> Self {
+		Self
+	}
 }
 
-const GOOGLE_STUDIO_API_KEY_ENV: &str = "GOOGLE_STUDIO_API_KEY";
+pub(crate) const GOOGLE_STUDIO_API_KEY_ENV: &str = "GOOGLE_STUDIO_API_KEY";
 const GOOGLE_STUDIO_API_URL_ENV: &str = "GOOGLE_STUDIO_API_URL";
-const GOOGLE_STUDIO_API_URL: &str =
-    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+const GOOGLE_STUDIO_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 
 /// Process-wide cache of available models, populated on first chat_completion()
 static MODELS_CACHE: OnceCell<Vec<CachedModel>> = OnceCell::const_new();
 
+// Implicit cache lifetimes. The docs give none, only "send requests with similar
+// prefix in a short amount of time" (<https://ai.google.dev/gemini-api/docs/caching>).
+// Measured 2026-11-07 on the OpenAI-compatible endpoint: unique ~8.9k-token prompts
+// re-sent once after an idle delay, two samples per delay. gemini-4-argon,
+// gemini-3.8-flash and gemini-3.6-flash hit on every sample up to 5m (one read timeout
+// at 3m excluded); at 7m only one gemini-3.8-flash sample hit, and from 15m every sample
+// missed. gemini-3.1-pro-preview missed one sample at 1m and every sample from 5m, so it
+// has no lifetime it is known to survive.
+// Measured 2026-11-17 the same way with ~8k-token prompts: gemini-4-carbon hit on both
+// samples at 1m and missed both at 3m and 5m; gemini-4-hydrogen hit on both at 1m and 5m,
+// on one of two at 3m and 7m, and missed from 10m. Carbon's cache is too short to keep
+// alive and Hydrogen's hits depend on routing, so neither has a known lifetime.
+const MEASURED_CACHE_MODELS: &[&str] = &["gemini-4-argon", "gemini-3.8-flash", "gemini-3.6-flash"];
+const MEASURED_CACHE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 #[async_trait::async_trait]
 impl AiProvider for GoogleStudioProvider {
-    fn name(&self) -> &str {
-        "google-studio"
-    }
+	fn name(&self) -> &str {
+		"google-studio"
+	}
 
-    fn supports_model(&self, model: &str) -> bool {
-        if model.is_empty() {
-            return false;
-        }
-        // Use cached model list if available (populated on first chat_completion)
-        is_model_cached(&MODELS_CACHE, model).unwrap_or(true)
-    }
+	fn supports_model(&self, model: &str) -> bool {
+		if model.is_empty() {
+			return false;
+		}
+		// Use cached model list if available (populated on first chat_completion)
+		is_model_cached(&MODELS_CACHE, model).unwrap_or(true)
+	}
 
-    fn get_api_key(&self) -> Result<String> {
-        match env::var(GOOGLE_STUDIO_API_KEY_ENV) {
-            Ok(key) if !key.trim().is_empty() => Ok(key),
-            _ => Err(anyhow::anyhow!(
-                "Google AI Studio API key not found in environment variable: {}. \
+	fn get_api_key(&self) -> Result<String> {
+		match env::var(GOOGLE_STUDIO_API_KEY_ENV) {
+			Ok(key) if !key.trim().is_empty() => Ok(key),
+			_ => Err(anyhow::anyhow!(
+				"Google AI Studio API key not found in environment variable: {}. \
                 Get an API key at https://aistudio.google.com/apikey",
-                GOOGLE_STUDIO_API_KEY_ENV
-            )),
-        }
-    }
+				GOOGLE_STUDIO_API_KEY_ENV
+			)),
+		}
+	}
 
-    // Gemini 2.5+ caches implicitly; cached tokens come back in usage and bill
-    // at the cache-read rate — same behavior as the Vertex lane.
-    fn supports_caching(&self, model: &str) -> bool {
-        let normalized = normalize_model_name(model);
-        normalized.contains("gemini-3") || normalized.contains("gemini-2.5")
-    }
+	// Gemini 2.5+ caches implicitly; cached tokens come back in usage and bill
+	// at the cache-read rate — same behavior as the Vertex lane.
+	fn supports_caching(&self, model: &str) -> bool {
+		let normalized = normalize_model_name(model);
+		normalized.contains("gemini-4") || normalized.contains("gemini-3") || normalized.contains("gemini-2.5")
+	}
 
-    fn supports_vision(&self, model: &str) -> bool {
-        normalize_model_name(model).contains("gemini")
-    }
+	/// See `MEASURED_CACHE_MODELS` for the evidence.
+	fn cache_lifetime(&self, model: &str, _use_long_cache: bool) -> Option<std::time::Duration> {
+		let normalized = normalize_model_name(model);
+		MEASURED_CACHE_MODELS
+			.iter()
+			.any(|measured| normalized.contains(measured))
+			.then_some(MEASURED_CACHE_LIFETIME)
+	}
 
-    fn supports_structured_output(&self, _model: &str) -> bool {
-        true
-    }
+	fn supports_vision(&self, model: &str) -> bool {
+		normalize_model_name(model).contains("gemini")
+	}
 
-    fn enforces_response_schema(&self, _model: &str) -> bool {
-        true
-    }
+	fn supports_structured_output(&self, _model: &str) -> bool {
+		true
+	}
 
-    fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
-        let (input_price, output_price, cache_write_price, cache_read_price) =
-            get_model_pricing(model, PRICING)?;
-        Some(crate::llm::types::ModelPricing::new(
-            input_price,
-            output_price,
-            cache_write_price,
-            cache_read_price,
-        ))
-    }
+	fn enforces_response_schema(&self, _model: &str) -> bool {
+		true
+	}
 
-    fn get_max_input_tokens(&self, model: &str) -> usize {
-        // Prefer cached value from API if available
-        if let Some(limit) = get_cached_input_limit(&MODELS_CACHE, model) {
-            return limit;
-        }
-        gemini_max_input_tokens(model)
-    }
+	fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
+		let (input_price, output_price, cache_write_price, cache_read_price) = get_model_pricing(model, PRICING)?;
+		Some(crate::llm::types::ModelPricing::new(
+			input_price,
+			output_price,
+			cache_write_price,
+			cache_read_price,
+		))
+	}
 
-    fn supported_sampling_params(&self, model: &str) -> SamplingSupport {
-        gemini_sampling_support(model)
-    }
+	fn get_max_input_tokens(&self, model: &str) -> usize {
+		// Prefer cached value from API if available
+		if let Some(limit) = get_cached_input_limit(&MODELS_CACHE, model) {
+			return limit;
+		}
+		gemini_max_input_tokens(model)
+	}
 
-    async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
-        let api_key = self.get_api_key()?;
-        let api_url = get_api_url(GOOGLE_STUDIO_API_URL_ENV, GOOGLE_STUDIO_API_URL);
-        let model = params.model.clone();
+	async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
+		let api_key = super::shared::resolve_api_key(self, &params)?;
+		let api_url = get_api_url(GOOGLE_STUDIO_API_URL_ENV, GOOGLE_STUDIO_API_URL);
+		let model = params.model.clone();
 
-        // Lazy-load available models on first call (errors silently ignored; retries next call)
-        let key = api_key.clone();
-        let url = api_url.clone();
-        let _ = MODELS_CACHE
-            .get_or_try_init(|| async move { fetch_available_models(&key, &url).await })
-            .await;
+		// Lazy-load available models on first call (errors silently ignored; retries next call)
+		let key = api_key.clone();
+		let per_call_api_key = params.api_key.clone();
+		let url = api_url.clone();
+		let _ = MODELS_CACHE
+			.get_or_try_init(|| async move { fetch_available_models(&key, &url, per_call_api_key.as_ref()).await })
+			.await;
 
-        let mut response = chat_completion_with_sampling(
-            OpenAiCompatConfig {
-                provider_name: "google-studio",
-                usage_fallback_cost: None,
-                use_response_cost: true,
-            },
-            self.supported_sampling_params(&model),
-            api_key,
-            api_url,
-            params,
-        )
-        .await?;
+		let mut response = chat_completion(
+			OpenAiCompatConfig {
+				provider_name: "google-studio",
+				usage_fallback_cost: None,
+				use_response_cost: true,
+				enforces_response_schema: true,
+				supports_required_tool_choice: false,
+				supports_parallel_tool_calls: true,
+			},
+			api_key,
+			api_url,
+			params,
+		)
+		.await?;
 
-        // Gemini's OpenAI-compat endpoint doesn't report cost — fill from the pricing table
-        if let Some(ref mut usage) = response.exchange.usage {
-            if usage.cost.is_none() {
-                usage.cost = calculate_usage_cost(
-                    &model,
-                    usage.input_tokens,
-                    usage.cache_write_tokens,
-                    usage.cache_read_tokens,
-                    usage.billable_output_tokens(),
-                );
-            }
-        }
+		// Gemini's OpenAI-compat endpoint doesn't report cost — fill from the pricing table
+		if let Some(ref mut usage) = response.exchange.usage {
+			if usage.cost.is_none() {
+				usage.cost = calculate_usage_cost(
+					&model,
+					usage.input_tokens,
+					usage.cache_write_tokens,
+					usage.cache_read_tokens,
+					usage.billable_output_tokens(),
+				);
+			}
+		}
 
-        Ok(response)
-    }
+		Ok(response)
+	}
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_supports_model_before_cache() {
-        let provider = GoogleStudioProvider::new();
-
-        // Before cache is populated, accept any non-empty model
-        assert!(provider.supports_model("gemini-2.5-flash"));
-        assert!(provider.supports_model("gemini-3.6-flash"));
-        assert!(provider.supports_model("gemini-3.7-flash"));
-        assert!(!provider.supports_model(""));
-    }
-
-    #[test]
-    fn test_default_capabilities() {
-        let provider = GoogleStudioProvider::new();
-        assert_eq!(provider.name(), "google-studio");
-        assert!(provider.supports_caching("gemini-3.5-flash"));
-        assert!(provider.supports_caching("gemini-2.5-pro"));
-        assert!(!provider.supports_caching("gemini-2.0-flash"));
-        assert!(provider.supports_vision("gemini-3.1-pro"));
-        assert!(provider.supports_structured_output("any-model"));
-        assert_eq!(provider.get_max_input_tokens("gemini-3.6-flash"), 1_048_576);
-    }
-
-    #[test]
-    fn test_sampling_params() {
-        let provider = GoogleStudioProvider::new();
-        assert_eq!(
-            provider.supported_sampling_params("gemini-3.7-flash"),
-            SamplingSupport::NONE
-        );
-        assert_eq!(
-            provider.supported_sampling_params("gemini-3.6-flash"),
-            SamplingSupport::NONE
-        );
-        assert_eq!(
-            provider.supported_sampling_params("gemini-2.5-flash"),
-            SamplingSupport::ALL
-        );
-    }
-
-    #[test]
-    fn test_model_pricing() {
-        let provider = GoogleStudioProvider::new();
-
-        let p = provider.get_model_pricing("gemini-3.7-flash").unwrap();
-        assert_eq!(p.input_price_per_1m, 0.75);
-        assert_eq!(p.output_price_per_1m, 3.75);
-
-        // Intro rate applies to 3.6 Flash too, through Dec 31, 2026
-        let p = provider.get_model_pricing("gemini-3.6-flash").unwrap();
-        assert_eq!(p.input_price_per_1m, 0.75);
-        assert_eq!(p.output_price_per_1m, 3.75);
-
-        // Preview suffixes resolve to the base model's pricing
-        let p = provider
-            .get_model_pricing("gemini-3.1-pro-preview")
-            .unwrap();
-        assert_eq!(p.input_price_per_1m, 2.00);
-        assert_eq!(p.output_price_per_1m, 12.00);
-
-        let p = provider.get_model_pricing("gemini-2.5-flash-lite").unwrap();
-        assert_eq!(p.input_price_per_1m, 0.10);
-        assert_eq!(p.output_price_per_1m, 0.40);
-
-        assert!(provider.get_model_pricing("gemma-3-27b").is_none());
-    }
-
-    #[test]
-    fn test_cost_calculation() {
-        // 1M input + 0.5M output on gemini-2.5-flash: $0.30 + 0.5 * $2.50 = $1.55
-        let cost = calculate_usage_cost("gemini-2.5-flash", 1_000_000, 0, 0, 500_000).unwrap();
-        assert!((cost - 1.55).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_pro_long_context_tier() {
-        // At or below 200K input, Pro bills the standard tier:
-        // 0.2M * $1.25 + 0.1M * $10.00 = $1.25
-        let short = calculate_usage_cost("gemini-2.5-pro", 200_000, 0, 0, 100_000).unwrap();
-        assert!((short - 1.25).abs() < 1e-9);
-
-        // Above 200K total input: 2x input/cache, 1.5x output.
-        // 0.200001M * $2.50 + 0.1M * $15.00 = $2.0000025
-        let long = calculate_usage_cost("gemini-2.5-pro", 200_001, 0, 0, 100_000).unwrap();
-        assert!((long - 2.0000025).abs() < 1e-9);
-
-        // Cache writes and reads count toward the threshold and get the 2x rate.
-        // 0.15M * $4.00 + 0.05M * $4.00 + 0.05M * $0.40 + 0.01M * $18.00 = $1.00
-        let cached =
-            calculate_usage_cost("gemini-3.1-pro", 150_000, 50_000, 50_000, 10_000).unwrap();
-        assert!((cached - 1.0).abs() < 1e-9);
-
-        // Flash has no long-context tier: 0.5M * $0.75 + 0.01M * $3.75 = $0.4125
-        let flash = calculate_usage_cost("gemini-3.7-flash", 500_000, 0, 0, 10_000).unwrap();
-        assert!((flash - 0.4125).abs() < 1e-9);
-    }
-}
+#[path = "google_studio_tests.rs"]
+mod tests;

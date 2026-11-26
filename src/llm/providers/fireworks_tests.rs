@@ -1,0 +1,268 @@
+// Copyright 2026 Muvon Un Limited
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::*;
+
+#[test]
+fn test_supports_model() {
+	let provider = FireworksProvider::new();
+	assert!(provider.supports_model("accounts/fireworks/models/kimi-k2-instruct-0905"));
+	assert!(provider.supports_model("accounts/fireworks/models/deepseek-v3"));
+	assert!(provider.supports_model("accounts/fireworks/models/qwen3-coder-480b-a35b-instruct"));
+	assert!(provider.supports_model("any-future-model"));
+	assert!(!provider.supports_model(""));
+}
+
+#[test]
+fn test_default_capabilities() {
+	let provider = FireworksProvider::new();
+	assert_eq!(provider.name(), "fireworks");
+	assert!(provider.supports_caching("any-model"));
+	assert!(provider.supports_structured_output("any-model"));
+}
+
+#[test]
+fn test_pricing_reference_fallback() {
+	let provider = FireworksProvider::new();
+	assert!(provider
+		.get_model_pricing("accounts/fireworks/models/deepseek-v3")
+		.is_some());
+}
+
+#[test]
+fn current_serverless_routes_use_fireworks_pricing_and_context() {
+	let provider = FireworksProvider::new();
+
+	// No longer serverless: context stays known, pricing leaves the table.
+	assert_eq!(
+		provider.get_max_input_tokens("accounts/fireworks/models/qwen3p8-2p4t-a95b"),
+		262_144
+	);
+
+	let kimi = provider.get_model_pricing("accounts/fireworks/models/kimi-k3").unwrap();
+	assert_eq!(kimi.input_price_per_1m, 3.00);
+	assert_eq!(kimi.cache_read_price_per_1m, 0.30);
+	assert_eq!(kimi.output_price_per_1m, 15.00);
+	assert_eq!(
+		provider.get_max_input_tokens("accounts/fireworks/models/kimi-k3"),
+		1_040_000
+	);
+
+	let qwen_max = provider
+		.get_model_pricing("accounts/fireworks/models/qwen3p8-max")
+		.unwrap();
+	assert_eq!(qwen_max.input_price_per_1m, 2.00);
+	assert_eq!(qwen_max.cache_read_price_per_1m, 0.25);
+	assert_eq!(qwen_max.output_price_per_1m, 6.00);
+}
+
+#[test]
+fn newly_listed_serverless_routes_use_fireworks_pricing_and_context() {
+	let provider = FireworksProvider::new();
+
+	let glm = provider.get_model_pricing("accounts/fireworks/models/glm-5p3").unwrap();
+	assert_eq!(glm.input_price_per_1m, 1.40);
+	assert_eq!(glm.cache_read_price_per_1m, 0.26);
+	assert_eq!(glm.output_price_per_1m, 4.40);
+	assert_eq!(
+		provider.get_max_input_tokens("accounts/fireworks/models/glm-5p3"),
+		1_040_000
+	);
+
+	let glm_flash = provider
+		.get_model_pricing("accounts/fireworks/models/glm-5p3-flash")
+		.unwrap();
+	assert_eq!(glm_flash.input_price_per_1m, 0.15);
+	assert_eq!(glm_flash.cache_read_price_per_1m, 0.03);
+	assert_eq!(glm_flash.output_price_per_1m, 0.50);
+
+	// No longer serverless: context stays known, pricing leaves the table.
+	assert_eq!(
+		provider.get_max_input_tokens("accounts/fireworks/models/kimi-k2p6"),
+		262_144
+	);
+
+	let gpt_oss = provider
+		.get_model_pricing("accounts/fireworks/models/gpt-oss-120b")
+		.unwrap();
+	assert_eq!(gpt_oss.input_price_per_1m, 0.15);
+	assert_eq!(gpt_oss.cache_read_price_per_1m, 0.015);
+	assert_eq!(gpt_oss.output_price_per_1m, 0.60);
+	assert_eq!(
+		provider.get_max_input_tokens("accounts/fireworks/models/gpt-oss-120b"),
+		131_072
+	);
+
+	let nemotron = provider
+		.get_model_pricing("accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b")
+		.unwrap();
+	assert_eq!(nemotron.input_price_per_1m, 0.05);
+	assert_eq!(nemotron.cache_read_price_per_1m, 0.01);
+	assert_eq!(nemotron.output_price_per_1m, 0.20);
+	assert_eq!(
+		provider.get_max_input_tokens("accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"),
+		262_144
+	);
+
+	assert_eq!(
+		provider.get_max_input_tokens("accounts/fireworks/models/muse-glimmer-30b"),
+		131_072
+	);
+}
+
+#[test]
+fn fast_and_us_routers_use_their_own_rates() {
+	let provider = FireworksProvider::new();
+
+	for router in [
+		"accounts/fireworks/routers/kimi-k3-fast",
+		"accounts/fireworks/routers/kimi-k3-us",
+	] {
+		let kimi = provider.get_model_pricing(router).unwrap();
+		assert_eq!(kimi.input_price_per_1m, 4.50, "{router}");
+		assert_eq!(kimi.cache_read_price_per_1m, 0.45, "{router}");
+		assert_eq!(kimi.output_price_per_1m, 22.50, "{router}");
+	}
+
+	for router in [
+		"accounts/fireworks/routers/glm-5p3-fast",
+		"accounts/fireworks/routers/glm-5p3-us",
+	] {
+		let glm = provider.get_model_pricing(router).unwrap();
+		assert_eq!(glm.input_price_per_1m, 2.10, "{router}");
+		assert_eq!(glm.cache_read_price_per_1m, 0.39, "{router}");
+		assert_eq!(glm.output_price_per_1m, 6.60, "{router}");
+	}
+
+	let glm_flash = provider
+		.get_model_pricing("accounts/fireworks/routers/glm-5p3-flash-us")
+		.unwrap();
+	assert_eq!(glm_flash.input_price_per_1m, 0.225);
+	assert_eq!(glm_flash.output_price_per_1m, 0.75);
+
+	let deepseek_us = provider
+		.get_model_pricing("accounts/fireworks/routers/deepseek-v4p1-flash-us")
+		.unwrap();
+	assert_eq!(deepseek_us.input_price_per_1m, 0.45);
+	assert_eq!(deepseek_us.cache_read_price_per_1m, 0.009);
+	assert_eq!(deepseek_us.output_price_per_1m, 1.80);
+}
+
+#[test]
+fn october_serverless_models_use_fireworks_pricing_and_context() {
+	let provider = FireworksProvider::new();
+
+	let deepseek = provider
+		.get_model_pricing("accounts/fireworks/models/deepseek-v4p1-flash")
+		.unwrap();
+	assert_eq!(deepseek.input_price_per_1m, 0.30);
+	assert_eq!(deepseek.cache_read_price_per_1m, 0.006);
+	assert_eq!(deepseek.output_price_per_1m, 1.20);
+	assert_eq!(
+		provider.get_max_input_tokens("accounts/fireworks/models/deepseek-v4p1-flash"),
+		1_040_000
+	);
+
+	let nemotron = provider
+		.get_model_pricing("accounts/fireworks/models/nemotron-3-ultra-nvfp4")
+		.unwrap();
+	assert_eq!(nemotron.input_price_per_1m, 0.60);
+	assert_eq!(nemotron.cache_read_price_per_1m, 0.12);
+	assert_eq!(nemotron.output_price_per_1m, 2.40);
+	assert_eq!(
+		provider.get_max_input_tokens("accounts/fireworks/models/nemotron-3-ultra-nvfp4"),
+		262_144
+	);
+
+	// Inkling prices correctly via the reference table; only its context is local.
+	assert_eq!(
+		provider.get_max_input_tokens("accounts/fireworks/models/inkling"),
+		1_040_000
+	);
+}
+
+#[test]
+fn deepseek_v4p1_flash_1017_spot_snapshot_uses_fireworks_rates() {
+	let provider = FireworksProvider::new();
+	// https://docs.fireworks.ai/guides/spot-serverless — same rate card as the
+	// moving alias; needs confirmation if a dedicated spot rate is published.
+	let pricing = provider
+		.get_model_pricing("accounts/fireworks/models/deepseek-v4p1-flash-1017")
+		.unwrap();
+	assert_eq!(pricing.input_price_per_1m, 0.30);
+	assert_eq!(pricing.cache_read_price_per_1m, 0.006);
+	assert_eq!(pricing.output_price_per_1m, 1.20);
+	assert_eq!(
+		provider.get_max_input_tokens("accounts/fireworks/models/deepseek-v4p1-flash-1017"),
+		1_040_000
+	);
+}
+
+#[test]
+fn november_serverless_models_use_fireworks_pricing_and_context() {
+	let provider = FireworksProvider::new();
+
+	let muse = provider
+		.get_model_pricing("accounts/fireworks/models/muse-spark-open")
+		.unwrap();
+	assert_eq!(muse.input_price_per_1m, 1.25);
+	assert_eq!(muse.cache_read_price_per_1m, 0.15);
+	assert_eq!(muse.output_price_per_1m, 4.25);
+	assert_eq!(
+		provider.get_max_input_tokens("accounts/fireworks/models/muse-spark-open"),
+		1_040_000
+	);
+
+	// MiniMax M3.1 Flash must not fall through to the minimax-m3 rate or context
+	let minimax = provider
+		.get_model_pricing("accounts/fireworks/models/minimax-m3p1-flash")
+		.unwrap();
+	assert_eq!(minimax.input_price_per_1m, 0.15);
+	assert_eq!(minimax.cache_read_price_per_1m, 0.015);
+	assert_eq!(minimax.output_price_per_1m, 0.60);
+	assert_eq!(
+		provider.get_max_input_tokens("accounts/fireworks/models/minimax-m3p1-flash"),
+		1_040_000
+	);
+}
+
+/// These model pages show "Serverless Not supported" (Nov 3, 2026): on-demand
+/// deployments bill per GPU-hour, so they carry no token rate.
+#[test]
+fn on_demand_only_models_have_no_fireworks_rate() {
+	for model in [
+		"accounts/fireworks/models/nemotron-3-ultra-bf16",
+		"accounts/fireworks/models/nvidia-nemotron-3p5-super-vl-120b-a12b-nvfp4",
+		"accounts/fireworks/models/nvidia-nemotron-3p5-super-vl-120b-a12b-bf16",
+		"accounts/fireworks/models/qwen3p7-max",
+	] {
+		assert!(fireworks_model_pricing(model).is_none(), "{model}");
+	}
+}
+
+#[test]
+fn retired_routes_leave_fireworks_table() {
+	for model in [
+		"accounts/fireworks/models/qwen3p7-plus",
+		"accounts/fireworks/models/qwen3p8-2p4t-a95b",
+		"accounts/fireworks/models/deepseek-v4-pro-0813",
+		"accounts/fireworks/models/deepseek-v4-pro",
+		"accounts/fireworks/models/deepseek-v4-flash",
+		"accounts/fireworks/models/kimi-k2p7-code",
+		"accounts/fireworks/models/kimi-k2p6",
+		"accounts/fireworks/models/muse-glimmer-30b",
+	] {
+		assert!(fireworks_model_pricing(model).is_none(), "{model}");
+	}
+}

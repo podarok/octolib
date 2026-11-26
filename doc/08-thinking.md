@@ -6,6 +6,39 @@ Octolib provides first-class support for models that produce thinking/reasoning 
 
 ## Architecture
 
+### Reasoning effort, including `None`
+
+`ChatCompletionParams::reasoning_effort` is a provider-agnostic hint. Leaving it
+unset (`None` at the `Option` level) keeps the provider's default. Setting
+`ReasoningEffort::None` is the explicit opposite — no reasoning requested, and
+thinking switched off wherever the provider has a switch:
+
+| Provider | `ReasoningEffort::None` on the wire |
+|----------|-------------------------------------|
+| Alibaba Model Studio (DeepSeek V4, GLM, Qwen3, Qwen4) | `enable_thinking: false`, no `reasoning_effort` |
+| DeepSeek (native) | `thinking: {"type": "disabled"}` |
+| Z.AI | `thinking: {"type": "disabled"}` (omitted for GLM-5.3, which rejects it) |
+| OpenRouter | `reasoning: {"enabled": false}` for optional reasoning; the catalog's lowest effort for mandatory reasoning |
+| Google Studio / Vertex, Gemini 4 Argon | `extra_body.google.thinking_config.thinking_level: "low"` (thinking cannot be disabled) |
+| Google Studio, Gemini 4 Hydrogen | `reasoning_effort: "none"` (thinking is reduced, not disabled) |
+| OpenAI Responses (gpt-5.x) | `reasoning: {"effort": "none"}`; the o-series floors to `"low"` |
+| OctoHub | `reasoning_effort: "none"`, mapped server-side by this same library |
+| Cloudflare Workers AI | `reasoning_effort: "none"` only when the catalog lists it as a level |
+| Anthropic, xAI, Together, Moonshot, codex CLI, other OpenAI-compatible hosts | nothing is sent (their default is no thinking, or there is no switch) |
+
+Use it for calls whose output is the whole point — summaries, judges, structured
+extraction. A hybrid-thinking model left on its default can spend the entire
+output budget reasoning and return an empty completion (`finish_reason=length`).
+
+### Historical thinking replay
+
+`AiProvider::replays_thinking(model)` says whether the provider sends stored
+assistant `thinking` back on later requests, so it occupies context the model
+reads and bills. Z.AI (Preserved Thinking), DeepSeek (tool-carrying requests)
+and Kimi K2.6+/K3 on Moonshot and Ollama replay it; every other provider drops
+historical reasoning on the wire. Callers that estimate prompt size should
+count stored thinking only where this returns `true`.
+
 ### ThinkingBlock Structure
 
 Thinking content is stored in a separate `ThinkingBlock` structure, parallel to how `tool_calls` are separate from content:
@@ -72,6 +105,34 @@ println!("Response: {}", response.content);
 
 ## Provider Support
 
+### Gemini 4 Argon
+
+Google Studio and Vertex use Google's supported OpenAI-compatible endpoint.
+Argon accepts low, medium and high thinking levels; Octolib maps XHigh and Max
+to high, explicit None to low, and an unset effort to the model default (medium).
+Thought summaries are requested with `include_thoughts` and `thought_tag_marker`;
+Octolib separates the tagged summaries from the answer. Encrypted signatures are
+replay state and are never presented as readable thinking.
+
+When storing assistant history, preserve both the generic tool calls returned by
+`ProviderToolCalls::extract_from_exchange(...).to_generic_tool_calls()` and
+`response.exchange.response["output_items"]` as `Message.provider_items` when
+present. The latter retains signatures on text-only turns as well as tool turns,
+including OpenRouter's `reasoning_details`. Saving only `response.content` or
+the plain `response.tool_calls` loses this state.
+
+Argon's 1,048,576-token context is shared by input and output, including thinking.
+A low output cap can be exhausted before an answer or tool call is produced;
+`finish_reason: "length"` remains visible to the caller. Google's long-decode
+continuation protocol requires GenerateContent and is **not supported by these
+OpenAI-compatible adapters**. Vertex defaults Argon, Carbon and Hydrogen to the global location;
+explicit URL and location overrides still take precedence.
+
+Sources, reviewed November 6, 2026:
+[Argon guide](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/guides/gemini-4-argon),
+[Google compatibility parameters](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/migrate/openai/overview),
+[thought markers](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/migrate/openai/examples).
+
 ### xAI
 
 xAI uses the native Responses API. Octolib requests
@@ -82,7 +143,7 @@ use xAI's `previous_response_id` state directly.
 
 ```rust
 let (provider, model) = ProviderFactory::get_provider_for_model("xai:grok-4.5")?;
-let params = ChatCompletionParams::new(&messages, &model, 0.2, 0.9, 40, 2048)
+let params = ChatCompletionParams::new(&messages, &model, 2048)
     .with_reasoning_effort(ReasoningEffort::High);
 let response = provider.chat_completion(params).await?;
 ```
@@ -224,7 +285,7 @@ async fn thinking_example() -> anyhow::Result<()> {
     ];
 
     // Create parameters
-    let params = ChatCompletionParams::new(&messages, &model, 0.7, 1.0, 50, 1000);
+    let params = ChatCompletionParams::new(&messages, &model, 1000);
 
     // Get completion
     let response = provider.chat_completion(params).await?;
@@ -334,7 +395,7 @@ conversation.push(Message::assistant(&response.content)
     .with_thinking(response.thinking.clone()));
 
 // Use conversation in next request
-let params = ChatCompletionParams::new(&conversation, &model, 0.7, 1.0, 50, 1000);
+let params = ChatCompletionParams::new(&conversation, &model, 1000);
 ```
 
 ### 3. Token Budgeting

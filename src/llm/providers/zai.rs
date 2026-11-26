@@ -14,13 +14,21 @@
 
 //! Z.ai (Zhipu AI) provider implementation
 //!
-//! PRICING UPDATE: April 2026 (from <https://docs.z.ai/guides/overview/pricing>)
+//! PRICING VERIFIED: September 22, 2026 (from <https://docs.z.ai/guides/overview/pricing>)
+//!
+//! GLM-5.4 (Nov 23, 2026, Coding Plan only):
+//! - GLM-5.4: placeholder at GLM-5.3 rates (Input $1.40/1M, Cached $0.26/1M,
+//!   Output $4.40/1M). Z.ai has not published a per-token price yet; its Coding
+//!   Plan charges GLM-5.4 about 2/3 of GLM-5.3's credits, so this overstates cost.
+//!   Replace once the pricing page lists it.
 //!
 //! GLM-5.3 series (added Aug 2026):
 //! - GLM-5.3: Input $1.40/1M, Cached $0.26/1M, Output $4.40/1M (official pricing
 //!   confirmed Aug 2026; previously mirrored from GLM-5.2)
 //! - GLM-5.3-Flash: Input $0.15/1M, Cached $0.03/1M, Output $0.50/1M — list prices;
-//!   50% promo ($0.075/$0.015/$0.25) runs until Sep 9, 2026
+//!   50% promo ($0.075/$0.015/$0.25) ran until Sep 9, 2026
+//! - GLM-5.3-FlashX: Input $0.37/1M, Cached $0.075/1M, Output $1.25/1M (faster
+//!   Flash variant, 200 tokens/s; added Sep 2026)
 //!
 //! GLM-5.2 series:
 //! - GLM-5.2: Input $1.40/1M, Cached $0.26/1M, Output $4.40/1M (pricing mirrors GLM-5.1)
@@ -57,58 +65,65 @@
 //! GLM-4 series:
 //! - GLM-4-32B-0414-128K: Input $0.10/1M, Output $0.10/1M
 use super::shared;
-use crate::errors::ProviderError;
 use crate::llm::retry;
 use crate::llm::traits::AiProvider;
 use crate::llm::types::{
-    ChatCompletionParams, ProviderExchange, ProviderResponse, ResponseMode, SamplingSupport,
-    ThinkingBlock, TokenUsage, ToolCall,
+	ChatCompletionParams, ProviderExchange, ProviderResponse, ReasoningEffort, ResponseMode, ThinkingBlock, TokenUsage,
+	ToolCall,
 };
-use crate::llm::utils::{
-    get_model_pricing, is_model_in_pricing_table, normalize_model_name, PricingTuple,
-};
+use crate::llm::utils::{get_model_pricing, is_model_in_pricing_table, normalize_model_name, PricingTuple};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::env;
 
 /// Z.ai pricing constants (per 1M tokens in USD)
-/// Source: https://docs.z.ai/guides/overview/pricing (verified Aug 26, 2026)
+/// Source: https://docs.z.ai/guides/overview/pricing (verified Sep 22, 2026)
 /// Format: (model, input, output, cache_write, cache_read)
-const PRICING: &[PricingTuple] = &[
-    // GLM-5.3-Flash — list prices; 50% promo ($0.075 in / $0.015 cached / $0.25 out) ends Sep 9, 2026
-    ("glm-5.3-flash", 0.15, 0.50, 0.00, 0.03),
-    // GLM-5.3 — official pricing confirmed Aug 2026 (previously mirrored from GLM-5.2)
-    ("glm-5.3", 1.40, 4.40, 0.00, 0.26),
-    // GLM-5.2 series (pricing mirrors GLM-5.1)
-    ("glm-5.2", 1.40, 4.40, 0.00, 0.26),
-    // GLM-5.1 series
-    ("glm-5.1-turbo", 1.40, 4.40, 0.00, 0.26),
-    ("glm-5.1", 1.40, 4.40, 0.00, 0.26),
-    // GLM-5 series
-    ("glm-5v-turbo", 1.20, 4.00, 0.00, 0.24), // vision
-    ("glm-5-turbo", 1.20, 4.00, 0.00, 0.24),
-    ("glm-5", 1.00, 3.20, 0.00, 0.20),
-    // GLM-4.7 series - more specific variants first
-    ("glm-4.7-flashx", 0.07, 0.40, 0.00, 0.01),
-    ("glm-4.7-flash", 0.00, 0.00, 0.00, 0.00), // free model
-    ("glm-4.7", 0.60, 2.20, 0.00, 0.11),
-    // GLM-4.6 series
-    ("glm-4.6v-flashx", 0.04, 0.40, 0.00, 0.004), // vision
-    ("glm-4.6v-flash", 0.00, 0.00, 0.00, 0.00),   // free, vision
-    ("glm-4.6v", 0.30, 0.90, 0.00, 0.05),         // vision
-    ("glm-ocr", 0.03, 0.03, 0.00, 0.00),          // vision
-    ("glm-4.6", 0.60, 2.20, 0.00, 0.11),
-    // GLM-4.5 series - most specific first
-    ("glm-4.5-airx", 1.10, 4.50, 0.00, 0.22),
-    ("glm-4.5-air", 0.20, 1.10, 0.00, 0.03),
-    ("glm-4.5-flash", 0.00, 0.00, 0.00, 0.00), // free model
-    ("glm-4.5v", 0.60, 1.80, 0.00, 0.11),      // vision
-    ("glm-4.5-x", 2.20, 8.90, 0.00, 0.45),
-    ("glm-4.5", 0.60, 2.20, 0.00, 0.11),
-    // GLM-4 series
-    // Official pricing lists Cached Input as N/A for this model
-    ("glm-4-32b-0414-128k", 0.10, 0.10, 0.00, 0.00),
+pub(crate) const PRICING: &[PricingTuple] = &[
+	// GLM-5.4 — placeholder at GLM-5.3 rates until Z.ai publishes a per-token
+	// price (Coding Plan only as of Nov 23, 2026; see module docs)
+	("glm-5.4", 1.40, 4.40, 0.00, 0.26),
+	// GLM-5.3-FlashX-Legal — the legal-tuned FlashX variant, listed at the
+	// same rates; must precede glm-5.3-flashx since that pattern is a
+	// substring of this name
+	("glm-5.3-flashx-legal", 0.37, 1.25, 0.00, 0.075),
+	// GLM-5.3-FlashX — faster GLM-5.3-Flash variant; must precede glm-5.3-flash
+	// since that pattern is a substring of this name
+	("glm-5.3-flashx", 0.37, 1.25, 0.00, 0.075),
+	// GLM-5.3-Flash — list prices; 50% promo ($0.075 in / $0.015 cached / $0.25 out) ended Sep 9, 2026
+	("glm-5.3-flash", 0.15, 0.50, 0.00, 0.03),
+	// GLM-5.3 — official pricing confirmed Aug 2026 (previously mirrored from GLM-5.2)
+	("glm-5.3", 1.40, 4.40, 0.00, 0.26),
+	// GLM-5.2 series (pricing mirrors GLM-5.1)
+	("glm-5.2", 1.40, 4.40, 0.00, 0.26),
+	// GLM-5.1 series
+	("glm-5.1-turbo", 1.40, 4.40, 0.00, 0.26),
+	("glm-5.1", 1.40, 4.40, 0.00, 0.26),
+	// GLM-5 series
+	("glm-5v-turbo", 1.20, 4.00, 0.00, 0.24), // vision
+	("glm-5-turbo", 1.20, 4.00, 0.00, 0.24),
+	("glm-5", 1.00, 3.20, 0.00, 0.20),
+	// GLM-4.7 series - more specific variants first
+	("glm-4.7-flashx", 0.07, 0.40, 0.00, 0.01),
+	("glm-4.7-flash", 0.00, 0.00, 0.00, 0.00), // free model
+	("glm-4.7", 0.60, 2.20, 0.00, 0.11),
+	// GLM-4.6 series
+	("glm-4.6v-flashx", 0.04, 0.40, 0.00, 0.004), // vision
+	("glm-4.6v-flash", 0.00, 0.00, 0.00, 0.00),   // free, vision
+	("glm-4.6v", 0.30, 0.90, 0.00, 0.05),         // vision
+	("glm-ocr", 0.03, 0.03, 0.00, 0.00),          // vision
+	("glm-4.6", 0.60, 2.20, 0.00, 0.11),
+	// GLM-4.5 series - most specific first
+	("glm-4.5-airx", 1.10, 4.50, 0.00, 0.22),
+	("glm-4.5-air", 0.20, 1.10, 0.00, 0.03),
+	("glm-4.5-flash", 0.00, 0.00, 0.00, 0.00), // free model
+	("glm-4.5v", 0.60, 1.80, 0.00, 0.11),      // vision
+	("glm-4.5-x", 2.20, 8.90, 0.00, 0.45),
+	("glm-4.5", 0.60, 2.20, 0.00, 0.11),
+	// GLM-4 series
+	// Official pricing lists Cached Input as N/A for this model
+	("glm-4-32b-0414-128k", 0.10, 0.10, 0.00, 0.00),
 ];
 
 /// GLM-5.3-Flash promotion ends at 2026-09-10 00:00 UTC+8
@@ -116,49 +131,52 @@ const PRICING: &[PricingTuple] = &[
 const GLM_5_3_FLASH_PROMO_END_UNIX_SECS: u64 = 1_788_969_600;
 
 fn effective_pricing_at(model: &str, time: std::time::SystemTime) -> Option<(f64, f64, f64, f64)> {
-    let pricing = get_model_pricing(model, PRICING)?;
-    let secs = time
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    if normalize_model_name(model).contains("glm-5.3-flash")
-        && secs < GLM_5_3_FLASH_PROMO_END_UNIX_SECS
-    {
-        Some((0.075, 0.25, 0.00, 0.015))
-    } else {
-        Some(pricing)
-    }
+	let pricing = get_model_pricing(model, PRICING)?;
+	let secs = time
+		.duration_since(std::time::SystemTime::UNIX_EPOCH)
+		.map(|duration| duration.as_secs())
+		.unwrap_or(0);
+	let normalized = normalize_model_name(model);
+	// The promo covered GLM-5.3-Flash only, not the later FlashX variant
+	if normalized.contains("glm-5.3-flash")
+		&& !normalized.contains("glm-5.3-flashx")
+		&& secs < GLM_5_3_FLASH_PROMO_END_UNIX_SECS
+	{
+		Some((0.075, 0.25, 0.00, 0.015))
+	} else {
+		Some(pricing)
+	}
 }
 
 fn calculate_cost_at(
-    model: &str,
-    regular_input_tokens: u64,
-    cache_read_tokens: u64,
-    completion_tokens: u64,
-    time: std::time::SystemTime,
+	model: &str,
+	regular_input_tokens: u64,
+	cache_read_tokens: u64,
+	completion_tokens: u64,
+	time: std::time::SystemTime,
 ) -> Option<f64> {
-    let (input, output, _cache_write, cache_read) = effective_pricing_at(model, time)?;
-    Some(
-        (regular_input_tokens as f64 / 1_000_000.0) * input
-            + (cache_read_tokens as f64 / 1_000_000.0) * cache_read
-            + (completion_tokens as f64 / 1_000_000.0) * output,
-    )
+	let (input, output, _cache_write, cache_read) = effective_pricing_at(model, time)?;
+	Some(
+		(regular_input_tokens as f64 / 1_000_000.0) * input
+			+ (cache_read_tokens as f64 / 1_000_000.0) * cache_read
+			+ (completion_tokens as f64 / 1_000_000.0) * output,
+	)
 }
 
 /// Calculate cost for Z.ai models (case-insensitive)
 fn calculate_cost(
-    model: &str,
-    regular_input_tokens: u64,
-    cache_read_tokens: u64,
-    completion_tokens: u64,
+	model: &str,
+	regular_input_tokens: u64,
+	cache_read_tokens: u64,
+	completion_tokens: u64,
 ) -> Option<f64> {
-    calculate_cost_at(
-        model,
-        regular_input_tokens,
-        cache_read_tokens,
-        completion_tokens,
-        std::time::SystemTime::now(),
-    )
+	calculate_cost_at(
+		model,
+		regular_input_tokens,
+		cache_read_tokens,
+		completion_tokens,
+		std::time::SystemTime::now(),
+	)
 }
 
 /// Z.ai provider
@@ -166,269 +184,271 @@ fn calculate_cost(
 pub struct ZaiProvider;
 
 impl ZaiProvider {
-    pub fn new() -> Self {
-        Self
-    }
+	pub fn new() -> Self {
+		Self
+	}
 }
 
 // Constants
-const ZAI_API_KEY_ENV: &str = "ZAI_API_KEY";
+pub(crate) const ZAI_API_KEY_ENV: &str = "ZAI_API_KEY";
 const ZAI_API_URL_ENV: &str = "ZAI_API_URL";
 const ZAI_API_URL: &str = "https://api.z.ai/api/paas/v4/chat/completions";
 // Z.ai API request/response structures
 #[derive(Serialize, Debug)]
 struct ZaiRequest {
-    model: String,
-    messages: Vec<ZaiMessage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    do_sample: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>, // Changed to f64 for better precision control
-    #[serde(skip_serializing_if = "Option::is_none")]
-    top_p: Option<f64>, // Changed to f64 for better precision control
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stop: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    return_messages: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    request_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    do_meta: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    web_search: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_format: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thinking: Option<serde_json::Value>,
+	model: String,
+	messages: Vec<ZaiMessage>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	max_tokens: Option<u32>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	stop: Option<serde_json::Value>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	stream: Option<bool>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	tools: Option<serde_json::Value>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	tool_choice: Option<serde_json::Value>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	return_messages: Option<bool>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	request_id: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	do_meta: Option<bool>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	web_search: Option<bool>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	response_format: Option<serde_json::Value>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	thinking: Option<serde_json::Value>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	reasoning_effort: Option<&'static str>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct ZaiMessage {
-    role: String,
-    content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_content: Option<String>, // For thinking mode
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<ZaiToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
+	role: String,
+	/// Plain string for text turns, OpenAI-style content parts when the turn
+	/// carries images (vision route only). A String here silently dropped every
+	/// image and GLM-5.3-Flash answered as if blind.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	content: Option<serde_json::Value>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	reasoning_content: Option<String>, // For thinking mode
+	#[serde(skip_serializing_if = "Option::is_none")]
+	tool_calls: Option<Vec<ZaiToolCall>>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	tool_call_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct ZaiToolCall {
-    id: String,
-    #[serde(rename = "type")]
-    type_field: String,
-    function: ZaiFunction,
+	id: String,
+	#[serde(rename = "type")]
+	type_field: String,
+	function: ZaiFunction,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct ZaiFunction {
-    name: String,
-    arguments: String, // Changed from serde_json::Value to String - Z.ai expects JSON string like OpenAI
+	name: String,
+	arguments: String, // Changed from serde_json::Value to String - Z.ai expects JSON string like OpenAI
 }
 
 #[derive(Deserialize, Debug)]
 #[allow(dead_code)]
 struct ZaiResponse {
-    id: String,
-    object: String,
-    created: u64,
-    model: String,
-    choices: Vec<ZaiChoice>,
-    usage: Option<ZaiUsage>,
-    #[serde(default)]
-    web_search: Vec<ZaiWebSearch>,
+	id: String,
+	object: String,
+	created: u64,
+	model: String,
+	choices: Vec<ZaiChoice>,
+	usage: Option<ZaiUsage>,
+	#[serde(default)]
+	web_search: Vec<ZaiWebSearch>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ZaiChoice {
-    message: ZaiMessage,
-    finish_reason: Option<String>,
+	message: ZaiMessage,
+	finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
 struct ZaiUsage {
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    total_tokens: u64,
-    #[serde(default)]
-    prompt_tokens_details: ZaiPromptTokensDetails,
+	prompt_tokens: u64,
+	completion_tokens: u64,
+	total_tokens: u64,
+	#[serde(default)]
+	prompt_tokens_details: ZaiPromptTokensDetails,
 }
 
 #[derive(Deserialize, Debug, Default)]
 struct ZaiPromptTokensDetails {
-    #[serde(default)]
-    cached_tokens: u64,
+	#[serde(default)]
+	cached_tokens: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ZaiWebSearch {
-    title: String,
-    content: String,
-    link: String,
-    media: String,
-    icon: String,
-    refer: String,
-    publish_date: String,
+	title: String,
+	content: String,
+	link: String,
+	media: String,
+	icon: String,
+	refer: String,
+	publish_date: String,
 }
 
 #[async_trait]
 impl AiProvider for ZaiProvider {
-    fn name(&self) -> &str {
-        "zai"
-    }
+	fn name(&self) -> &str {
+		"zai"
+	}
 
-    fn supports_model(&self, model: &str) -> bool {
-        // Z.ai (GLM) models - check against pricing table (strict)
-        is_model_in_pricing_table(model, PRICING)
-    }
+	fn supports_model(&self, model: &str) -> bool {
+		// Z.ai (GLM) models - check against pricing table (strict)
+		is_model_in_pricing_table(model, PRICING)
+	}
 
-    fn supported_sampling_params(&self, _model: &str) -> SamplingSupport {
-        // Z.ai supports temperature and top_p, not top_k
-        SamplingSupport::TEMPERATURE_AND_TOP_P
-    }
+	fn get_api_key(&self) -> Result<String> {
+		env::var(ZAI_API_KEY_ENV).map_err(|_| crate::errors::missing_api_key("zai", ZAI_API_KEY_ENV).into())
+	}
+	/// Z.AI documents that historical `reasoning_content` must be returned
+	/// unmodified (Preserved Thinking); `convert_messages` replays every turn.
+	fn replays_thinking(&self, _model: &str) -> bool {
+		true
+	}
 
-    fn get_api_key(&self) -> Result<String> {
-        env::var(ZAI_API_KEY_ENV)
-            .map_err(|_| anyhow::anyhow!("{} not found in environment", ZAI_API_KEY_ENV))
-    }
-    fn supports_caching(&self, _model: &str) -> bool {
-        true // Z.ai supports prompt caching
-    }
+	/// Automatic prefix cache; the docs state no TTL ("reasonable time limits").
+	/// Measured 2026-11-07 on glm-5.3 (coding plan endpoint): unique ~8k-token
+	/// prompts re-sent once after an idle delay hit in full on 54 of 54 calls,
+	/// with delays from 5s to 60m. The cache outlives 60m of silence; the upper
+	/// bound is not measured.
+	fn supports_caching(&self, _model: &str) -> bool {
+		true
+	}
 
-    fn supports_vision(&self, model: &str) -> bool {
-        let normalized = normalize_model_name(model);
-        normalized.contains("glm-5.3-flash") // natively multimodal GLM-5
+	/// The idle gap measured to still hit; see `supports_caching`.
+	fn cache_lifetime(&self, _model: &str, _use_long_cache: bool) -> Option<std::time::Duration> {
+		Some(crate::llm::config::CacheTTL::long().to_duration())
+	}
+
+	fn supports_vision(&self, model: &str) -> bool {
+		let normalized = normalize_model_name(model);
+		normalized.contains("glm-5.4") // video/image/text/file input per the GLM-5.4 guide; image verified live
+            || normalized.contains("glm-5.3-flash") // GLM-5.3-Flash / FlashX, natively multimodal
             || normalized.contains("glm-5v")
             || normalized.contains("glm-4.6v")
             || normalized.contains("glm-4.5v")
             || normalized.contains("glm-ocr")
-    }
+	}
 
-    fn supports_video(&self, model: &str) -> bool {
-        normalize_model_name(model).contains("glm-5.3-flash")
-    }
+	fn supports_video(&self, model: &str) -> bool {
+		let normalized = normalize_model_name(model);
+		normalized.contains("glm-5.4") || normalized.contains("glm-5.3-flash")
+	}
 
-    fn supports_structured_output(&self, _model: &str) -> bool {
-        // Z.ai supports JSON mode (`response_format.type = "json_object"`) which
-        // guarantees valid JSON but NOT conformance to a supplied schema.
-        true
-    }
+	fn supports_structured_output(&self, _model: &str) -> bool {
+		// Z.ai supports JSON mode (`response_format.type = "json_object"`) which
+		// guarantees valid JSON but NOT conformance to a supplied schema.
+		true
+	}
 
-    fn enforces_response_schema(&self, _model: &str) -> bool {
-        // Z.ai's native API supports ONLY `json_object` mode — there is no
-        // `json_schema` response_format, so the supplied schema is ignored and
-        // the `Strict` arm in chat_completion downgrades to `json_object`. The
-        // response shape is therefore NOT guaranteed; report false so callers
-        // route to a tolerant parser (same class as DeepSeek).
-        false
-    }
+	fn enforces_response_schema(&self, _model: &str) -> bool {
+		// Z.ai's native API supports ONLY `json_object` mode — there is no
+		// `json_schema` response_format, so the supplied schema is ignored and
+		// the `Strict` arm in chat_completion downgrades to `json_object`. The
+		// response shape is therefore NOT guaranteed; report false so callers
+		// route to a tolerant parser (same class as DeepSeek).
+		false
+	}
 
-    fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
-        let (input_price, output_price, cache_write_price, cache_read_price) =
-            effective_pricing_at(model, std::time::SystemTime::now())?;
+	fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
+		let (input_price, output_price, cache_write_price, cache_read_price) =
+			effective_pricing_at(model, std::time::SystemTime::now())?;
 
-        Some(crate::llm::types::ModelPricing::new(
-            input_price,
-            output_price,
-            cache_write_price,
-            cache_read_price,
-        ))
-    }
+		Some(crate::llm::types::ModelPricing::new(
+			input_price,
+			output_price,
+			cache_write_price,
+			cache_read_price,
+		))
+	}
 
-    fn get_max_input_tokens(&self, model: &str) -> usize {
-        // Z.ai model context window limits (case-insensitive)
-        let model_lower = normalize_model_name(model);
-        if model_lower.contains("glm-5.3") {
-            1_000_000 // 1M context window for GLM-5.3 and GLM-5.3-Flash
-        } else if model_lower.contains("glm-5.2") || model_lower.contains("glm-5.1") {
-            200_000 // 200K context window for GLM-5.1/5.2
-        } else if model_lower.contains("glm-5") {
-            128_000 // 128K context window for GLM-5
-        } else if model_lower.contains("glm-4.7") {
-            200_000 // 200K context window for GLM-4.7
-        } else if model_lower.contains("glm-4.6") {
-            128_000 // 128K context window for GLM-4.6
-        } else if model_lower.contains("glm-4.5") {
-            131_072 // ~128K context window for GLM-4.5
-        } else {
-            128_000 // Default context window
-        }
-    }
+	fn get_max_input_tokens(&self, model: &str) -> usize {
+		// Z.ai model context window limits (case-insensitive), per
+		// https://docs.z.ai/guides/overview/overview (verified Oct 2, 2026)
+		let model_lower = normalize_model_name(model);
+		if model_lower.contains("glm-5.4") || model_lower.contains("glm-5.3") || model_lower.contains("glm-5.2") {
+			1_000_000 // 1M for GLM-5.4, GLM-5.3 (incl. Flash/FlashX) and GLM-5.2
+		} else if model_lower.contains("glm-5") || model_lower.contains("glm-4.7") {
+			200_000 // 200K for GLM-5 / GLM-5-Turbo, GLM-5.1 and GLM-4.7
+		} else if model_lower.contains("glm-4.5v") {
+			64_000 // 64K for GLM-4.5V
+		} else if model_lower.contains("glm-4.6v") {
+			128_000 // 128K for the GLM-4.6V family
+		} else if model_lower.contains("glm-4.6") || model_lower.contains("glm-4.5-flash") {
+			200_000 // 200K for GLM-4.6 and GLM-4.5-Flash
+		} else if model_lower.contains("glm-4.5") {
+			131_072 // ~128K context window for GLM-4.5
+		} else {
+			128_000 // Default context window
+		}
+	}
 
-    async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
-        let (api_key, api_url) = get_api_key_and_url()?;
+	async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
+		let api_key = shared::resolve_api_key(self, &params)?;
+		let api_url = env::var(ZAI_API_URL_ENV).unwrap_or_else(|_| ZAI_API_URL.to_string());
 
-        // Convert messages to Z.ai format
-        let messages = convert_messages(&params.messages);
+		// Convert messages to Z.ai format
+		let messages = convert_messages(&params.messages);
 
-        // Build request
-        // Z.ai API is strict about floating point precision - convert f32 to f64 and round to 2 decimal places
-        let sampling = self.effective_sampling_params(&params);
-        let temperature = sampling
-            .temperature
-            .map(|t| (t as f64 * 100.0).round() / 100.0);
-        let top_p = sampling.top_p.map(|p| (p as f64 * 100.0).round() / 100.0);
+		let (thinking, reasoning_effort) = thinking_fields(&params.model, params.reasoning_effort);
 
-        let request = ZaiRequest {
-            model: params.model.clone(),
-            messages,
-            do_sample: Some(sampling.temperature.is_some_and(|t| t > 0.0)),
-            temperature,
-            top_p,
-            max_tokens: Some(params.max_tokens),
-            stream: Some(false),
-            stop: None,
-            tools: params.tools.as_ref().map(|t| convert_tools(t)),
-            tool_choice: None,
-            return_messages: Some(true),
-            request_id: None,
-            do_meta: None,
-            web_search: None,
-            response_format: params.response_format.as_ref().map(|so| {
-                let mode_str = match so.mode {
-                    ResponseMode::Auto => "auto",
-                    ResponseMode::Strict => "json_object",
-                };
-                serde_json::json!({
-                    "type": mode_str
-                })
-            }),
-            // Z.ai GLM hybrid thinking models (4.5/4.6/4.7/5.x) accept
-            // `thinking: { "type": "enabled" | "disabled" }`. The API is binary —
-            // there is no budget knob, so any non-None ReasoningEffort enables it.
-            // Models without hybrid thinking (e.g. glm-4-32b, glm-ocr) ignore the field.
-            // GLM-5.3 requires thinking ("disabled" is rejected); omitting the field
-            // uses the API default, which is enabled.
-            thinking: params
-                .reasoning_effort
-                .map(|_| serde_json::json!({ "type": "enabled" })),
-        };
+		let request = ZaiRequest {
+			model: params.model.clone(),
+			messages,
+			// 0 = provider default: omit rather than send a literal zero cap.
+			max_tokens: (params.max_tokens > 0).then_some(params.max_tokens),
+			stream: Some(true),
+			stop: None,
+			tools: params.tools.as_ref().map(|t| convert_tools(t)),
+			tool_choice: None,
+			return_messages: Some(true),
+			request_id: None,
+			do_meta: None,
+			web_search: None,
+			response_format: params.response_format.as_ref().map(|so| {
+				let mode_str = match so.mode {
+					ResponseMode::Auto => "auto",
+					ResponseMode::Strict => "json_object",
+				};
+				serde_json::json!({
+					"type": mode_str
+				})
+			}),
+			thinking,
+			reasoning_effort,
+		};
 
-        // Execute request with retry logic
-        let response = execute_zai_request(
-            api_key,
-            api_url,
-            request,
-            params.max_retries,
-            params.retry_timeout,
-            params.request_timeout,
-            params.cancellation_token.as_ref(),
-            params.extra_headers.clone(),
-        )
-        .await?;
+		// Execute request with retry logic
+		let response = execute_zai_request(
+			api_key,
+			api_url,
+			request,
+			params.max_retries,
+			params.retry_timeout,
+			params.request_timeout,
+			params.stream_timeout,
+			params.cancellation_token.as_ref(),
+			params.extra_headers.clone(),
+			params.api_key.as_ref(),
+			params.retry_observer.as_ref(),
+		)
+		.await?;
 
-        Ok(response)
-    }
+		Ok(response)
+	}
 }
 
 /// Convert generic conversation messages to Z.ai's OpenAI-compatible wire format.
@@ -441,599 +461,390 @@ impl AiProvider for ZaiProvider {
 /// rust/tokio, thinking rose 44k -> 114k tokens and the sequence went from 31.8
 /// to 56.6 minutes for the same 5/5 result.
 fn convert_messages(messages: &[crate::llm::types::Message]) -> Vec<ZaiMessage> {
-    messages
-        .iter()
-        .map(|msg| ZaiMessage {
-            role: msg.role.clone(),
-            content: msg.content.clone(),
-            reasoning_content: msg.thinking.as_ref().map(|t| t.content.clone()),
-            tool_calls: msg.tool_calls.as_ref().map(convert_tool_calls),
-            // Tool results must reference the matching assistant tool call. Without
-            // this field Z.ai cannot associate the returned content with the call.
-            tool_call_id: msg.tool_call_id.clone(),
-        })
-        .collect()
+	let messages = shared::chat_completion_messages(messages);
+	let messages = messages.as_ref();
+	messages
+		.iter()
+		.map(|msg| {
+			// A message with images becomes the OpenAI-compatible content array
+			// Z.ai expects for vision; without it every image was dropped and
+			// GLM-5.3-Flash answered as if it saw nothing. Text-only stays a plain
+			// string. (Videos ride their own provider path.)
+			let images = msg.images.as_deref().unwrap_or_default();
+			let content = if images.is_empty() {
+				serde_json::json!(msg.content)
+			} else {
+				let mut parts = vec![serde_json::json!({"type": "text", "text": msg.content})];
+				parts.extend(images.iter().map(|image| {
+					let url = match &image.data {
+						crate::llm::types::ImageData::Base64(data) => {
+							format!("data:{};base64,{}", image.media_type, data)
+						}
+						crate::llm::types::ImageData::Url(u) => u.clone(),
+					};
+					serde_json::json!({"type": "image_url", "image_url": {"url": url}})
+				}));
+				serde_json::json!(parts)
+			};
+			ZaiMessage {
+				role: msg.role.clone(),
+				content: Some(content),
+				reasoning_content: msg.thinking.as_ref().map(|t| t.content.clone()),
+				tool_calls: msg.tool_calls.as_ref().map(convert_tool_calls),
+				// Tool results must reference the matching assistant tool call. Without
+				// this field Z.ai cannot associate the returned content with the call.
+				tool_call_id: msg.tool_call_id.clone(),
+			}
+		})
+		.collect()
 }
 
 /// Convert tool calls from unified format to Z.ai format
 fn convert_tool_calls(tool_calls: &serde_json::Value) -> Vec<ZaiToolCall> {
-    // Parse as GenericToolCall format
-    if let Ok(calls) =
-        serde_json::from_value::<Vec<crate::llm::tool_calls::GenericToolCall>>(tool_calls.clone())
-    {
-        calls
-            .iter()
-            .map(|call| ZaiToolCall {
-                id: call.id.clone(),
-                type_field: "function".to_string(),
-                function: ZaiFunction {
-                    name: call.name.clone(),
-                    // Z.ai expects arguments as a JSON string, not a JSON object (like OpenAI)
-                    arguments: serde_json::to_string(&call.arguments).unwrap_or_default(),
-                },
-            })
-            .collect()
-    } else {
-        vec![]
-    }
+	// Parse as GenericToolCall format
+	if let Ok(calls) = serde_json::from_value::<Vec<crate::llm::tool_calls::GenericToolCall>>(tool_calls.clone()) {
+		calls
+			.iter()
+			.map(|call| ZaiToolCall {
+				id: call.id.clone(),
+				type_field: "function".to_string(),
+				function: ZaiFunction {
+					name: call.name.clone(),
+					// Z.ai expects arguments as a JSON string, not a JSON object (like OpenAI)
+					arguments: serde_json::to_string(&call.arguments).unwrap_or_default(),
+				},
+			})
+			.collect()
+	} else {
+		vec![]
+	}
 }
 
 /// Convert tools to Z.ai format
 fn convert_tools(tools: &[crate::llm::types::FunctionDefinition]) -> serde_json::Value {
-    serde_json::json!(tools
-        .iter()
-        .map(|f| {
-            serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": f.name,
-                    "description": f.description,
-                    "parameters": f.parameters
-                }
-            })
-        })
-        .collect::<Vec<_>>())
-}
-
-/// Get API key and endpoint URL based on available configuration
-/// Returns (api_key, api_url) tuple
-fn get_api_key_and_url() -> Result<(String, String)> {
-    let api_key = env::var(ZAI_API_KEY_ENV)
-        .map_err(|_| anyhow::anyhow!("{} not found in environment", ZAI_API_KEY_ENV))?;
-
-    // Use custom URL if configured, otherwise use default
-    let api_url = env::var(ZAI_API_URL_ENV).unwrap_or_else(|_| ZAI_API_URL.to_string());
-
-    Ok((api_key, api_url))
+	serde_json::json!(tools
+		.iter()
+		.map(|f| {
+			serde_json::json!({
+				"type": "function",
+				"function": {
+					"name": f.name,
+					"description": f.description,
+					"parameters": f.parameters
+				}
+			})
+		})
+		.collect::<Vec<_>>())
 }
 
 /// Execute a single Z.ai HTTP request with retry logic
 #[allow(clippy::too_many_arguments)]
 async fn execute_zai_request(
-    api_key: String,
-    api_url: String,
-    request: ZaiRequest,
-    max_retries: u32,
-    base_timeout: std::time::Duration,
-    request_timeout: Option<std::time::Duration>,
-    cancellation_token: Option<&tokio::sync::watch::Receiver<bool>>,
-    extra_headers: Option<std::collections::HashMap<String, String>>,
+	api_key: String,
+	api_url: String,
+	request: ZaiRequest,
+	max_retries: u32,
+	base_timeout: std::time::Duration,
+	request_timeout: Option<std::time::Duration>,
+	stream_timeout: Option<std::time::Duration>,
+	cancellation_token: Option<&tokio::sync::watch::Receiver<bool>>,
+	extra_headers: Option<std::collections::HashMap<String, String>>,
+	per_call_api_key: Option<&crate::llm::types::PerCallApiKey>,
+	retry_observer: Option<&crate::llm::retry::RetryObserver>,
 ) -> Result<ProviderResponse> {
-    let start_time = std::time::Instant::now();
+	let start_time = std::time::Instant::now();
 
-    let response = retry::retry_with_exponential_backoff(
-        || {
-            let client = shared::http_client();
-            let extra_headers = extra_headers.clone();
-            let api_key = api_key.clone();
-            let api_url = api_url.clone();
-            let request_body = serde_json::to_value(&request).unwrap();
+	let response = retry::retry_provider_request(
+		|| {
+			let client = shared::http_client();
+			let extra_headers = extra_headers.clone();
+			let api_key = api_key.clone();
+			let api_url = api_url.clone();
+			let request_body = serde_json::to_value(&request).unwrap();
 
-            Box::pin(async move {
-                let req = client
-                    .post(&api_url)
-                    .header("Content-Type", "application/json")
-                    .header("Authorization", format!("Bearer {}", api_key))
-                    .json(&request_body);
+			Box::pin(async move {
+				let req = client
+					.post(&api_url)
+					.header("Content-Type", "application/json")
+					.bearer_auth(&api_key)
+					.json(&request_body);
 
-                let captured =
-                    shared::send_and_read(req, request_timeout, extra_headers.as_ref()).await?;
+				let captured = super::streaming::send_and_read(
+					req,
+					request_timeout,
+					stream_timeout,
+					extra_headers.as_ref(),
+					super::streaming::Format::Chat,
+				)
+				.await?;
 
-                // Return Err for retryable HTTP errors so the retry loop catches them
-                if retry::is_retryable_status(captured.status.as_u16()) {
-                    return Err(anyhow::anyhow!(
-                        "Z.ai API error {}: {}",
-                        captured.status,
-                        captured.body
-                    ));
-                }
+				// Return Err for retryable HTTP errors so the retry loop catches them
+				if retry::is_retryable_status(captured.status.as_u16()) {
+					return Err(retry::retryable_status_error(
+						&captured,
+						format!("Z.ai API error {}: {}", captured.status, captured.body),
+					));
+				}
 
-                Ok(captured)
-            })
-        },
-        max_retries,
-        base_timeout,
-        cancellation_token,
-        || ProviderError::Cancelled.into(),
-        |e| {
-            matches!(
-                e.downcast_ref::<ProviderError>(),
-                Some(ProviderError::Cancelled)
-            )
-        },
-        |e: &anyhow::Error| shared::is_connection_error(e),
-    )
-    .await?;
+				Ok(captured)
+			})
+		},
+		max_retries,
+		base_timeout,
+		cancellation_token,
+		per_call_api_key,
+		retry_observer,
+	)
+	.await?;
 
-    let request_time_ms = start_time.elapsed().as_millis() as u64;
+	let request_time_ms = start_time.elapsed().as_millis() as u64;
 
-    if !response.status.is_success() {
-        // Z.ai reports payload rejections (1213/1214) without saying which
-        // message is at fault, and the body is unusable for diagnosis. Log the
-        // role sequence and which optional fields each message carries — no
-        // content, so nothing sensitive is written — so a rejection can be
-        // reproduced from the log instead of re-run under instrumentation.
-        let shape: Vec<String> = request
-            .messages
-            .iter()
-            .map(|m| {
-                let mut f = String::from(m.role.as_str());
-                if m.content.is_empty() {
-                    f.push_str("+empty");
-                }
-                if m.reasoning_content.is_some() {
-                    f.push_str("+reasoning");
-                }
-                if m.tool_calls.is_some() {
-                    f.push_str("+tool_calls");
-                }
-                if m.tool_call_id.is_some() {
-                    f.push_str("+tool_call_id");
-                }
-                f
-            })
-            .collect();
-        tracing::error!(
-            status = %response.status,
-            messages = request.messages.len(),
-            shape = %shape.join(" | "),
-            "Z.ai rejected the request; message shape logged for diagnosis"
-        );
-        return Err(anyhow::anyhow!(
-            "Z.ai API error {}: {}",
-            response.status,
-            response.body
-        ));
-    }
+	if !response.status.is_success() {
+		// Z.ai reports payload rejections (1213/1214) without saying which
+		// message is at fault, and the body is unusable for diagnosis. Log the
+		// role sequence and which optional fields each message carries — no
+		// content, so nothing sensitive is written — so a rejection can be
+		// reproduced from the log instead of re-run under instrumentation.
+		let shape: Vec<String> = request
+			.messages
+			.iter()
+			.map(|m| {
+				let mut f = String::from(m.role.as_str());
+				if m.reasoning_content.is_some() {
+					f.push_str("+reasoning");
+				}
+				if m.tool_calls.is_some() {
+					f.push_str("+tool_calls");
+				}
+				if m.tool_call_id.is_some() {
+					f.push_str("+tool_call_id");
+				}
+				f
+			})
+			.collect();
+		tracing::error!(
+			status = %response.status,
+			messages = request.messages.len(),
+			shape = %shape.join(" | "),
+			"Z.ai rejected the request; message shape logged for diagnosis"
+		);
+		return Err(anyhow::anyhow!("Z.ai API error {}: {}", response.status, response.body));
+	}
 
-    let response_text = response.body;
-    let zai_response: ZaiResponse = serde_json::from_str(&response_text)?;
+	let zai_response: ZaiResponse = shared::parse_response(&response.body, per_call_api_key)?;
 
-    // Extract content and tool calls
-    let raw_content = zai_response
-        .choices
-        .first()
-        .map(|choice| choice.message.content.clone())
-        .unwrap_or_default();
+	// Extract content and tool calls
+	let raw_content = zai_response
+		.choices
+		.first()
+		.and_then(|choice| choice.message.content.as_ref())
+		.and_then(|c| c.as_str())
+		.unwrap_or_default()
+		.to_string();
 
-    // Extract thinking from reasoning_content field first, then fall back to tags
-    let (thinking, content) = extract_thinking(
-        &raw_content,
-        zai_response
-            .choices
-            .first()
-            .and_then(|c| c.message.reasoning_content.clone()),
-    );
+	// Extract thinking from reasoning_content field first, then fall back to tags
+	let (thinking, content) = extract_thinking(
+		&raw_content,
+		zai_response
+			.choices
+			.first()
+			.and_then(|c| c.message.reasoning_content.clone()),
+	);
 
-    let finish_reason = zai_response
-        .choices
-        .first()
-        .and_then(|choice| choice.finish_reason.clone());
+	let finish_reason = zai_response
+		.choices
+		.first()
+		.and_then(|choice| choice.finish_reason.clone());
 
-    // Extract tool calls if present
-    let tool_calls: Option<Vec<ToolCall>> = zai_response.choices.first().and_then(|choice| {
-        choice.message.tool_calls.as_ref().map(|calls| {
-            calls
-                .iter()
-                .map(|tc| {
-                    // Parse the JSON string arguments into a Value
-                    let arguments: serde_json::Value = if tc.function.arguments.trim().is_empty() {
-                        serde_json::json!({})
-                    } else {
-                        serde_json::from_str(&tc.function.arguments).unwrap_or_else(
-                            |_| serde_json::json!({"raw_arguments": tc.function.arguments}),
-                        )
-                    };
+	// Extract tool calls if present
+	let tool_calls: Option<Vec<ToolCall>> = zai_response.choices.first().and_then(|choice| {
+		choice.message.tool_calls.as_ref().map(|calls| {
+			calls
+				.iter()
+				.map(|tc| {
+					// Parse the JSON string arguments into a Value
+					let arguments: serde_json::Value = if tc.function.arguments.trim().is_empty() {
+						serde_json::json!({})
+					} else {
+						serde_json::from_str(&tc.function.arguments)
+							.unwrap_or_else(|_| serde_json::json!({"raw_arguments": tc.function.arguments}))
+					};
 
-                    ToolCall {
-                        id: tc.id.clone(),
-                        name: tc.function.name.clone(),
-                        arguments,
-                    }
-                })
-                .collect()
-        })
-    });
+					ToolCall {
+						id: tc.id.clone(),
+						name: tc.function.name.clone(),
+						arguments,
+					}
+				})
+				.collect()
+		})
+	});
 
-    // Extract reasoning tokens from thinking block
-    // Z.ai doesn't provide reasoning_tokens in usage response, so we estimate from thinking content length
-    let reasoning_tokens = thinking.as_ref().map(|t| t.tokens).unwrap_or(0);
+	// Extract reasoning tokens from thinking block
+	// Z.ai doesn't provide reasoning_tokens in usage response, so we estimate from thinking content length
+	let reasoning_tokens = thinking.as_ref().map(|t| t.tokens).unwrap_or(0);
 
-    // Calculate cost
-    let usage = zai_response.usage.as_ref();
-    // Z.ai returns prompt_tokens; this is RAW input and may include cached reads.
-    let input_tokens_raw = usage.map(|u| u.prompt_tokens).unwrap_or(0);
-    let completion_tokens = usage.map(|u| u.completion_tokens).unwrap_or(0);
+	// Calculate cost
+	let usage = zai_response.usage.as_ref();
+	// Z.ai returns prompt_tokens; this is RAW input and may include cached reads.
+	let input_tokens_raw = usage.map(|u| u.prompt_tokens).unwrap_or(0);
+	let completion_tokens = usage.map(|u| u.completion_tokens).unwrap_or(0);
 
-    // Z.ai reports cached_tokens in prompt_tokens_details (these are cache READ tokens)
-    let cache_read_tokens = usage
-        .map(|u| u.prompt_tokens_details.cached_tokens)
-        .unwrap_or(0);
+	// Z.ai reports cached_tokens in prompt_tokens_details (these are cache READ tokens)
+	let cache_read_tokens = usage.map(|u| u.prompt_tokens_details.cached_tokens).unwrap_or(0);
 
-    // Z.ai doesn't expose cache_write separately
-    let cache_write_tokens = 0_u64;
+	// Z.ai doesn't expose cache_write separately
+	let cache_write_tokens = 0_u64;
 
-    // Cost needs regular (non-cached) input split from cache reads.
-    let regular_input_tokens = input_tokens_raw.saturating_sub(cache_read_tokens);
+	// Cost needs regular (non-cached) input split from cache reads.
+	let regular_input_tokens = input_tokens_raw.saturating_sub(cache_read_tokens);
 
-    // Cost is billed on the provider's raw completion counter; the split below
-    // only affects how the counter is reported to consumers.
-    let cost = calculate_cost(
-        zai_response.model.as_str(),
-        regular_input_tokens,
-        cache_read_tokens,
-        completion_tokens,
-    );
+	// Cost is billed on the provider's raw completion counter; the split below
+	// only affects how the counter is reported to consumers.
+	let cost = calculate_cost(
+		zai_response.model.as_str(),
+		regular_input_tokens,
+		cache_read_tokens,
+		completion_tokens,
+	);
 
-    let (output_tokens, reasoning_tokens) =
-        TokenUsage::split_output(completion_tokens, reasoning_tokens);
+	let (output_tokens, reasoning_tokens) = TokenUsage::split_output(completion_tokens, reasoning_tokens);
 
-    let token_usage = TokenUsage {
-        // CLEAN input tokens - excludes cached reads (as per TokenUsage contract)
-        input_tokens: regular_input_tokens,
-        cache_read_tokens,  // Tokens read from cache
-        cache_write_tokens, // Z.ai doesn't expose this (0)
-        output_tokens,
-        reasoning_tokens, // Estimated from the thinking block, which z.ai bills inside completion_tokens
-        total_tokens: usage.map(|u| u.total_tokens).unwrap_or(0),
-        cost,
-        request_time_ms: Some(request_time_ms),
-    };
+	let token_usage = TokenUsage {
+		// CLEAN input tokens - excludes cached reads (as per TokenUsage contract)
+		input_tokens: regular_input_tokens,
+		cache_read_tokens,  // Tokens read from cache
+		cache_write_tokens, // Z.ai doesn't expose this (0)
+		output_tokens,
+		reasoning_tokens, // Estimated from the thinking block, which z.ai bills inside completion_tokens
+		total_tokens: usage.map(|u| u.total_tokens).unwrap_or(0),
+		cost,
+		request_time_ms: Some(request_time_ms),
+	};
 
-    // Build response JSON for exchange
-    let mut response_json: serde_json::Value = serde_json::from_str(&response_text)?;
+	// Build response JSON for exchange
+	let mut response_json: serde_json::Value = shared::parse_response(&response.body, per_call_api_key)?;
 
-    // Store tool_calls in unified GenericToolCall format for conversation history
-    if let Some(ref calls) = tool_calls {
-        shared::set_response_tool_calls(&mut response_json, calls, None);
-    }
+	// Store tool_calls in unified GenericToolCall format for conversation history
+	if let Some(ref calls) = tool_calls {
+		shared::set_response_tool_calls(&mut response_json, calls, None);
+	}
 
-    // Check for structured output in response
-    let structured_output = extract_structured_output(&response_json);
+	// Check for structured output in response
+	let structured_output = extract_structured_output(&response_json);
 
-    let exchange = ProviderExchange::new(
-        serde_json::to_value(&request).unwrap_or_default(),
-        response_json,
-        Some(token_usage),
-        "zai",
-    );
+	let exchange = ProviderExchange::new(
+		serde_json::to_value(&request).unwrap_or_default(),
+		response_json,
+		Some(token_usage),
+		"zai",
+	);
 
-    Ok(ProviderResponse {
-        content,
-        thinking,
-        exchange,
-        tool_calls,
-        finish_reason,
-        structured_output,
-        id: Some(zai_response.id),
-    })
+	Ok(ProviderResponse {
+		content,
+		thinking,
+		exchange,
+		tool_calls,
+		finish_reason,
+		structured_output,
+		id: Some(zai_response.id),
+	})
 }
 
 /// Extract structured output from response if present
 fn extract_structured_output(response: &serde_json::Value) -> Option<serde_json::Value> {
-    // Z.ai may return structured output in the message content as JSON
-    // Check if content is a JSON object
-    if let Some(content) = response["choices"]
-        .get(0)
-        .and_then(|c| c["message"]["content"].as_str())
-    {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
-            if json.is_object()
-                && (json.get("properties").is_some() || json.get("$schema").is_some())
-            {
-                return Some(json);
-            }
-        }
-    }
-    None
+	// Z.ai may return structured output in the message content as JSON
+	// Check if content is a JSON object
+	if let Some(content) = response["choices"]
+		.get(0)
+		.and_then(|c| c["message"]["content"].as_str())
+	{
+		if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
+			if json.is_object() && (json.get("properties").is_some() || json.get("$schema").is_some()) {
+				return Some(json);
+			}
+		}
+	}
+	None
+}
+
+/// Z.ai `reasoning_effort` (chat-completion reference, Sep 2026): supported by
+/// GLM-5.2 and above, default `max`. GLM-5.2 maps `low`/`medium` to `high` and
+/// `xhigh` to `max` itself, so the caller's level is forwarded. GLM-5.3 and
+/// GLM-5.3-Flash accept only `low|high|max` — verified live: `medium` and
+/// `xhigh` return 400 "please use low, high, or max". Intermediate levels floor
+/// to the next supported one, matching the K3 handling in `opencode`. GLM-5.4
+/// accepted all five levels live (Coding Plan endpoint, Nov 23, 2026), so it
+/// keeps the caller's level. Older models ignore the field (glm-5.1 and
+/// glm-4.7 returned 200 with it set).
+fn reasoning_effort_value(model: &str, effort: ReasoningEffort) -> &'static str {
+	let glm_5_3 = normalize_model_name(model).contains("glm-5.3");
+	match effort {
+		// Callers filter None out before asking for a level.
+		ReasoningEffort::None | ReasoningEffort::Low => "low",
+		ReasoningEffort::Medium if glm_5_3 => "low",
+		ReasoningEffort::Medium => "medium",
+		ReasoningEffort::High => "high",
+		ReasoningEffort::XHigh if glm_5_3 => "high",
+		ReasoningEffort::XHigh => "xhigh",
+		ReasoningEffort::Max => "max",
+	}
+}
+
+/// Z.ai `thinking` and `reasoning_effort` for a requested effort. GLM hybrid
+/// thinking models (4.5/4.6/4.7/5.x) accept `thinking: { "type": "enabled" |
+/// "disabled" }`; any non-None effort enables it and the level goes through
+/// `reasoning_effort`. Models without hybrid thinking (e.g. glm-4-32b, glm-ocr)
+/// ignore the field.
+fn thinking_fields(model: &str, effort: Option<ReasoningEffort>) -> (Option<serde_json::Value>, Option<&'static str>) {
+	match effort.map(|effort| shared::supported_reasoning_effort("zai", model, effort)) {
+		Some(ReasoningEffort::None) => (Some(serde_json::json!({ "type": "disabled" })), None),
+		Some(effort) => (
+			Some(serde_json::json!({ "type": "enabled" })),
+			Some(reasoning_effort_value(model, effort)),
+		),
+		None => (None, None),
+	}
 }
 
 /// Extract thinking content from reasoning_content field or <think>...</think> tags
-fn extract_thinking(
-    content: &str,
-    reasoning_content: Option<String>,
-) -> (Option<ThinkingBlock>, String) {
-    // Priority 1: reasoning_content field (new API format for streaming)
-    if let Some(ref thinking_str) = reasoning_content {
-        if !thinking_str.trim().is_empty() {
-            let tokens = (thinking_str.len() / 4) as u64;
-            let thinking = Some(ThinkingBlock {
-                content: thinking_str.clone(),
-                tokens,
-            });
-            return (thinking, content.to_string());
-        }
-    }
+fn extract_thinking(content: &str, reasoning_content: Option<String>) -> (Option<ThinkingBlock>, String) {
+	// Priority 1: reasoning_content field (new API format for streaming)
+	if let Some(ref thinking_str) = reasoning_content {
+		if !thinking_str.trim().is_empty() {
+			let tokens = (thinking_str.len() / 4) as u64;
+			let thinking = Some(ThinkingBlock {
+				content: thinking_str.clone(),
+				tokens,
+			});
+			return (thinking, content.to_string());
+		}
+	}
 
-    // Priority 2: <think>...</think> tags (legacy format)
-    let think_start = "<think>";
-    let think_end = "</think>";
+	// Priority 2: <think>...</think> tags (legacy format)
+	let think_start = "<think>";
+	let think_end = "</think>";
 
-    if let Some(start_idx) = content.find(think_start) {
-        if let Some(end_idx) = content.find(think_end) {
-            let thinking_content = &content[start_idx + think_start.len()..end_idx];
-            let before_think = &content[..start_idx];
-            let after_think = &content[end_idx + think_end.len()..];
-            let clean_content = format!("{}{}", before_think.trim(), after_think.trim())
-                .trim()
-                .to_string();
-            let tokens = (thinking_content.len() / 4) as u64;
-            let thinking = Some(ThinkingBlock {
-                content: thinking_content.to_string(),
-                tokens,
-            });
-            return (thinking, clean_content);
-        }
-    }
+	if let Some(start_idx) = content.find(think_start) {
+		if let Some(end_idx) = content.find(think_end) {
+			let thinking_content = &content[start_idx + think_start.len()..end_idx];
+			let before_think = &content[..start_idx];
+			let after_think = &content[end_idx + think_end.len()..];
+			let clean_content = format!("{}{}", before_think.trim(), after_think.trim())
+				.trim()
+				.to_string();
+			let tokens = (thinking_content.len() / 4) as u64;
+			let thinking = Some(ThinkingBlock {
+				content: thinking_content.to_string(),
+				tokens,
+			});
+			return (thinking, clean_content);
+		}
+	}
 
-    (None, content.to_string())
+	(None, content.to_string())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_tool_call_and_result_round_trip() {
-        use crate::llm::tool_calls::GenericToolCall;
-        use crate::llm::types::Message;
-
-        let tool_calls = serde_json::to_value(vec![GenericToolCall {
-            id: "call_weather".to_string(),
-            name: "get_weather".to_string(),
-            arguments: serde_json::json!({"city": "Bangkok"}),
-            meta: None,
-        }])
-        .unwrap();
-
-        let assistant = Message {
-            tool_calls: Some(tool_calls),
-            ..Message::assistant("")
-        };
-        let tool_result = Message::tool(
-            r#"{"temperature_c":31,"condition":"sunny"}"#,
-            "call_weather",
-            "get_weather",
-        );
-
-        let converted = convert_messages(&[assistant, tool_result]);
-        let serialized = serde_json::to_value(converted).unwrap();
-
-        assert_eq!(serialized[0]["tool_calls"][0]["id"], "call_weather");
-        assert_eq!(
-            serialized[0]["tool_calls"][0]["function"]["arguments"],
-            r#"{"city":"Bangkok"}"#
-        );
-        assert_eq!(serialized[1]["role"], "tool");
-        assert_eq!(serialized[1]["tool_call_id"], "call_weather");
-        assert_eq!(
-            serialized[1]["content"],
-            r#"{"temperature_c":31,"condition":"sunny"}"#
-        );
-        assert!(serialized[1].get("tool_calls_id").is_none());
-    }
-
-    #[test]
-    fn test_model_support() {
-        let provider = ZaiProvider::new();
-        assert!(provider.supports_model("glm-5.1"));
-        assert!(provider.supports_model("glm-5.3"));
-        assert!(provider.supports_model("glm-5.3-flash"));
-        assert!(provider.supports_model("glm-5.1-turbo"));
-        assert!(provider.supports_model("glm-5"));
-        assert!(provider.supports_model("glm-5-turbo"));
-        assert!(provider.supports_model("glm-5v-turbo"));
-        assert!(provider.supports_model("glm-4.7"));
-        assert!(provider.supports_model("glm-4.7-flash"));
-        assert!(provider.supports_model("glm-4.6"));
-        assert!(provider.supports_model("glm-4.5"));
-        // Near-miss rejections: invalid models that contain no pricing entry as a substring
-        assert!(!provider.supports_model("glm5.3-flash"));
-        assert!(!provider.supports_model("glmm-5.3-flash"));
-        // Substring convention: a variant of a known family matches its base entry
-        // (same mechanism that bills glm-4.7-flashx via its own specific-first entry),
-        // so a hypothetical glm-5.3-flashx is accepted at flash pricing until z.ai
-        // ships it with distinct prices and it gets its own entry.
-        assert!(provider.supports_model("glm-5.3-flashx"));
-        // Deprecated models
-        assert!(!provider.supports_model("glm-4"));
-        assert!(!provider.supports_model("glm-4-flash"));
-        assert!(!provider.supports_model("gpt-4"));
-    }
-
-    #[test]
-    fn test_model_support_case_insensitive() {
-        let provider = ZaiProvider::new();
-        // Test uppercase
-        assert!(provider.supports_model("GLM-5-Turbo"));
-        assert!(provider.supports_model("GLM-5.1"));
-        // Test mixed case
-        assert!(provider.supports_model("Glm-4.7"));
-        assert!(provider.supports_model("GLM-4.6"));
-    }
-
-    #[test]
-    fn test_cost_calculation() {
-        // Test GLM-5-Turbo: $1.20 input, $4.00 output
-        let cost = calculate_cost("glm-5-turbo", 1_000_000, 0, 1_000_000);
-        assert!((cost.unwrap() - 5.20).abs() < 0.01); // 1.20 + 4.00
-
-        // Test GLM-5.1: $1.40 input, $4.40 output
-        let cost = calculate_cost("glm-5.1", 1_000_000, 0, 1_000_000);
-        assert!((cost.unwrap() - 5.80).abs() < 0.01); // 1.40 + 4.40
-
-        // Test GLM-5.3: mirrors GLM-5.2 pricing ($1.40 input, $4.40 output)
-        let cost = calculate_cost("glm-5.3", 1_000_000, 0, 1_000_000);
-        assert!((cost.unwrap() - 5.80).abs() < 0.01); // 1.40 + 4.40
-
-        // Test GLM-4.5: $0.60 input, $2.20 output
-        let cost = calculate_cost("glm-4.5", 1_000_000, 0, 1_000_000);
-        assert!((cost.unwrap() - 2.80).abs() < 0.01); // 0.60 + 2.20
-
-        // Test GLM-4.7: $0.60 input, $2.20 output
-        let cost = calculate_cost("glm-4.7", 1_000_000, 0, 1_000_000);
-        assert!((cost.unwrap() - 2.80).abs() < 0.01); // 0.60 + 2.20
-
-        // Test GLM-4.7-flash: free model
-        let cost = calculate_cost("glm-4.7-flash", 1_000_000, 0, 1_000_000);
-        assert_eq!(cost.unwrap(), 0.0);
-    }
-
-    #[test]
-    fn glm_5_3_flash_promo_switches_to_list_price_at_documented_cutoff() {
-        use std::time::{Duration, SystemTime};
-
-        let before =
-            SystemTime::UNIX_EPOCH + Duration::from_secs(GLM_5_3_FLASH_PROMO_END_UNIX_SECS - 1);
-        let promo = calculate_cost_at("glm-5.3-flash", 1_000_000, 0, 1_000_000, before).unwrap();
-        assert!((promo - 0.325).abs() < 0.0001);
-
-        let cutoff =
-            SystemTime::UNIX_EPOCH + Duration::from_secs(GLM_5_3_FLASH_PROMO_END_UNIX_SECS);
-        let list = calculate_cost_at("glm-5.3-flash", 1_000_000, 0, 1_000_000, cutoff).unwrap();
-        assert!((list - 0.65).abs() < 0.0001);
-    }
-
-    #[test]
-    fn test_extract_thinking_from_reasoning_content() {
-        let content = "Final answer";
-        let (thinking, clean) = extract_thinking(content, Some("step by step".to_string()));
-
-        assert_eq!(clean, "Final answer");
-        assert!(thinking.is_some());
-        assert_eq!(thinking.as_ref().unwrap().content, "step by step");
-    }
-
-    #[test]
-    fn test_extract_thinking_from_think_tags() {
-        let content = "before <think>internal reasoning</think> after";
-        let (thinking, clean) = extract_thinking(content, None);
-
-        assert_eq!(clean, "beforeafter");
-        assert!(thinking.is_some());
-        assert_eq!(thinking.as_ref().unwrap().content, "internal reasoning");
-    }
-
-    #[test]
-    fn test_cost_calculation_case_insensitive() {
-        let cost = calculate_cost("GLM-5-TURBO", 1_000_000, 0, 1_000_000);
-        assert!((cost.unwrap() - 5.20).abs() < 0.01);
-
-        let cost = calculate_cost("gLm-4.7-FlAsH", 1_000_000, 0, 1_000_000);
-        assert_eq!(cost.unwrap(), 0.0);
-
-        let cost = calculate_cost("glm-4.5-AIR", 1_000_000, 0, 1_000_000);
-        assert!((cost.unwrap() - 1.30).abs() < 0.01); // 0.20 + 1.10
-    }
-
-    #[test]
-    fn test_cost_with_partial_tokens() {
-        let cost = calculate_cost("glm-4.5", 500_000, 0, 500_000);
-        assert!((cost.unwrap() - 1.40).abs() < 0.01); // 0.60 * 0.5 + 2.20 * 0.5
-    }
-
-    #[test]
-    fn test_unknown_model() {
-        let cost = calculate_cost("unknown-model", 1_000_000, 0, 1_000_000);
-        assert_eq!(cost, None);
-
-        // Deprecated models should return None
-        let cost = calculate_cost("glm-4", 1_000_000, 0, 1_000_000);
-        assert_eq!(cost, None);
-    }
-
-    #[test]
-    fn test_cost_with_cache_read_tokens() {
-        // GLM-4.7 pricing: input 0.60, cache_read 0.11, output 2.20
-        // regular_input=100K => 0.06
-        // cache_read=200K => 0.022
-        // output=100K => 0.22
-        // total => 0.302
-        let cost = calculate_cost("glm-4.7", 100_000, 200_000, 100_000).unwrap();
-        assert!((cost - 0.302).abs() < 0.0001);
-    }
-
-    #[test]
-    fn historical_reasoning_is_preserved_for_zai() {
-        use crate::llm::types::{Message, ThinkingBlock};
-        let think = |c: &str| ThinkingBlock {
-            content: c.to_string(),
-            tokens: 0,
-        };
-        let mut older = Message::assistant("older");
-        older.thinking = Some(think("old reasoning"));
-        let mut newer = Message::assistant("newer");
-        newer.thinking = Some(think("current reasoning"));
-
-        let out = serde_json::to_value(convert_messages(&[
-            Message::user("go"),
-            older,
-            Message::user("again"),
-            newer,
-        ]))
-        .unwrap();
-
-        // Z.ai requires the complete unmodified reasoning history back: dropping
-        // it to save context breaks the chain and the model re-derives.
-        assert_eq!(out[1]["reasoning_content"], "old reasoning");
-        assert_eq!(out[3]["reasoning_content"], "current reasoning");
-    }
-
-    #[test]
-    fn test_zai_usage_deserialize_prompt_tokens_shape() {
-        let parsed: ZaiUsage = serde_json::from_value(serde_json::json!({
-            "prompt_tokens": 173,
-            "completion_tokens": 104,
-            "total_tokens": 277,
-            "prompt_tokens_details": { "cached_tokens": 43 }
-        }))
-        .expect("prompt_tokens shape should deserialize");
-        assert_eq!(parsed.prompt_tokens, 173);
-        assert_eq!(parsed.prompt_tokens_details.cached_tokens, 43);
-    }
-
-    #[test]
-    fn test_provider_capabilities() {
-        let provider = ZaiProvider::new();
-        assert!(provider.supports_caching("glm-4.7"));
-        assert!(provider.supports_structured_output("glm-4.7"));
-        // json_object only — schema is NOT enforced (no json_schema response_format)
-        assert!(!provider.enforces_response_schema("glm-4.7"));
-        // Vision models
-        assert!(provider.supports_vision("glm-5v-turbo"));
-        assert!(provider.supports_vision("glm-4.6v"));
-        assert!(provider.supports_vision("glm-4.6v-flash"));
-        assert!(provider.supports_vision("glm-4.5v"));
-        assert!(provider.supports_vision("glm-ocr"));
-        // GLM-5.3-Flash: native image/video input; both 5.3 variants have 1M context.
-        assert!(provider.supports_vision("glm-5.3-flash"));
-        assert!(provider.supports_video("glm-5.3-flash"));
-        assert_eq!(provider.get_max_input_tokens("glm-5.3-flash"), 1_000_000);
-        assert_eq!(provider.get_max_input_tokens("glm-5.3"), 1_000_000);
-        // Non-vision models
-        assert!(!provider.supports_vision("glm-5.1"));
-        assert!(!provider.supports_vision("glm-5-turbo"));
-        assert!(!provider.supports_vision("glm-5"));
-        assert!(!provider.supports_vision("glm-4.7"));
-    }
-}
+#[path = "zai_tests.rs"]
+mod tests;

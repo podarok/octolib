@@ -22,7 +22,7 @@
 //! workspace deployments use a different host — override `ALIBABA_API_URL`
 //! with the full endpoint including `/chat/completions`.
 //!
-//! PRICING UPDATE: August 2026
+//! PRICING UPDATE: September 2026
 //! Source: <https://www.alibabacloud.com/help/en/model-studio/model-pricing>
 //!
 //! Configuration:
@@ -30,14 +30,11 @@
 //! - `ALIBABA_API_URL`: Optional endpoint override (Token Plan, China, workspace)
 
 use crate::llm::providers::openai_compat::{
-    chat_completion as openai_compat_chat_completion, get_api_url, OpenAiCompatConfig,
+	chat_completion as openai_compat_chat_completion, get_api_url, OpenAiCompatConfig,
 };
-use crate::llm::providers::shared::parse_structured_output_from_text;
 use crate::llm::traits::AiProvider;
-use crate::llm::types::{
-    ChatCompletionParams, Message, OutputFormat, ProviderResponse, StructuredOutputRequest,
-};
-use crate::llm::utils::{normalize_model_name, PricingTuple};
+use crate::llm::types::{ChatCompletionParams, ProviderResponse};
+use crate::llm::utils::{contains_ignore_ascii_case, normalize_model_name, PricingTuple};
 use anyhow::Result;
 use std::env;
 
@@ -46,506 +43,332 @@ use std::env;
 pub struct AlibabaProvider;
 
 impl Default for AlibabaProvider {
-    fn default() -> Self {
-        Self::new()
-    }
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 impl AlibabaProvider {
-    pub fn new() -> Self {
-        Self
-    }
+	pub fn new() -> Self {
+		Self
+	}
 }
 
-const ALIBABA_API_KEY_ENV: &str = "ALIBABA_API_KEY";
+pub(crate) const ALIBABA_API_KEY_ENV: &str = "ALIBABA_API_KEY";
 const ALIBABA_API_URL_ENV: &str = "ALIBABA_API_URL";
-const ALIBABA_API_URL: &str =
-    "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions";
+const ALIBABA_API_URL: &str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions";
 
-// Model Studio international pricing (per 1M tokens in USD) - Aug 2026
-// Source: https://www.alibabacloud.com/help/en/model-studio/model-pricing
+// Model Studio international pricing (per 1M tokens in USD) - Oct 2026; rows added
+// since carry their own date.
+// Source: https://www.alibabacloud.com/help/en/model-studio/model-pricing plus the
+// per-model pages linked from https://www.alibabacloud.com/help/en/model-studio/models
 // Format: (model, input, output, cache_write, cache_read)
-// Context caching is implicit: writes bill at the input rate, hits at cache_read.
-// Tiered models are priced at the 0-256K tier; longer contexts bill up to 4x more.
-// Except for qwen3.8-max's separately published $0.25 rate and DeepSeek V4 Pro,
-// implicit cache hits cost 20% of uncached input.
-const PRICING: &[PricingTuple] = &[
-    ("qwen3.8-max", 2.00, 6.00, 2.00, 0.25),
-    ("qwen3.8-flash", 0.113, 0.382, 0.113, 0.0226),
-    // Dated Qwen 3.7 snapshots retain list price; moving aliases have current promos.
-    ("qwen3.7-max-2026-06-08", 2.50, 7.50, 2.50, 0.50),
-    ("qwen3.7-max-2026-05-20", 2.50, 7.50, 2.50, 0.50),
-    ("qwen3.7-max-2026-05-17", 2.50, 7.50, 2.50, 0.50),
-    ("qwen3.7-max-preview", 2.50, 7.50, 2.50, 0.50),
-    ("qwen3.7-max", 1.25, 3.75, 1.25, 0.25),
-    ("qwen3.7-plus-2026-05-26", 0.40, 1.60, 0.40, 0.08),
-    ("qwen3.7-plus", 0.32, 1.28, 0.32, 0.064),
-    ("qwen3.6-plus", 0.50, 3.00, 0.50, 0.10),
-    ("qwen3.6-flash", 0.25, 1.50, 0.25, 0.05),
-    ("qwen3.5-flash", 0.10, 0.40, 0.10, 0.02),
-    ("qwen3-coder-plus", 1.00, 5.00, 1.00, 0.20),
-    ("qwen3-coder-flash", 0.30, 1.50, 0.30, 0.06),
-    ("qwen3-vl-plus", 0.20, 1.60, 0.20, 0.04),
-    ("qwen-max", 1.60, 6.40, 1.60, 0.32),
-    ("qwen-plus", 0.40, 1.20, 0.40, 0.08),
-    ("qwen-turbo", 0.05, 0.20, 0.05, 0.01),
-    // Third-party models resold by Model Studio at Alibaba's own rates
-    ("deepseek-v4-pro", 2.40, 4.80, 2.40, 0.24),
-    ("deepseek-v4-flash", 0.20, 0.40, 0.20, 0.04),
-    ("glm-5.2", 1.40, 4.40, 1.40, 0.28),
+// List prices only; limited-time promotions are not tracked.
+// Context caching is implicit: writes bill at the input rate, hits at cache_read
+// (the published implicit cache-hit rate, or the explicit cache-read rate when
+// that is the only one published). Models without context caching bill hits at
+// the input rate.
+// Tiered models are priced at their lowest tier; longer prompts bill up to 4x more.
+// Busy/idle models are priced at the busy rate (idle is half). Hybrid-thinking
+// open-weight models are priced at the non-thinking output rate.
+pub(crate) const PRICING: &[PricingTuple] = &[
+	// Model page, Nov 2026.
+	("qwen4-max", 1.50, 4.50, 1.50, 0.075),
+	// The 0902 snapshot is listed at the moving alias's rates.
+	("qwen3.8-max-0902", 2.00, 6.00, 2.00, 0.25),
+	("qwen3.8-max", 2.00, 6.00, 2.00, 0.25),
+	("qwen3.8-flash", 0.15, 0.47, 0.15, 0.016),
+	("qwen3.8-omni-flash", 0.15, 0.47, 0.15, 0.016),
+	("qwen3.7-max", 2.50, 7.50, 2.50, 0.50),
+	("qwen3.7-plus", 0.40, 1.60, 0.40, 0.08),
+	("qwen3.7-flash", 0.03, 0.13, 0.03, 0.006),
+	("qwen3.6-max-preview", 1.30, 7.80, 1.30, 0.13),
+	// Explicit cache only (10% hit rate); not on the international implicit list.
+	("qwen3.6-plus", 0.50, 3.00, 0.50, 0.05),
+	("qwen3.6-flash", 0.25, 1.50, 0.25, 0.025),
+	("qwen3.5-plus", 0.40, 2.40, 0.40, 0.04),
+	// Qwen3.5-Omni-Plus: text/image/video input at $1.40 and text output at
+	// $8.30 (international list price). Audio input ($11.00) and text-and-audio
+	// output ($44.00) are not representable in a single-rate row, so the text
+	// rates are used. Context caching is unsupported, so cache hits bill at
+	// the input rate.
+	("qwen3.5-omni-plus", 1.40, 8.30, 1.40, 1.40),
+	// Qwen3.5-Omni-Flash: text/image/video input at $0.40 and text output at
+	// $2.20 (international list price). Audio input ($3.00) and text-and-audio
+	// output ($11.90) are not representable in a single-rate row, so the text
+	// rates are used. Context caching is unsupported, so cache hits bill at
+	// the input rate.
+	("qwen3.5-omni-flash", 0.40, 2.20, 0.40, 0.40),
+	// Qwen3-Omni-Flash: text input at $0.43 and text output after text-only
+	// input at $1.66 (international list price). Image/video input ($0.78),
+	// audio input ($3.81) and text output after multimodal input ($3.06) are
+	// not representable in a single-rate row, so the text rates are used. Not
+	// on the implicit-cache list, so cache hits bill at the input rate.
+	("qwen3-omni-flash", 0.43, 1.66, 0.43, 0.43),
+	("qwen3.5-flash", 0.10, 0.40, 0.10, 0.01),
+	("qwen3-coder-plus", 1.00, 5.00, 1.00, 0.20),
+	("qwen3-coder-flash", 0.30, 1.50, 0.30, 0.06),
+	("qwen3-coder-next", 0.30, 1.50, 0.30, 0.30),
+	("qwen3-coder-480b-a35b-instruct", 1.50, 7.50, 1.50, 1.50),
+	("qwen3-coder-30b-a3b-instruct", 0.45, 2.25, 0.45, 0.45),
+	("qwen3-vl-plus", 0.20, 1.60, 0.20, 0.04),
+	("qwen3-vl-flash", 0.05, 0.40, 0.05, 0.01),
+	("qwen3-vl-235b-a22b-thinking", 0.40, 4.00, 0.40, 0.40),
+	("qwen3-vl-235b-a22b-instruct", 0.40, 1.60, 0.40, 0.40),
+	("qwen3-max", 1.20, 6.00, 1.20, 0.24),
+	("qwen-vl-max", 0.80, 3.20, 0.80, 0.16),
+	("qwen-max", 1.60, 6.40, 1.60, 0.32),
+	// Must precede qwen-plus; covers qwen-plus-character-ja too.
+	("qwen-plus-character", 0.50, 1.40, 0.50, 0.10),
+	("qwen-plus", 0.40, 1.20, 0.40, 0.08),
+	("qwen-flash", 0.05, 0.40, 0.05, 0.01),
+	("qwen-turbo", 0.05, 0.20, 0.05, 0.01),
+	// Open-weight Qwen checkpoints; the 3.5/3.6 ones have no context caching.
+	("qwen3.8-2.4t-a95b", 2.00, 6.00, 2.00, 0.25),
+	("qwen3.8-27b", 0.50, 3.00, 0.50, 0.10),
+	("qwen3.6-35b-a3b", 0.375, 2.25, 0.375, 0.375),
+	("qwen3.6-27b", 0.60, 3.60, 0.60, 0.60),
+	("qwen3.5-397b-a17b", 0.60, 3.60, 0.60, 0.60),
+	("qwen3.5-122b-a10b", 0.40, 3.20, 0.40, 0.40),
+	("qwen3.5-35b-a3b", 0.25, 2.00, 0.25, 0.25),
+	("qwen3.5-27b", 0.30, 2.40, 0.30, 0.30),
+	("qwen3-235b-a22b-thinking-2507", 0.23, 2.30, 0.23, 0.23),
+	("qwen3-235b-a22b-instruct-2507", 0.23, 0.92, 0.23, 0.23),
+	("qwen3-235b-a22b", 0.70, 2.80, 0.70, 0.70),
+	("qwen3-32b", 0.16, 0.64, 0.16, 0.16),
+	("qwen3-8b", 0.18, 0.70, 0.18, 0.18),
+	// Third-party models resold by Model Studio at Alibaba's own rates.
+	// V4.1 Flash and the dated V4 snapshots bill busy/idle; the moving V4
+	// aliases have flat rates. V4.1 Flash cache hits bill a fixed $0.006 at
+	// busy hours ($0.003 idle), the same in every region.
+	("deepseek-v4.1-flash", 0.30, 1.20, 0.30, 0.006),
+	("deepseek-v4-pro-0813", 1.32, 3.96, 1.32, 0.132),
+	("deepseek-v4-pro", 2.40, 4.80, 2.40, 0.20),
+	("deepseek-v4-flash-0731", 0.44, 1.32, 0.44, 0.044),
+	("deepseek-v4-flash", 0.20, 0.40, 0.20, 0.04),
+	("deepseek-v3.2", 0.57, 1.71, 0.57, 0.114),
+	// GLM cache hits bill 20% of input in Singapore (glm-5.1: 18.57%).
+	// Prime bills 2x glm-5.3 and must precede it.
+	("glm-5.3-prime", 2.80, 8.80, 2.80, 0.56),
+	("glm-5.3", 1.40, 4.40, 1.40, 0.28),
+	// Must precede glm-5.2.
+	("glm-5.2-fast-preview", 2.80, 8.80, 2.80, 0.56),
+	("glm-5.2", 1.40, 4.40, 1.40, 0.28),
+	("glm-5.1", 1.40, 4.40, 1.40, 0.26),
+	// Published cached-input rate, not the 20% default; must precede kimi-k3.
+	("kimi-k3.1-pro", 2.00, 10.00, 2.00, 0.20),
+	("kimi-k3", 3.00, 15.00, 3.00, 0.60),
+	("kimi-k2.7-code", 0.95, 4.00, 0.95, 0.19),
+	// Macaron models from `mindlab` (model pages, Nov 2026): pay-as-you-go in
+	// Singapore only. One published cache rate covers implicit and explicit hits.
+	("macaron-v1.1-coding-venti", 1.19, 3.74, 1.19, 0.22),
+	("macaron-v1.1-venti", 1.19, 3.74, 1.19, 0.22),
+	("macaron-v1-tall", 0.45, 2.60, 0.45, 0.08),
 ];
 
 const QWEN_PLUS_LONG_CONTEXT_THRESHOLD: u64 = 256_000;
 
+// Implicit context cache lifetimes. Model Studio gives the implicit cache "no fixed
+// validity period" (<https://www.alibabacloud.com/help/en/model-studio/context-cache>);
+// its documented 5-minute validity covers only the explicit `cache_control` cache, which
+// octolib does not send. Measured 2026-11-07 on the Token Plan endpoint
+// (token-plan.ap-southeast-1): unique 3.5k-12k-token prompts re-sent once after an idle
+// delay, two samples per delay.
+// - deepseek-v4.1-flash: every sample hit up to 30m, both missed at 45m and 60m.
+// - qwen3.8-max: every sample hit up to 30m, the longest delay tried.
+// - glm-5.3, qwen3.8-flash: every sample hit up to 10m. At 15m qwen3.8-flash missed both
+//   and glm-5.3 one of two; later hits on qwen3.8-flash (30m, one at 60m) came after
+//   misses, so they are routing, not a longer lifetime.
+// - qwen3.7-plus: hits at 30s and 45s, 3 of 4 at 60s, none from 65s to 60m.
+// - qwen4-max (measured 2026-11-17, same endpoint and method, ~8k-token prompts): every
+//   sample hit at each delay from 1m to 60m, the longest tried.
+const MEASURED_CACHE_LIFETIMES: &[(&str, std::time::Duration)] = &[
+	("deepseek-v4.1-flash", std::time::Duration::from_secs(30 * 60)),
+	("glm-5.3", std::time::Duration::from_secs(10 * 60)),
+	("qwen3.8-flash", std::time::Duration::from_secs(10 * 60)),
+	("qwen3.8-max", std::time::Duration::from_secs(30 * 60)),
+	("qwen4-max", std::time::Duration::from_secs(60 * 60)),
+];
+// About a minute is too short for a keepalive or an idle compaction to pay off.
+const SHORT_CACHE_MODELS: &[&str] = &["qwen3.7-plus"];
+// Assumed for models not measured yet.
+const UNMEASURED_CACHE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 fn calculate_local_usage_cost(
-    model: &str,
-    input_tokens: u64,
-    cache_write_tokens: u64,
-    cache_read_tokens: u64,
-    output_tokens: u64,
+	model: &str,
+	input_tokens: u64,
+	cache_write_tokens: u64,
+	cache_read_tokens: u64,
+	output_tokens: u64,
 ) -> Option<f64> {
-    let (mut input, mut output, mut cache_write, mut cache_read) =
-        crate::llm::utils::get_model_pricing(model, PRICING)?;
-    let total_input_tokens = input_tokens
-        .saturating_add(cache_write_tokens)
-        .saturating_add(cache_read_tokens);
+	let (mut input, mut output, mut cache_write, mut cache_read) =
+		crate::llm::utils::get_model_pricing(model, PRICING)?;
+	let total_input_tokens = input_tokens
+		.saturating_add(cache_write_tokens)
+		.saturating_add(cache_read_tokens);
 
-    if normalize_model_name(model).contains("qwen3.7-plus")
-        && total_input_tokens > QWEN_PLUS_LONG_CONTEXT_THRESHOLD
-    {
-        if normalize_model_name(model).contains("qwen3.7-plus-2026-05-26") {
-            // Dated snapshot list-price tier for prompts in (256K, 1M].
-            input = 1.20;
-            output = 4.80;
-            cache_write = 1.20;
-            cache_read = 0.24;
-        } else {
-            // Moving alias: current 20%-off tier for prompts in (256K, 1M].
-            input = 0.96;
-            output = 3.84;
-            cache_write = 0.96;
-            cache_read = 0.192;
-        }
-    }
+	if normalize_model_name(model).contains("qwen3.7-plus") && total_input_tokens > QWEN_PLUS_LONG_CONTEXT_THRESHOLD {
+		// List-price tier for prompts in (256K, 1M].
+		input = 1.20;
+		output = 4.80;
+		cache_write = 1.20;
+		cache_read = 0.24;
+	}
 
-    Some(
-        (input_tokens as f64 / 1_000_000.0) * input
-            + (cache_write_tokens as f64 / 1_000_000.0) * cache_write
-            + (cache_read_tokens as f64 / 1_000_000.0) * cache_read
-            + (output_tokens as f64 / 1_000_000.0) * output,
-    )
+	Some(
+		(input_tokens as f64 / 1_000_000.0) * input
+			+ (cache_write_tokens as f64 / 1_000_000.0) * cache_write
+			+ (cache_read_tokens as f64 / 1_000_000.0) * cache_read
+			+ (output_tokens as f64 / 1_000_000.0) * output,
+	)
 }
 
 #[async_trait::async_trait]
 impl AiProvider for AlibabaProvider {
-    fn name(&self) -> &str {
-        "alibaba"
-    }
+	fn name(&self) -> &str {
+		"alibaba"
+	}
 
-    fn supports_model(&self, model: &str) -> bool {
-        !model.is_empty()
-    }
+	fn supports_model(&self, model: &str) -> bool {
+		!model.is_empty()
+	}
 
-    fn get_api_key(&self) -> Result<String> {
-        env::var(ALIBABA_API_KEY_ENV).map_err(|_| {
-            anyhow::anyhow!(
-                "Alibaba API key not found in environment variable: {}",
-                ALIBABA_API_KEY_ENV
-            )
-        })
-    }
+	fn get_api_key(&self) -> Result<String> {
+		env::var(ALIBABA_API_KEY_ENV).map_err(|_| crate::errors::missing_api_key("alibaba", ALIBABA_API_KEY_ENV).into())
+	}
 
-    fn supports_caching(&self, _model: &str) -> bool {
-        true
-    }
+	fn supports_caching(&self, _model: &str) -> bool {
+		true
+	}
 
-    // supports_vision, supports_video, get_max_input_tokens are resolved via
-    // reference capabilities (trait defaults)
+	/// See `MEASURED_CACHE_LIFETIMES` for the evidence.
+	fn cache_lifetime(&self, model: &str, _use_long_cache: bool) -> Option<std::time::Duration> {
+		if SHORT_CACHE_MODELS
+			.iter()
+			.any(|pattern| contains_ignore_ascii_case(model, pattern))
+		{
+			return None;
+		}
+		let measured = MEASURED_CACHE_LIFETIMES
+			.iter()
+			.find(|(pattern, _)| contains_ignore_ascii_case(model, pattern))
+			.map(|(_, lifetime)| *lifetime);
+		Some(measured.unwrap_or(UNMEASURED_CACHE_LIFETIME))
+	}
 
-    /// Structured output is supported via a provider-side downgrade: DashScope
-    /// compatible-mode maps `json_schema` onto `json_object` (the schema is
-    /// never enforced server-side, and requests whose prompt lacks the word
-    /// "json" are rejected outright). `chat_completion` therefore rewrites
-    /// JsonSchema requests to plain JSON mode, carries the schema in a
-    /// trailing system message, and validates the response client-side.
-    fn supports_structured_output(&self, _model: &str) -> bool {
-        true
-    }
+	/// GLM and qwen4-max read every prior turn's reasoning back (see
+	/// `preserves_historical_thinking`), so it occupies context the model
+	/// reads and bills.
+	fn replays_thinking(&self, model: &str) -> bool {
+		preserves_historical_thinking(model)
+	}
 
-    /// No server-side constrained decoding: the schema rides in the prompt and
-    /// conformance is only checked after the fact (same class as Z.ai/DeepSeek).
-    fn enforces_response_schema(&self, _model: &str) -> bool {
-        false
-    }
+	// supports_vision, supports_video, get_max_input_tokens are resolved via
+	// reference capabilities (trait defaults)
 
-    fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
-        if let Some((input, output, cache_write, cache_read)) =
-            crate::llm::utils::get_model_pricing(model, PRICING)
-        {
-            return Some(crate::llm::types::ModelPricing::new(
-                input,
-                output,
-                cache_write,
-                cache_read,
-            ));
-        }
-        crate::llm::reference_models::get_reference_pricing(model)
-    }
+	/// Alibaba supports native JSON Schema for selected Qwen families. Other
+	/// hosted models use shared forced-tool enforcement plus local validation.
+	fn supports_structured_output(&self, _model: &str) -> bool {
+		true
+	}
 
-    async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
-        let api_key = self.get_api_key()?;
-        let api_url = get_api_url(ALIBABA_API_URL_ENV, ALIBABA_API_URL);
-        let model = params.model.clone();
+	fn enforces_response_schema(&self, model: &str) -> bool {
+		natively_enforces_response_schema(model)
+	}
 
-        // DashScope compatible-mode cannot enforce `json_schema`: it silently
-        // downgrades to `json_object` (schema ignored) and rejects requests
-        // whose prompt lacks the word "json". Rewrite schema requests into
-        // JSON mode + a trailing schema system message, validated client-side.
-        let (params, requested_schema) = downgrade_schema_request(params);
-        let mut response = openai_compat_chat_completion(
-            OpenAiCompatConfig {
-                provider_name: "alibaba",
-                usage_fallback_cost: None,
-                use_response_cost: false,
-            },
-            api_key,
-            api_url,
-            params,
-        )
-        .await?;
+	fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
+		if let Some((input, output, cache_write, cache_read)) = crate::llm::utils::get_model_pricing(model, PRICING) {
+			return Some(crate::llm::types::ModelPricing::new(
+				input,
+				output,
+				cache_write,
+				cache_read,
+			));
+		}
+		crate::llm::reference_models::get_reference_pricing(model)
+	}
 
-        if let Some(ref mut usage) = response.exchange.usage {
-            if usage.cost.is_none() {
-                let input_tokens = usage.input_tokens;
-                let cache_write_tokens = usage.cache_write_tokens;
-                let cache_read_tokens = usage.cache_read_tokens;
-                let output_tokens = usage.billable_output_tokens();
-                usage.cost = calculate_local_usage_cost(
-                    &model,
-                    input_tokens,
-                    cache_write_tokens,
-                    cache_read_tokens,
-                    output_tokens,
-                )
-                .or_else(|| {
-                    self.get_model_pricing(&model).map(|pricing| {
-                        pricing.calculate_cost(
-                            input_tokens,
-                            cache_write_tokens,
-                            cache_read_tokens,
-                            output_tokens,
-                        )
-                    })
-                });
-            }
-        }
+	async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
+		let api_key = super::shared::resolve_api_key(self, &params)?;
+		let api_url = get_api_url(ALIBABA_API_URL_ENV, ALIBABA_API_URL);
+		let model = params.model.clone();
+		let mut response = openai_compat_chat_completion(
+			OpenAiCompatConfig {
+				provider_name: "alibaba",
+				usage_fallback_cost: None,
+				use_response_cost: false,
+				enforces_response_schema: natively_enforces_response_schema(&model),
+				// Thinking-mode tool calls accept only auto/none. Schema repair
+				// therefore uses auto plus explicit prompt guidance and local
+				// validation instead of an unsupported required policy.
+				supports_required_tool_choice: false,
+				supports_parallel_tool_calls: true,
+			},
+			api_key,
+			api_url,
+			params,
+		)
+		.await?;
 
-        if let Some(schema) = requested_schema {
-            enforce_schema_on_response(&mut response, &schema);
-        }
+		if let Some(ref mut usage) = response.exchange.usage {
+			if usage.cost.is_none() {
+				let input_tokens = usage.input_tokens;
+				let cache_write_tokens = usage.cache_write_tokens;
+				let cache_read_tokens = usage.cache_read_tokens;
+				let output_tokens = usage.billable_output_tokens();
+				usage.cost = calculate_local_usage_cost(
+					&model,
+					input_tokens,
+					cache_write_tokens,
+					cache_read_tokens,
+					output_tokens,
+				)
+				.or_else(|| {
+					self.get_model_pricing(&model).map(|pricing| {
+						pricing.calculate_cost(input_tokens, cache_write_tokens, cache_read_tokens, output_tokens)
+					})
+				});
+			}
+		}
 
-        Ok(response)
-    }
+		Ok(response)
+	}
 }
 
-/// Rewrite a `JsonSchema` structured-output request for DashScope's
-/// compatible-mode: plain `json_object` on the wire (schema never sent), with
-/// the schema spelled out in a trailing system message. Returns the schema so
-/// the response can be validated client-side by [`enforce_schema_on_response`].
-fn downgrade_schema_request(
-    mut params: ChatCompletionParams,
-) -> (ChatCompletionParams, Option<serde_json::Value>) {
-    let Some(request) = params.response_format.as_ref() else {
-        return (params, None);
-    };
-    if !matches!(request.format, OutputFormat::JsonSchema) {
-        return (params, None);
-    }
-    let Some(schema) = request.schema.clone() else {
-        return (params, None);
-    };
-
-    params.response_format = Some(StructuredOutputRequest::json());
-    params.messages.push(Message::system(&format!(
-        "Your next reply must be a single JSON object that conforms exactly to this JSON schema — no prose, no markdown fences, no trailing text:\n{schema}"
-    )));
-    (params, Some(schema))
+/// JSON Schema is native only for the Alibaba model families explicitly listed
+/// by Model Studio. Snapshot suffixes inherit their family's capability.
+/// qwen4-max was probed live on the Token Plan endpoint (2026-11-17): a strict
+/// object schema against a prompt asking for a JSON array returned the object
+/// on 5 of 5 calls, 3 with thinking and 2 with `enable_thinking: false`. The
+/// pay-as-you-go endpoint was not probed (no key for it); its model page lists
+/// JSON Schema as supported.
+fn natively_enforces_response_schema(model: &str) -> bool {
+	let model = normalize_model_name(model);
+	[
+		"qwen4-max",
+		"qwen3.8-max",
+		"qwen3.8-flash",
+		"qwen3.7-max",
+		"qwen3.7-plus",
+		"qwen3.7-flash",
+	]
+	.iter()
+	.any(|prefix| model.starts_with(prefix))
 }
 
-/// Best-effort client-side schema enforcement on the final (tool-free)
-/// response: parse the content, validate against the schema, and expose it as
-/// `structured_output`. Violations are logged, never fatal — this provider
-/// does not guarantee schema conformance (`enforces_response_schema` = false).
-fn enforce_schema_on_response(response: &mut ProviderResponse, schema: &serde_json::Value) {
-    // Mid-agent-loop replies (tool calls) are not the final answer; the schema
-    // constrains only the closing text response.
-    if response
-        .tool_calls
-        .as_ref()
-        .is_some_and(|calls| !calls.is_empty())
-    {
-        return;
-    }
-    let Some(value) = response
-        .structured_output
-        .clone()
-        .or_else(|| parse_structured_output_from_text(&response.content))
-    else {
-        tracing::warn!("alibaba structured output: final response is not parseable JSON");
-        return;
-    };
-    match jsonschema::validator_for(schema) {
-        Ok(validator) => match validator.validate(&value) {
-            Ok(()) => {
-                response.content = value.to_string();
-                response.structured_output = Some(value);
-            }
-            Err(err) => tracing::warn!(
-                error = %err,
-                "alibaba structured output: response does not match requested schema"
-            ),
-        },
-        Err(err) => tracing::warn!(
-            error = %err,
-            "alibaba structured output: schema failed to compile"
-        ),
-    }
+/// Model Studio's GLM models keep earlier turns' reasoning in context by
+/// default (`clear_thinking` defaults to false), and Preserved Thinking needs
+/// that `reasoning_content` sent back complete, unmodified and in its original
+/// order. Without it every call starts with none of the model's earlier
+/// reasoning: a glm-5.3 max-effort run re-derived the same plan (20-88k chars)
+/// on every step until it timed out. qwen4-max has `preserve_thinking`
+/// on by default in Chat Completions and asks for all historical thinking back
+/// in `reasoning_content` (model page, Nov 2026). DeepSeek and earlier Qwen
+/// models follow other rules on this host.
+pub(crate) fn preserves_historical_thinking(model: &str) -> bool {
+	contains_ignore_ascii_case(model, "glm") || contains_ignore_ascii_case(model, "qwen4-max")
 }
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_supports_model() {
-        let provider = AlibabaProvider::new();
-        assert!(provider.supports_model("qwen3.8-max"));
-        assert!(provider.supports_model("qwen3-coder-plus"));
-        assert!(!provider.supports_model(""));
-    }
-
-    #[test]
-    fn test_default_capabilities() {
-        let provider = AlibabaProvider::new();
-        assert_eq!(provider.name(), "alibaba");
-        assert!(provider.supports_caching("qwen3.8-max"));
-        // Structured output advertised (downgraded to json_object + prompt
-        // schema + client-side validation), but not natively enforced.
-        assert!(provider.supports_structured_output("qwen3.8-max"));
-        assert!(!provider.enforces_response_schema("qwen3.8-max"));
-        // qwen3.8-max carries a 1M context window via reference capabilities
-        assert_eq!(provider.get_max_input_tokens("qwen3.8-max"), 1_000_000);
-        // Verified live: 3.8-max/3.7-plus/3.6-flash take images and video,
-        // 3.7-max rejects image parts outright
-        assert!(provider.supports_vision("qwen3.8-max"));
-        assert!(provider.supports_vision("qwen3.7-plus"));
-        assert!(provider.supports_vision("qwen3.6-flash"));
-        assert!(provider.supports_video("qwen3.8-max"));
-        assert!(provider.supports_video("qwen3.6-flash"));
-        assert!(!provider.supports_vision("qwen3.7-max"));
-    }
-
-    #[test]
-    fn test_pricing_qwen() {
-        let provider = AlibabaProvider::new();
-
-        let p = provider.get_model_pricing("qwen3.8-max").unwrap();
-        assert_eq!(p.input_price_per_1m, 2.00);
-        assert_eq!(p.output_price_per_1m, 6.00);
-        assert_eq!(p.cache_read_price_per_1m, 0.25);
-
-        // Moving alias currently has a 50% promotion.
-        let p = provider.get_model_pricing("qwen3.7-max").unwrap();
-        assert_eq!(p.input_price_per_1m, 1.25);
-        assert_eq!(p.output_price_per_1m, 3.75);
-
-        // Dated snapshots retain list price.
-        let p = provider
-            .get_model_pricing("qwen3.7-max-2026-06-08")
-            .unwrap();
-        assert_eq!(p.input_price_per_1m, 2.50);
-        assert_eq!(p.output_price_per_1m, 7.50);
-
-        let p = provider.get_model_pricing("qwen3.6-flash").unwrap();
-        assert_eq!(p.input_price_per_1m, 0.25);
-        assert_eq!(p.cache_read_price_per_1m, 0.05);
-
-        // Dated aliases must resolve to their family
-        let p = provider
-            .get_model_pricing("deepseek-v4-flash-0731")
-            .unwrap();
-        assert_eq!(p.input_price_per_1m, 0.20);
-
-        // Unversioned aliases must not shadow more specific entries
-        let p = provider.get_model_pricing("qwen-plus-latest").unwrap();
-        assert_eq!(p.input_price_per_1m, 0.40);
-        assert_eq!(p.output_price_per_1m, 1.20);
-    }
-
-    #[test]
-    fn test_pricing_falls_back_to_reference() {
-        let provider = AlibabaProvider::new();
-        let p = provider.get_model_pricing("qwen3-max-2026-01-25").unwrap();
-        assert!(p.input_price_per_1m > 0.0);
-    }
-
-    #[test]
-    fn test_qwen3_8_flash_pricing() {
-        let provider = AlibabaProvider::new();
-        let p = provider.get_model_pricing("qwen3.8-flash").unwrap();
-        assert_eq!(p.input_price_per_1m, 0.113);
-        assert_eq!(p.output_price_per_1m, 0.382);
-        assert_eq!(p.cache_write_price_per_1m, 0.113);
-        assert_eq!(p.cache_read_price_per_1m, 0.0226);
-    }
-
-    #[test]
-    fn test_cost_calculation() {
-        let provider = AlibabaProvider::new();
-        let pricing = provider.get_model_pricing("qwen3.8-max").unwrap();
-
-        // 1M input + 500K output, no cache
-        let cost = pricing.calculate_cost(1_000_000, 0, 0, 500_000);
-        let expected = 2.00 + 0.5 * 6.00; // $5.00
-        assert!((cost - expected).abs() < 0.001);
-
-        // Cache hits must be cheaper than fresh input
-        let cost_cached = pricing.calculate_cost(500_000, 0, 500_000, 500_000);
-        assert!(cost_cached < cost);
-
-        let long = calculate_local_usage_cost("qwen3.7-plus", 256_001, 0, 0, 100_000).unwrap();
-        let expected_long = 256_001.0 / 1_000_000.0 * 0.96 + 0.1 * 3.84;
-        assert!((long - expected_long).abs() < 0.001);
-
-        let boundary = calculate_local_usage_cost("qwen3.7-plus", 256_000, 0, 0, 100_000).unwrap();
-        let expected_boundary = 0.256 * 0.32 + 0.1 * 1.28;
-        assert!((boundary - expected_boundary).abs() < 0.001);
-
-        let snapshot_long =
-            calculate_local_usage_cost("qwen3.7-plus-2026-05-26", 256_001, 0, 0, 100_000).unwrap();
-        let expected_snapshot = 256_001.0 / 1_000_000.0 * 1.20 + 0.1 * 4.80;
-        assert!((snapshot_long - expected_snapshot).abs() < 0.001);
-    }
-
-    use crate::llm::types::{ProviderExchange, ResponseMode, ToolCall};
-
-    fn schema_request(schema: serde_json::Value) -> ChatCompletionParams {
-        let mut params = ChatCompletionParams::new(
-            &[Message::user("analyze")],
-            "qwen3.8-max",
-            0.3,
-            0.7,
-            20,
-            1024,
-        );
-        params.response_format =
-            Some(StructuredOutputRequest::json_schema(schema).with_strict_mode());
-        params
-    }
-
-    fn test_response(content: &str, tool_calls: Option<Vec<ToolCall>>) -> ProviderResponse {
-        ProviderResponse {
-            content: content.to_string(),
-            thinking: None,
-            exchange: ProviderExchange::new(
-                serde_json::json!({}),
-                serde_json::json!({}),
-                None,
-                "alibaba",
-            ),
-            tool_calls,
-            finish_reason: None,
-            structured_output: None,
-            id: None,
-        }
-    }
-
-    #[test]
-    fn test_downgrade_schema_request_rewrites_json_schema() {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {"verdict": {"type": "string"}},
-            "required": ["verdict"]
-        });
-        let (rewritten, requested) = downgrade_schema_request(schema_request(schema.clone()));
-
-        // Wire format is plain json_object — never json_schema.
-        let wire = rewritten.response_format.expect("json mode on the wire");
-        assert!(matches!(wire.format, OutputFormat::Json));
-        assert!(wire.schema.is_none());
-
-        // Schema rides in a trailing system message that mentions "JSON",
-        // satisfying DashScope's json-in-prompt keyword check.
-        let last = rewritten.messages.last().expect("schema system message");
-        assert_eq!(last.role, "system");
-        assert!(last.content.contains("JSON schema"));
-        assert_eq!(requested.as_ref(), Some(&schema));
-    }
-
-    #[test]
-    fn test_downgrade_schema_request_passthrough() {
-        // Plain JSON mode: untouched.
-        let mut params =
-            ChatCompletionParams::new(&[Message::user("hi")], "qwen3.8-max", 0.3, 0.7, 20, 1024);
-        params.response_format = Some(StructuredOutputRequest::json());
-        let (rewritten, requested) = downgrade_schema_request(params);
-        assert!(matches!(
-            rewritten.response_format.unwrap().format,
-            OutputFormat::Json
-        ));
-        assert_eq!(rewritten.messages.len(), 1);
-        assert!(requested.is_none());
-
-        // JsonSchema without a schema: untouched (nothing to inject).
-        let mut params =
-            ChatCompletionParams::new(&[Message::user("hi")], "qwen3.8-max", 0.3, 0.7, 20, 1024);
-        params.response_format = Some(StructuredOutputRequest {
-            format: OutputFormat::JsonSchema,
-            mode: ResponseMode::Strict,
-            schema: None,
-        });
-        let (rewritten, requested) = downgrade_schema_request(params);
-        assert!(matches!(
-            rewritten.response_format.unwrap().format,
-            OutputFormat::JsonSchema
-        ));
-        assert_eq!(rewritten.messages.len(), 1);
-        assert!(requested.is_none());
-    }
-
-    #[test]
-    fn test_enforce_schema_on_response() {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {"verdict": {"type": "string"}},
-            "required": ["verdict"],
-            "additionalProperties": false
-        });
-
-        // Valid JSON matching the schema → attached as structured_output.
-        let mut response = test_response("{\"verdict\":\"dispatched\"}", None);
-        enforce_schema_on_response(&mut response, &schema);
-        assert_eq!(
-            response.structured_output,
-            Some(serde_json::json!({"verdict": "dispatched"}))
-        );
-
-        // Schema violation → logged and left as-is, never fatal.
-        let mut response = test_response("{\"wrong\": 1}", None);
-        enforce_schema_on_response(&mut response, &schema);
-        assert_eq!(response.structured_output, None);
-        assert_eq!(response.content, "{\"wrong\": 1}");
-
-        // Mid-loop tool-call replies are never rewritten.
-        let mut response = test_response(
-            "ignored",
-            Some(vec![ToolCall {
-                id: "c1".to_string(),
-                name: "read".to_string(),
-                arguments: serde_json::json!({}),
-            }]),
-        );
-        enforce_schema_on_response(&mut response, &schema);
-        assert_eq!(response.structured_output, None);
-        assert_eq!(response.content, "ignored");
-    }
-}
+#[path = "alibaba_tests.rs"]
+mod tests;

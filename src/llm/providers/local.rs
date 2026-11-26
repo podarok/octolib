@@ -25,8 +25,7 @@
 //! - `LOCAL_API_KEY`: Optional API key
 
 use crate::llm::providers::openai_compat::{
-    chat_completion as openai_compat_chat_completion, get_api_url, get_optional_api_key,
-    OpenAiCompatConfig,
+	chat_completion as openai_compat_chat_completion, get_api_url, get_optional_api_key, OpenAiCompatConfig,
 };
 use crate::llm::traits::AiProvider;
 use crate::llm::types::{ChatCompletionParams, ProviderResponse};
@@ -37,122 +36,86 @@ use anyhow::Result;
 pub struct LocalProvider;
 
 impl Default for LocalProvider {
-    fn default() -> Self {
-        Self::new()
-    }
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 impl LocalProvider {
-    pub fn new() -> Self {
-        Self
-    }
+	pub fn new() -> Self {
+		Self
+	}
 }
 
-const LOCAL_API_KEY_ENV: &str = "LOCAL_API_KEY";
+pub(crate) const LOCAL_API_KEY_ENV: &str = "LOCAL_API_KEY";
 const LOCAL_API_URL_ENV: &str = "LOCAL_API_URL";
 const LOCAL_API_URL: &str = "http://localhost:11434/v1/chat/completions";
 
 #[async_trait::async_trait]
 impl AiProvider for LocalProvider {
-    fn name(&self) -> &str {
-        "local"
-    }
+	fn name(&self) -> &str {
+		"local"
+	}
 
-    fn supports_model(&self, model: &str) -> bool {
-        !model.is_empty()
-    }
+	fn supports_model(&self, model: &str) -> bool {
+		!model.is_empty()
+	}
 
-    fn get_api_key(&self) -> Result<String> {
-        Ok(get_optional_api_key(LOCAL_API_KEY_ENV))
-    }
+	fn get_api_key(&self) -> Result<String> {
+		Ok(get_optional_api_key(LOCAL_API_KEY_ENV))
+	}
 
-    fn supports_caching(&self, _model: &str) -> bool {
-        false
-    }
+	fn supports_caching(&self, _model: &str) -> bool {
+		false
+	}
 
-    // supports_vision, supports_video, supports_structured_output, get_max_input_tokens
-    // are resolved via reference capabilities (trait defaults)
+	// supports_vision, supports_video, supports_structured_output, get_max_input_tokens
+	// are resolved via reference capabilities (trait defaults)
 
-    fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
-        // Try reference pricing for cloud-equivalent cost estimation
-        crate::llm::reference_models::get_reference_pricing(model)
-    }
+	fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
+		// Try reference pricing for cloud-equivalent cost estimation
+		crate::llm::reference_models::get_reference_pricing(model)
+	}
 
-    async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
-        let api_key = self.get_api_key()?;
-        let api_url = get_api_url(LOCAL_API_URL_ENV, LOCAL_API_URL);
-        let model = params.model.clone();
+	async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
+		let api_key = super::shared::resolve_api_key(self, &params)?;
+		let api_url = get_api_url(LOCAL_API_URL_ENV, LOCAL_API_URL);
+		let model = params.model.clone();
 
-        let mut response = openai_compat_chat_completion(
-            OpenAiCompatConfig {
-                provider_name: "local",
-                usage_fallback_cost: None,
-                use_response_cost: false,
-            },
-            api_key,
-            api_url,
-            params,
-        )
-        .await?;
+		let mut response = openai_compat_chat_completion(
+			OpenAiCompatConfig {
+				provider_name: "local",
+				usage_fallback_cost: None,
+				use_response_cost: false,
+				enforces_response_schema: false,
+				supports_required_tool_choice: false,
+				supports_parallel_tool_calls: true,
+			},
+			api_key,
+			api_url,
+			params,
+		)
+		.await?;
 
-        // Fill cost from reference pricing for cloud-equivalent estimation
-        if let Some(ref mut usage) = response.exchange.usage {
-            if usage.cost.is_none() {
-                usage.cost = crate::llm::reference_models::calculate_reference_cost(
-                    &model,
-                    usage.input_tokens,
-                    usage.cache_read_tokens,
-                    usage.billable_output_tokens(),
-                );
-            }
-        }
+		// Fill cost from reference pricing for cloud-equivalent estimation
+		if let Some(ref mut usage) = response.exchange.usage {
+			if usage.cost.is_none() {
+				usage.cost = crate::llm::reference_models::calculate_reference_cost(
+					&model,
+					usage.input_tokens,
+					usage.cache_read_tokens,
+					usage.billable_output_tokens(),
+				);
+			}
+		}
 
-        Ok(response)
-    }
+		Ok(response)
+	}
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_supports_model() {
-        let provider = LocalProvider::new();
-
-        assert!(provider.supports_model("llama3.2"));
-        assert!(provider.supports_model("mistral-7b"));
-        assert!(provider.supports_model("gpt4all-j"));
-        assert!(provider.supports_model("any-model-name"));
-        assert!(!provider.supports_model(""));
-    }
-
-    #[test]
-    fn test_get_api_key_optional() {
-        let provider = LocalProvider::new();
-        let result = provider.get_api_key();
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_default_capabilities() {
-        let provider = LocalProvider::new();
-        assert_eq!(provider.name(), "local");
-        assert!(!provider.supports_caching("any-model"));
-    }
-
-    #[test]
-    fn test_capabilities_model_specific() {
-        let provider = LocalProvider::new();
-        // Vision models
-        assert!(provider.supports_vision("llava:latest"));
-        assert!(provider.supports_vision("gemma-3-27b"));
-        // Text-only models
-        assert!(!provider.supports_vision("llama-3.1-8b"));
-        // Structured output
-        assert!(provider.supports_structured_output("llama-3.1-8b"));
-        assert!(!provider.supports_structured_output("mistral-7b"));
-        // Context windows
-        assert_eq!(provider.get_max_input_tokens("llama-3.1-8b"), 131_072);
-        assert_eq!(provider.get_max_input_tokens("mistral-7b"), 32_768);
-    }
-}
+#[path = "local_http_tests.rs"]
+mod http_tests;
+#[cfg(test)]
+#[path = "local_tests.rs"]
+mod tests;

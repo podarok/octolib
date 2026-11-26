@@ -1,32 +1,33 @@
-# Octolib: Self-Sufficient AI Provider Library
+# Octolib
 
+> One `provider:model` string — 31 AI providers, one trait, cost tracking built in.
 
-**© 2026 Muvon Un Limited (Hong Kong)** | [Website](https://muvon.io) | [Product Page](https://octolib.muvon.io)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
+[![Crates.io](https://img.shields.io/crates/v/octolib.svg)](https://crates.io/crates/octolib)
+[![Documentation](https://docs.rs/octolib/badge.svg)](https://docs.rs/octolib)
+[![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fmuvon%2Foctolib%2Fbadges%2Fcoverage.json&style=flat-square)](https://github.com/muvon/octolib/actions/workflows/ci.yml)
+## Overview
 
-## 🚀 Overview
+Octolib is a self-sufficient Rust library for AI providers. One `provider:model` string — `openai:gpt-4o`, `anthropic:claude-opus-5-5`, `ollama:llama3.2` — resolves through `ProviderFactory` to a provider behind the `AiProvider` trait. Switching models is a string change, not a rewrite: the same `chat_completion` call drives OpenAI's Responses API, Anthropic's Messages API, an OpenAI-compatible proxy, or a local Ollama server.
 
-Octolib is a comprehensive, self-sufficient AI provider library that provides a unified, type-safe interface for interacting with multiple AI services. It offers intelligent model selection, robust error handling, and advanced features like cross-provider tool calling and vision support.
+Pricing and capability tables ship inside the crate, so every response reports token usage and USD cost — input, output, cache reads/writes, and reasoning tokens — with zero configuration. The API is `Result`-based end to end with no panics or printing in library code, and API keys are read from environment variables only.
+
+**Contents:** [Features](#-key-features) · [Installation](#-quick-installation) · [Quick Start](#-quick-start) · [Media](#media-generation) · [Evaluation](#evaluation) · [Structured Output](#-structured-output) · [CLI Provider](#-cli-provider-proxy-mode) · [Tool Calling](#-tool-calling) · [Embeddings](#-embedding-generation) · [Reranking](#-document-reranking) · [OAuth](#-oauth-authentication) · [Provider Matrix](#-provider-support-matrix) · [Thinking](#-thinkingreasoning-support) · [Docs](#-complete-documentation) · [Security](#-privacy--security) · [Support](#-support--community) · [License](#-license)
 
 ## ✨ Key Features
-- **🔌 Multi-Provider Support**: OpenAI, Anthropic, xAI, OpenRouter, Cerebras, NVIDIA NIM, Groq, BytePlus, Alibaba Model Studio, Ollama, Together, Featherless, Fireworks, Hetzner, OpenCode Zen/Go, Google Vertex, Google Studio, Amazon, Cloudflare, DeepSeek, MiniMax, Moonshot AI (Kimi), Z.ai, OctoHub, Local, CLI proxies
-- **🛡️ Unified Interface**: Consistent API across different providers
-- **🔍 Intelligent Model Validation**: Strict `provider:model` format parsing with case-insensitive model support
-- **📋 Structured Output**: JSON and JSON Schema support for OpenAI, xAI, OpenRouter, DeepSeek, Together, and Z.ai
-- **💰 Cost Tracking**: Automatic token usage and cost calculation
-- **🖼️ Vision Support**: Image and video attachment handling for vision-capable models
-- **🧰 Tool Calling**: Cross-provider tool call standardization
-- **🧩 CLI Provider**: Use `cli:<backend>/<model>` (e.g. `cli:codex/gpt-5.2-codex`). Proxy-only: tools/MCP are not used or controllable.
-- **⏱️ Retry Management**: Configurable exponential backoff
-- **🔒 Secure Design**: Environment-based API key management
-- **⚙️ Configuration Migration**: Reusable, comment-preserving TOML upgrades with locking, versioned backups, and atomic writes
-- **🎯 Embedding Support**: Multi-provider embedding generation with Jina, Voyage, Google, OpenAI, Together, OctoHub, Local (Ollama, llama.cpp, LM Studio, vLLM), FastEmbed, and HuggingFace
-- **🔄 Reranking**: Document relevance scoring with cross-encoder models (Voyage AI, Cohere, Jina AI, Mixedbread, Local (llama.cpp, vLLM, TEI), HuggingFace)
+
+- **🔌 33 providers, one interface** — OpenAI, Anthropic, xAI, OpenRouter, Google Vertex & Studio, Amazon Bedrock, DeepSeek, Moonshot (Kimi), MiniMax, Z.ai, BytePlus, Alibaba Model Studio, Groq, Cerebras, NVIDIA NIM, Together, Featherless, Fireworks, Hetzner, Inception Labs, Isoquant, Meta, Reflection AI, Tinker, OpenCode Zen/Go, OctoHub, Cloudflare Workers AI, Ollama, WebWright, Local, and CLI proxies (Codex, Claude, Gemini, Cursor)
+- **💰 Cost tracking with zero config** — per-model pricing tables ship in the crate; every response carries input, output, cache, and reasoning tokens with USD cost
+- **🧰 Tool calling** — one `ToolCall` format across providers, with JSON Schema parameter validation and multi-turn conversations
+- **📋 Structured output** — JSON and JSON Schema modes, validated locally even when the upstream doesn't enforce them
+- **🧠 Thinking/reasoning** — reasoning content and token counts surfaced separately from the answer; the `ReasoningEffort` hint maps to each provider's knob
+- **🖼️ Vision & video** — image and video attachments on vision-capable models
+- **🎯 Embeddings & reranking** — Jina, Voyage, Google, OpenAI, OctoHub, plus local FastEmbed and HuggingFace backends
+- **🎬 Media generation** — typed image, video, speech, and transcription APIs with durable jobs and dimensional cost reporting
+- **🧩 CLI proxies** — drive `codex`, `claude`, `gemini`, or `cursor-agent` as a provider via `cli:<backend>/<model>` (prompt-only)
+- **🛡️ Production posture** — `Result` everywhere, exponential-backoff retries, cancellation tokens, and API keys from the environment only
 
 ## 📦 Quick Installation
-
-[![Crates.io](https://img.shields.io/crates/v/octolib.svg)](https://crates.io/crates/octolib)
 
 ```toml
 # From crates.io (recommended) — use the latest version from the badge above
@@ -36,7 +37,26 @@ octolib = "<latest>"
 octolib = { git = "https://github.com/muvon/octolib" }
 ```
 
-Local embedding/reranking (`fastembed`, `huggingface`) is enabled by default. Hardware acceleration is opt-in via features: `metal`, `cuda`, `cudnn`, `mkl`, `accelerate`.
+`websockets` and `terminal` are opt-in. Pick only what you need to cut compile time and dependencies:
+
+| Feature | Module | Pulls in |
+|---|---|---|
+| `llm` | `octolib::llm` — chat completion, tool calling, structured output | `jsonschema`, `jsonwebtoken` |
+| `websockets` (off by default) | WebSocket transport support (implies `llm`; ChatGPT and OctoHub) | `reqwest-websocket`, `futures-util` |
+| `embeddings` | `octolib::embedding` | `tiktoken-rs` |
+| `reranker` | `octolib::reranker` | — |
+| `media` | `octolib::media` — image, video, speech, transcription | `base64` |
+| `evaluation` | `octolib::evaluation` — structured evaluation (TypeSafe Jev, Cloudflare AI Gateway and Clef, Inception Mercury Decide, OpenRouter Decisions, OpenAI Decisions, Ollama decision models) | `base64` |
+| `terminal` (off by default) | `octolib::terminal` — fuzzy list picker and hidden input | `crossterm`, `fuzzy-matcher` |
+| `fastembed` | local embedding backend (implies `embeddings`) | `fastembed` |
+| `huggingface` | local embedding backend (implies `embeddings`) | `candle`, `tokenizers`, `hf-hub` |
+
+```toml
+# Chat only — no embedding, reranking, or media stack compiled.
+octolib = { version = "<latest>", default-features = false, features = ["llm"] }
+```
+
+`octolib::errors`, `octolib::storage`, `octolib::utils` and `set_user_agent` are always available. Hardware acceleration features include `metal`, `cuda`, `cudnn`, and `accelerate`. Local backends compile Metal support on macOS through target-specific dependencies in this crate; Apple dependencies are not built on other platforms. The `metal` feature selects Metal for HuggingFace inference on macOS and is a no-op elsewhere; without it, HuggingFace uses CPU. `--no-default-features` omits local backends unless explicitly enabled. No separate helper package is required.
 
 ## 🚀 Quick Start
 
@@ -44,24 +64,126 @@ Local embedding/reranking (`fastembed`, `huggingface`) is enabled by default. Ha
 use octolib::{ProviderFactory, ChatCompletionParams, Message};
 
 async fn example() -> anyhow::Result<()> {
-    // Parse model and get provider
+    // One string picks both the provider and the model.
     let (provider, model) = ProviderFactory::get_provider_for_model("openai:gpt-4o")?;
 
-    // Create messages
-    let messages = vec![
-        Message::user("Hello, how are you?"),
-    ];
+    let messages = vec![Message::user("Hello, how are you?")];
 
-    // Create completion parameters
-    let params = ChatCompletionParams::new(&messages, &model, 0.7, 1.0, 50, 1000);
+    // Arguments: messages, model, max_tokens
+    let params = ChatCompletionParams::new(&messages, &model, 1000);
 
-    // Get completion (requires OPENAI_API_KEY environment variable)
+    // Requires OPENAI_API_KEY in the environment
     let response = provider.chat_completion(params).await?;
     println!("Response: {}", response.content);
+
+    // Token usage and USD cost are attached to every response:
+    if let Some(usage) = &response.exchange.usage {
+        println!(
+            "Input: {}, Output: {}, Cost: ${:.6}",
+            usage.input_tokens, usage.output_tokens,
+            usage.cost.unwrap_or(0.0),
+        );
+    }
 
     Ok(())
 }
 ```
+
+Switching providers is the same call with a different string — `anthropic:claude-opus-5-5`, `ollama:llama3.2` — after exporting the matching `*_API_KEY` (see the [key table in the docs](doc/04-advanced-guide.md)).
+
+### Media generation
+
+Media delivery is separate from chat input attachments. The high-level helpers accept the same `provider:model` addressing used elsewhere and wait for asynchronous jobs when necessary:
+
+```rust
+use octolib::{generate_image, ImageGenerationRequest};
+
+async fn image_example() -> octolib::MediaResult<()> {
+    // Requires OPENROUTER_API_KEY.
+    let request = ImageGenerationRequest::new("A red panda astronaut, studio lighting");
+    let result = generate_image(
+        "openrouter:openai/gpt-image-1",
+        request,
+    ).await?;
+
+    // OpenRouter reports authoritative request cost in the response.
+    let cost_usd = result
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.provider_reported_cost);
+    println!("{} image(s), cost: {:?}", result.artifacts.len(), cost_usd);
+    Ok(())
+}
+```
+
+- **Coverage** — OpenRouter, Replicate, and fal serve all four task traits; Runway and Higgsfield serve image and video; ElevenLabs serves speech and transcription; Cloudflare Workers AI serves image, speech, and transcription via `/ai/run`
+- **Synchronous vs. durable** — ElevenLabs and Cloudflare answer synchronously, so results are complete on submission; the rest return a credential-free `JobHandle` you can persist and resume after a restart, and a local `wait_timeout` returns `MediaError::WaitTimeout { handle }` without cancelling the remote job
+- **Honest costs** — `provider_reported_cost` only when the upstream returns a dollar amount; otherwise a caller-supplied `CostEstimate` or the crate's reference rates, always stored as `estimated_cost`, with the rate frozen into the `JobHandle` at submit
+- **Safe downloads** — generated URLs are never fetched automatically; `download_artifact` takes an explicit byte limit, accepts HTTPS only, rejects embedded credentials and local/private addresses, and does not follow redirects
+- **No duplicate paid work** — only idempotent schema and polling queries are retried; generation POSTs are never replayed after an ambiguous transport failure unless the provider honours `request_options.idempotency_key` (Higgsfield)
+- **Finished means final** — a job the provider reports finished whose output holds no readable media of the requested kind comes back `Failed` with `FailureCategory::InvalidResponse` and the raw output on the failure, never as an error that leaves it live for another poll
+- **fal endpoints checked against fal's catalog** — before queueing, the fal adapter reads the endpoint's category from fal's model catalog and refuses a route the endpoint does not make (`MediaError::UnsupportedTask`); a portable `duration_secs` is sent in the type the endpoint's OpenAPI schema declares. Both lookups use `FAL_API_KEY`, are cached for 10 minutes, and fail the submit when fal cannot answer
+
+Provider-specific fields live under the provider's own namespace (`provider_options["replicate"].input`), with optional `field_map` mappings for portable fields. The `media_openrouter`, `media_replicate`, and `media_fal` examples show the full contract.
+
+### Evaluation
+
+Evaluation models answer typed questions about one state with calibrated probabilities instead of generated text. Ask several independent questions in one call and branch on the numbers in code:
+
+```rust
+use octolib::{evaluate, Answer, EvaluationRequest, Question};
+
+async fn triage() -> octolib::EvaluationResult<()> {
+    // Requires TYPESAFE_API_KEY; use "cloudflare:typesafe/jev" to bill AI Gateway credits instead.
+    let request = EvaluationRequest::new("Help! My payouts have been failing for 3 days.")
+        .with_question("is_urgent", Question::noul("Does this convey urgency?"))
+        .with_question(
+            "department",
+            Question::choice(
+                "Which team should handle this?",
+                [("billing", "Payments, refunds"), ("technical", "Bugs, outages")],
+            ),
+        )
+        .with_question(
+            "frustration",
+            Question::score("How frustrated is the customer?", ["Calm", "Frustrated", "Very angry"]),
+        );
+    let response = evaluate("typesafe:jev-latest", request).await?;
+    if let Answer::Noul { noul } = response.answers["is_urgent"] {
+        println!("urgent with p={noul:.2}, cost {:?}", response.usage.cost);
+    }
+    Ok(())
+}
+```
+
+Jev bills input tokens only ($0.042 per 1M, output free) and has a 32k context, so trim the state to what the questions need. The response's `model` field reports the versioned model that answered.
+
+The same request runs on other decision models: Cloudflare's Clef on Workers AI (`cloudflare:@cf/cloudflare/clef`, `clef-flash`, `clef-omni`; $0.24 / $0.038 / $0.15 per 1M input tokens), Inception's `inception:mercury-decide` (`INCEPTION_API_KEY`, $0.02 per 1M input tokens), `openrouter:<maker>/<model>` (e.g. `openrouter:perplexity/pplx-decider-v1.2`; `OPENROUTER_API_KEY`, cost taken from OpenRouter's response; `get_model_pricing` knows the listed rate of the Perplexity Decider, Liquid d1, Upstage Solar Decide, Nace.AI Drex, Microsoft Decision and GPT-6 Luna Decisions models) or OpenAI's own Decisions API, `openai:gpt-6-luna` (`OPENAI_API_KEY`). OpenAI's wire format has no `box` questions and no yes/no criteria, takes plain-string instructions, choice descriptions and levels only, and reads images only as top-level `state` array items; anything else is rejected before sending. A question OpenAI declines comes back as `Answer::Refusal`.
+
+The `ollama` provider sends the same request to Ollama's decision endpoint (`https://ollama.com/v1/systemone`), for example `ollama:clef`. `OLLAMA_API_KEY` is sent as a bearer token when set. To reach a self-hosted Ollama server (0.35.0 or later), which takes no key, set `OLLAMA_EVALUATION_API_URL` to its full URL, for example `http://localhost:11434/v1/systemone` with `ollama:tev1:0.8b`. Ollama's pricing page lists a rate for `clef` only ($0.24 per 1M input tokens); other models, and every call behind the URL override, report no cost.
+
+Use an image reference in the state and ask for a bounding box:
+
+```rust
+use octolib::{evaluate, EvaluationRequest, EvaluationResult, ImageAsset, Question};
+
+async fn locate(image: Vec<u8>) -> EvaluationResult<()> {
+    let request = EvaluationRequest::new("Find the cat in 6de04501-7e48-45ac-bff3-43a6e93a391e")
+        .with_image("6de04501-7e48-45ac-bff3-43a6e93a391e", ImageAsset::png(image))
+        .with_question("cat", Question::bounding_box("Locate the cat's bounding box."));
+    let response = evaluate("typesafe:jev-preview", request).await?;
+    if let octolib::Answer::Box { bounds, confidence } = &response.answers["cat"] {
+        tracing::info!(?bounds, confidence, "Located cat");
+    }
+    Ok(())
+}
+```
+
+Image limits are checked before sending (PNG/JPEG still images, at most 16 MiB each, sides 256–1568 px, and 78,400–2,458,624 total pixels, all inclusive); images are never resized, padded or rotated for the caller.
+
+TypeSafe flags images and box questions as not production-ready. The `typesafe` and `openrouter` providers send them; `openai` sends top-level state images only, and `cloudflare`, `inception`, `octohub` and `ollama` reject both.
+
+Use `EvaluationProviderFactory::provider_setup_info()` to list providers, credential variables, and known callable model IDs for interactive setup. Ollama accepts a model ID entered by the user, and OctoHub offers the `auto` routing model.
 
 ### 📋 Structured Output
 
@@ -92,7 +214,7 @@ async fn structured_example() -> anyhow::Result<()> {
 
     // Request structured JSON output
     let structured_request = StructuredOutputRequest::json();
-    let params = ChatCompletionParams::new(&messages, &model, 0.7, 1.0, 50, 1000)
+    let params = ChatCompletionParams::new(&messages, &model, 1000)
         .with_structured_output(structured_request);
 
     let response = provider.chat_completion(params).await?;
@@ -112,7 +234,7 @@ Use local CLIs as a lightweight proxy. This mode is prompt-only; tool calling/MC
 
 ```rust
 let (provider, model) = ProviderFactory::get_provider_for_model("cli:codex/gpt-5.2-codex")?;
-// or: "cli:claude/claude-sonnet-4-5"
+// or: "cli:claude/claude-sonnet-5-5"
 // or: "cli:gemini/gemini-2.5-pro"
 // or: "cli:cursor/auto"
 ```
@@ -181,7 +303,7 @@ async fn tool_calling_example() -> anyhow::Result<()> {
     ];
 
     // Initial request with tools
-    let params = ChatCompletionParams::new(&messages, &model, 0.7, 1.0, 50, 1000)
+    let params = ChatCompletionParams::new(&messages, &model, 1000)
         .with_tools(tools.clone());
 
     let response = provider.chat_completion(params).await?;
@@ -230,7 +352,7 @@ async fn tool_calling_example() -> anyhow::Result<()> {
         }
 
         // Get final response with tool results
-        let params = ChatCompletionParams::new(&messages, &model, 0.7, 1.0, 50, 1000)
+        let params = ChatCompletionParams::new(&messages, &model, 1000)
             .with_tools(tools);
 
         let final_response = provider.chat_completion(params).await?;
@@ -292,13 +414,13 @@ async fn embedding_example() -> anyhow::Result<()> {
 // Supported embedding providers:
 // - Jina: jina-embeddings-v4, jina-clip-v2, etc.
 // - Voyage: voyage-3.5, voyage-code-2, etc.
-// - Google: gemini-embedding-001, text-embedding-005
+// - Google: gemini-embedding-2, gemini-embedding-001
 // - OpenAI: text-embedding-3-small, text-embedding-3-large
 // - FastEmbed: Local models (feature-gated)
 // - HuggingFace: sentence-transformers models
 ```
 
-### 🎯 Document Reranking
+### 🔎 Document Reranking
 
 Improve search results by scoring document relevance with cross-encoder models:
 
@@ -318,7 +440,7 @@ async fn reranking_example() -> anyhow::Result<()> {
         query,
         documents,
         "voyage",           // provider: voyage, cohere, jina, fastembed
-        "rerank-2.5",       // model
+        "rerank-3",         // model
         Some(2)             // top_k: return top 2 results
     ).await?;
 
@@ -335,15 +457,128 @@ async fn reranking_example() -> anyhow::Result<()> {
 // Supported Providers:
 //
 // API-Based (require API keys):
-// - Voyage AI (VOYAGE_API_KEY): rerank-2.5, rerank-2.5-lite, rerank-2, rerank-2-lite
-// - Cohere (COHERE_API_KEY): rerank-english-v3.0, rerank-multilingual-v3.0
-// - Jina AI (JINA_API_KEY): jina-reranker-v3, jina-reranker-v2-base-multilingual
+// - Voyage AI (VOYAGE_API_KEY): rerank-3, rerank-3-lite, rerank-2.5, rerank-2.5-lite
+// - Cohere (COHERE_API_KEY): rerank-v4.0-pro, rerank-v4.0-fast, rerank-v3.5
+// - Jina AI (JINA_API_KEY): jina-reranker-v3.5, jina-reranker-v3, jina-reranker-m0
 //
 // Local (no API keys, requires features):
 // - FastEmbed (fastembed feature): bge-reranker-base, bge-reranker-large, jina-reranker-v1-turbo-en
 ```
 
+### OctoHub transport
+
+`octohub:<model>` uses HTTP by default, including when the optional `websockets`
+feature is enabled. Enable that feature and select `OctoHubTransport::WebSocket`
+per request to opt in; select `Http` to switch back. This setting is independent
+of `ChatGptTransport` and is ignored by other providers.
+
+```toml
+octolib = { version = "<latest>", features = ["websockets"] }
+```
+
+```rust
+use octolib::{ChatCompletionParams, Message, OctoHubTransport};
+
+let messages = vec![Message::user("Hello")];
+let params = ChatCompletionParams::new(&messages, "auto", 100);
+assert_eq!(params.octohub_transport, OctoHubTransport::Http);
+
+#[cfg(feature = "websockets")]
+let params = params
+    .with_octohub_transport(OctoHubTransport::WebSocket)
+    .with_prompt_cache_key("conversation-id");
+
+let params = params.with_octohub_transport(OctoHubTransport::Http);
+assert_eq!(params.octohub_transport, OctoHubTransport::Http);
+```
+
+Both transports use OctoHub's `/v1/completions` protocol: Responses-shaped `input`
+and `output`, with `previous_completion_id` for server-backed continuation, not
+Chat Completions or ChatGPT's connection-local continuation. HTTP POST returns a
+JSON completion. WebSocket upgrades GET over HTTP/1.1, sends the same request JSON
+as one text message (maximum 16 MiB), and receives one text envelope:
+`{"status":200,"headers":{"content-type":"application/json"},"body":{...}}`.
+Requests are sequential, not multiplexed or token-streamed; native ping/pong is supported.
+
+`OCTOHUB_API_URL` retains its HTTP(S) base URL for other routes; completion requests
+also accept explicit WS(S) URLs and normalize them for HTTP. Hosts, local IPs,
+ports and base paths are preserved. Bearer auth, attribution and extra headers
+(including purpose) are applied at the handshake, with extras upserting last.
+Use a stable, conversation-specific `prompt_cache_key` to reuse a socket across
+provider instances; without it, each call uses a fresh socket. The bounded pool
+isolates endpoints, credentials, effective headers and session keys. Keep supplying
+conversation history: OctoHub's server retains continuation state, not the socket.
+
+WebSocket setup is bounded to 20 seconds. `request_timeout` bounds the entire
+WebSocket call, including queue waits, setup, sending, replies and retry backoff;
+`None` uses 600 seconds. The separate `stream_timeout` does not apply to OctoHub's
+buffered HTTP or WebSocket envelope. Cancellation, timeout, a dropped future or
+protocol failure discards the socket.
+Only explicit retryable server statuses use the configured retry policy and
+`Retry-After`/retry observer. A lost reply may already be paid work: the library
+never replays ambiguous requests or silently falls back to HTTP.
+
+### WebSocket connection lifecycle
+
+ChatGPT and OctoHub share the connection manager in
+`src/llm/providers/websocket_transport.rs`. It services server ping and close
+frames between turns as well as during responses, sends a ping every 30 seconds,
+and requires a matching pong within 10 seconds. Heartbeats measure connection
+health; they do not extend response inactivity or request deadlines. Socket writes
+are bounded to 20 seconds, subject to any shorter caller deadline.
+
+Before reusing a socket, the manager verifies its liveness with a ping/pong exchange.
+A dead idle socket is replaced before sending the next application request. This
+reconnection does not consume the request retry budget or replay previous work.
+ChatGPT drops connection-local continuation state when reconnecting and sends the
+full supplied history; OctoHub retains its existing no-replay policy for ambiguous
+in-flight failures.
+
+Each provider pool holds at most 64 sessions. Idle readers close their sockets after
+five minutes without a request, even when there are no further pool lookups, and
+connections rotate between requests after 55 minutes. Eviction and cancellation
+abort the owned idle reader; no detached task or response queue remains. New
+WebSocket providers can reuse this manager while defining their own handshake,
+response format, and retry policy.
+
 ### 🔐 OAuth Authentication
+
+The `chatgpt:<model>` provider uses Sign in with ChatGPT (`llm::providers::chatgpt::start_login`)
+and the user's authorized plan allowance. HTTP/SSE Responses is the default transport.
+To enable WebSocket support, add the optional Cargo feature:
+
+```toml
+octolib = { version = "<latest>", features = ["websockets"] }
+```
+
+Then opt in for each request:
+
+```rust
+use octolib::ChatGptTransport;
+
+let params = params
+    .with_chatgpt_transport(ChatGptTransport::WebSocket)
+    .with_prompt_cache_key("conversation-id");
+```
+
+`ChatCompletionParams::new(...)` defaults to `ChatGptTransport::Http` even with the
+feature enabled. Select `Http` explicitly to switch back; transports never silently
+fall back to each other. The `WebSocket` variant is only available with the feature.
+
+In WebSocket mode, a stable, conversation-specific cache key reuses the connection
+across provider instances; calls without a key use a fresh connection. Continue
+supplying the full message history, including captured `provider_items`: Octolib sends
+only new input when history matches the connection's last response and sends full
+context after a reconnect or history change. Credentials, model, and handshake headers
+isolate connections. For ChatGPT, `request_timeout` caps each complete HTTP or
+WebSocket request attempt, excluding shared-session waits and retry backoff;
+`None` disables this deadline. The optional `stream_timeout` separately limits
+waiting for SSE chunks or WebSocket
+response messages; it defaults to `None` (disabled). WebSocket ping/pong frames do
+not reset this response inactivity limit. Stream activity never extends the total
+request deadline. Cancellation or timeout discards the in-flight WebSocket connection.
+
+ChatGPT uses the [shared WebSocket connection lifecycle](#websocket-connection-lifecycle) described above.
 
 Octolib supports OAuth authentication for ChatGPT subscriptions and Anthropic:
 
@@ -360,36 +595,45 @@ export ANTHROPIC_OAUTH_TOKEN="your_bearer_token"
 
 The library automatically detects OAuth credentials and prefers them over API keys. See `examples/openai_oauth.rs` and `examples/anthropic_oauth.rs` for full usage examples.
 
-## 🎯 Provider Support Matrix
+## 📊 Provider Support Matrix
 
-| Provider | Structured Output | Vision | Tool Calls | Caching |
-|----------|------------------|--------|------------|---------|
-| **OpenAI** | ✅ JSON + Schema | ✅ Yes | ✅ Yes | ✅ Yes |
-| **xAI** | ✅ JSON + Schema | ✅ Yes | ✅ Yes | ✅ Yes |
-| **OpenRouter** | ✅ JSON + Schema | ✅ Yes | ✅ Yes | ✅ Yes |
-| **DeepSeek** | ✅ JSON Mode | ❌ No | ❌ No | ✅ Yes |
-| **Moonshot AI (Kimi)** | ✅ JSON Mode | ✅ kimi-k2.5 | ✅ Yes | ✅ Yes |
-| **MiniMax** | ✅ JSON Mode | ❌ No | ✅ Yes | ✅ Yes |
-| **Anthropic** | ❌ No | ✅ Yes | ✅ Yes | ✅ Yes |
-| **Z.ai** | ✅ JSON Mode | ❌ No | ✅ Yes | ✅ Yes |
-| **NVIDIA NIM** | ✅ JSON + Schema | Per-model | ✅ Yes | ❌ No |
-| **Groq** | ✅ JSON + Schema | Per-model | ❌ No | ✅ Select models |
-| **BytePlus** | ✅ JSON + Schema | Per-model | ❌ No | ✅ Yes |
-| **Alibaba Model Studio** | ❌ No | Per-model | ✅ Yes | ✅ Yes |
-| **Cerebras** | ✅ JSON + Schema | ❌ No | ❌ No | ❌ No |
-| **Featherless** | ✅ JSON + Schema | ❌ No | ❌ No | ❌ No |
-| **Hetzner** | ✅ JSON + Schema | Per-model | ✅ Yes | ❌ No |
-| **OpenCode Zen** | Per-model | Per-model | ✅ Yes | ❌ No |
-| **OpenCode Go** | ✅ JSON + Schema | Per-model | ✅ Yes | ✅ Yes |
-| **Google Vertex** | ❌ No | ✅ Yes | ✅ Yes | ❌ No |
-| **Google Studio** | ✅ JSON + Schema | ✅ Yes | ✅ Yes | ✅ Yes |
-| **Amazon Bedrock** | ❌ No | ✅ Yes | ✅ Yes | ❌ No |
-| **OctoHub** | Per-model | Per-model | ✅ Yes | ✅ Yes |
-| **Together** | Per-model | Per-model | ✅ Yes | ✅ Yes (auto) |
-| **Fireworks** | ✅ JSON + Schema | Per-model | ✅ Yes | ✅ Yes (auto) |
-| **Cloudflare** | ❌ No | ❌ No | ❌ No | ❌ No |
-| **Local** | Per-model | Per-model | Per-model | ❌ No |
-| **Ollama** | Per-model | Per-model | Per-model | ❌ No |
+Capabilities marked "Per-model" are resolved per model from the provider's capability tables.
+
+| Provider | Highlights | Structured Output | Vision | Tool Calls | Caching |
+|----------|------------|-------------------|--------|------------|---------|
+| **OpenAI** | Responses API, OAuth support | ✅ JSON + Schema | ✅ | ✅ | ✅ |
+| **xAI** | Grok 4.5/4.3/4.20/Build, encrypted reasoning | ✅ JSON + Schema | ✅ | ✅ | ✅ |
+| **Anthropic** | Claude models, thinking blocks, OAuth support | ❌ | ✅ | ✅ | ✅ |
+| **OpenRouter** | Multi-provider proxy | ✅ JSON + Schema | ✅ | ✅ | ✅ |
+| **Google Vertex** | Enterprise, service-account auth | ❌ | ✅ | ✅ | ❌ |
+| **Google Studio** | Gemini API, API-key auth | ✅ JSON + Schema | ✅ | ✅ | ✅ |
+| **Amazon Bedrock** | Cloud AI services | ❌ | ✅ | ✅ | ❌ |
+| **DeepSeek** | Open-source models | ✅ JSON Mode | ❌ | ❌ | ✅ |
+| **Moonshot (Kimi)** | K2/K3 series | ✅ JSON Mode | ✅ kimi-k3 | ✅ | ✅ |
+| **MiniMax** | Anthropic-compatible API | ✅ JSON Mode | ❌ | ✅ | ✅ |
+| **Z.ai** | GLM models | ✅ JSON Mode | ❌ | ✅ | ✅ |
+| **BytePlus** | Seed models | ✅ JSON + Schema | Per-model | ❌ | ✅ |
+| **Alibaba Model Studio** | Qwen + resold DeepSeek/GLM | ❌ | Per-model | ✅ | ✅ |
+| **Groq** | Fast inference | ✅ JSON + Schema | Per-model | ❌ | ✅ Select models |
+| **Cerebras** | Fast inference | ✅ JSON + Schema | ❌ | ❌ | ❌ |
+| **NVIDIA NIM** | 100+ hosted models | ✅ JSON + Schema | Per-model | ✅ | ❌ |
+| **Together** | Multi-provider proxy | Per-model | Per-model | ✅ | ✅ (auto) |
+| **Fireworks** | Auto prefix-cache | ✅ JSON + Schema | Per-model | ✅ | ✅ (auto) |
+| **Featherless** | Open-weight models, subscription billing | ✅ JSON + Schema | ❌ | ❌ | ❌ |
+| **Hetzner** | Open-weight models, free while experimental | ✅ JSON + Schema | Per-model | ✅ | ❌ |
+| **Inception Labs** | Mercury diffusion LLMs | ✅ JSON + Schema | ❌ | ✅ | ✅ |
+| **Isoquant** | Models read from its catalog, zero data retention required | ✅ JSON + Schema | Per-model | ✅ | ✅ (auto) |
+| **Meta** | Muse Spark models, 1M-token context | ✅ JSON + Schema | ✅ | ✅ | ✅ |
+| **Reflection AI** | Beam reasoning model, 1M-token context | ✅ JSON + Schema | ❌ | ✅ | ✅ (auto) |
+| **Tinker** | Inkling family, sampler checkpoints | ❌ | ❌ | ✅ | ❌ |
+| **OpenCode Zen** | Multi-provider proxy, pay-as-you-go | Per-model | Per-model | ✅ | ❌ |
+| **OpenCode Go** | Multi-provider proxy, subscription billing | ✅ JSON + Schema | Per-model | ✅ | ✅ |
+| **OctoHub** | Local AI serving, evaluation proxy | Per-model | Per-model | ✅ | ✅ |
+| **Cloudflare Workers AI** | Edge AI, media, evaluation | ❌ | ❌ | ❌ | ❌ |
+| **Local** | Ollama, LM Studio, LocalAI, Jan, vLLM | Per-model | Per-model | Per-model | ❌ |
+| **Ollama** | Local LLM runner | Per-model | Per-model | Per-model | ❌ |
+| **WebWright** | OpenAI-compatible chat API | ❌ | ❌ | ❌ | ✅ |
+| **CLI Proxy** | Codex, Claude, Gemini, Cursor — prompt-only | ❌ | ❌ | ❌ | ❌ |
 
 ### Structured Output Details
 
@@ -405,14 +649,14 @@ Octolib provides first-class support for models that produce thinking/reasoning 
 use octolib::{ProviderFactory, ChatCompletionParams, Message, ThinkingBlock};
 
 async fn thinking_example() -> anyhow::Result<()> {
-    // Thinking-capable models: MiniMax, OpenAI o-series, Moonshot (kimi-k2-thinking*), Z.ai, xAI
+    // Thinking-capable models: MiniMax, OpenAI o-series, Moonshot (K3), Z.ai (GLM hybrid thinking), xAI
     let (provider, model) = ProviderFactory::get_provider_for_model("minimax:MiniMax-M2")?;
 
     let messages = vec![
         Message::user("Solve this complex math problem step by step"),
     ];
 
-    let params = ChatCompletionParams::new(&messages, &model, 0.7, 1.0, 50, 1000);
+    let params = ChatCompletionParams::new(&messages, &model, 1000);
     let response = provider.chat_completion(params).await?;
 
     // Access thinking content (separate from response.content)
@@ -444,6 +688,8 @@ async fn thinking_example() -> anyhow::Result<()> {
 | **xAI** | Responses API reasoning items | Summary extraction plus encrypted reasoning preservation across tool rounds |
 | **OpenAI o-series** | `reasoning_content` field | o1, o3, o4 models |
 | **OpenRouter** | `reasoning_details` | Gemini and other providers |
+| **Moonshot (Kimi)** | `reasoning_content` field | K3 always reasons |
+| **Z.ai** | reasoning_content field with legacy think-tag fallback | GLM hybrid thinking models (4.5/4.6/4.7/5.x) |
 
 #### Token Tracking
 
@@ -462,60 +708,34 @@ if let Some(usage) = &response.exchange.usage {
 
 ## 📚 Complete Documentation
 
-📖 **Quick Navigation**
+- **[Overview](doc/01-overview.md)** — library introduction and core concepts
+- **[Installation Guide](doc/02-installation.md)** — setup and API keys
+- **[Advanced Usage](doc/03-advanced-usage.md)** and **[Advanced Guide](doc/04-advanced-guide.md)** — advanced features and the full environment-variable table
+- **[Embedding Guide](doc/05-embedding.md)** — embedding generation with multiple providers
+- **[Reranking Guide](doc/06-reranking.md)** — document relevance scoring
+- **[Tool Calling](doc/07-tool-calling.md)** — cross-provider tool calling
+- **[Thinking/Reasoning](doc/08-thinking.md)** — reasoning model support
+- **[Configuration Migration](doc/09-configuration-migration.md)** — versioned TOML upgrades and safe file persistence
 
-- **[Overview](doc/01-overview.md)** - Library introduction and core concepts
-- **[Installation Guide](doc/02-installation.md)** - Setup and configuration
-- **[Advanced Usage](doc/03-advanced-usage.md)** - Advanced features and customization
-- **[Advanced Guide](doc/04-advanced-guide.md)** - Comprehensive usage patterns
-- **[Embedding Guide](doc/05-embedding.md)** - Embedding generation with multiple providers
-- **[Reranking Guide](doc/06-reranking.md)** - Document relevance scoring
-- **[Tool Calling](doc/07-tool-calling.md)** - Cross-provider tool calling
-- **[Thinking/Reasoning](doc/08-thinking.md)** - Reasoning model support
-- **[Configuration Migration](doc/09-configuration-migration.md)** - Versioned TOML upgrades and safe file persistence
+Also:
 
-## 🌐 Supported Providers
+- **[Examples](examples/)** — one runnable file per feature; every snippet in this README has a fuller version there
+- **[CHANGELOG](CHANGELOG.md)** — release history
+- **[API reference](https://docs.rs/octolib)** — generated rustdoc
+- **[AGENTS.md](AGENTS.md)** — repository guide: project layout, conventions, and how to add a provider
 
-| Provider | Status | Capabilities |
-|----------|--------|--------------|
-| OpenAI | ✅ Full Support | Chat, Vision, Tools, Structured Output, Caching |
-| xAI | ✅ Full Support | Grok 4.5/4.3/4.20/Build, Vision, Tools, Structured Output, Caching, Encrypted Reasoning |
-| Anthropic | ✅ Full Support | Claude Models, Vision, Tools, Caching |
-| OpenRouter | ✅ Full Support | Multi-Provider Proxy, Vision, Caching, Structured Output |
-| Groq | ✅ Full Support | Fast Inference, Structured Output, Caching |
-| BytePlus | ✅ Full Support | Seed Models, Structured Output, Caching |
-| Alibaba Model Studio | ✅ Full Support | Qwen Models + Resold DeepSeek/GLM, Vision, Video, Tools, Thinking, Caching |
-| DeepSeek | ✅ Full Support | Open-Source AI Models, Structured Output, Caching |
-| Moonshot AI (Kimi) | ✅ Full Support | Kimi K2 Series, Vision (kimi-k2.5), Tools, Structured Output, Caching, Thinking |
-| MiniMax | ✅ Full Support | Anthropic-Compatible API, Tools, Caching, Thinking, Structured Output |
-| Z.ai | ✅ Full Support | GLM Models, Caching, Structured Output |
-| NVIDIA NIM | ✅ Full Support | 100+ Hosted Models, Tools, Structured Output, Reference Pricing |
-| Together AI | ✅ Full Support | Multi-Provider Proxy, Vision, Tools, Structured Output |
-| Cerebras | ✅ Full Support | Fast Inference, Structured Output |
-| Featherless | ✅ Full Support | Open-Weight Models (Qwen, Llama, Mistral, DeepSeek, RWKV), Subscription Billing |
-| Hetzner | ✅ Full Support | Open-Weight Models (DeepSeek, GLM, Kimi, Qwen), Free While Experimental |
-| OpenCode Zen | ✅ Full Support | Multi-Provider Proxy (Claude, GPT, Gemini, Grok, DeepSeek, Kimi…), Pay-As-You-Go |
-| OpenCode Go | ✅ Full Support | Multi-Provider Proxy (Kimi, GLM, DeepSeek, Qwen, MiniMax…), Subscription Billing |
-| OctoHub | ✅ Supported | Local AI Serving |
-| Google Vertex AI | ✅ Supported | Enterprise AI Integration |
-| Google AI Studio | ✅ Supported | Gemini API, API-Key Auth |
-| Amazon Bedrock | ✅ Supported | Cloud AI Services |
-| Cloudflare Workers AI | ✅ Supported | Edge AI Compute |
-| Local LLM | ✅ Supported | Ollama, LM Studio, LocalAI, Jan, vLLM |
-| Ollama | ✅ Supported | Local LLM Runner |
-| CLI Proxy | ✅ Supported | Codex, Claude, Gemini, Cursor |
 ## 🔒 Privacy & Security
 
-- **🏠 Local-first design**
-- **🔑 Secure API key management**
-- **📁 Respects .gitignore**
-- **🛡️ Comprehensive error handling**
+- **Keys from the environment only** — read at call time, never accepted as function parameters
+- **No panics in library code** — every fallible path returns `Result`; no `unwrap()`, `expect()`, or `panic!()` outside tests
+- **No hidden output** — the library never prints; diagnostics go through `tracing` when you enable it
+- **Local-first option** — Ollama, Local, and OctoHub run against your own infrastructure with no external calls
 
 ## 🤝 Support & Community
 
 - **🐛 Issues**: [GitHub Issues](https://github.com/Muvon/octolib/issues)
 - **📧 Email**: [opensource@muvon.io](mailto:opensource@muvon.io)
-- **🏢 Company**: Muvon Un Limited (Hong Kong)
+- **🏢 Company**: [Muvon Un Limited](https://muvon.io) (Hong Kong)
 
 ## ⚖️ License
 
@@ -523,4 +743,4 @@ This project is licensed under the **Apache License 2.0** - see the [LICENSE](LI
 
 ---
 
-**Built with ❤️ by the Muvon team in Hong Kong**
+**© 2026 Muvon Un Limited (Hong Kong)** · Built with ❤️ by the [Muvon team](https://muvon.io)

@@ -22,17 +22,20 @@
 use super::shared;
 use crate::llm::reference_models::proxy_route_enforces_response_schema;
 use crate::llm::retry;
-use crate::llm::traits::AiProvider;
+use crate::llm::traits::{AiProvider, KeepalivePolicy};
 use crate::llm::types::{
-    ChatCompletionParams, Message, ProviderExchange, ProviderResponse, SamplingSupport,
-    ThinkingBlock, TokenUsage, ToolCall,
+	ChatCompletionParams, Message, OctoHubTransport, ProviderExchange, ProviderResponse, ThinkingBlock, TokenUsage,
+	ToolCall,
 };
 use anyhow::Result;
 use serde::Deserialize;
 
-const OCTOHUB_API_KEY_ENV: &str = "OCTOHUB_API_KEY";
+pub(crate) const OCTOHUB_API_KEY_ENV: &str = "OCTOHUB_API_KEY";
 const OCTOHUB_API_URL_ENV: &str = "OCTOHUB_API_URL";
 const OCTOHUB_DEFAULT_BASE_URL: &str = "https://hub.octomind.run";
+
+#[cfg(feature = "websockets")]
+mod websocket;
 
 /// OctoHub provider — routes through an OctoHub proxy server using the
 /// Responses API format (`/v1/completions`).
@@ -40,22 +43,22 @@ const OCTOHUB_DEFAULT_BASE_URL: &str = "https://hub.octomind.run";
 pub struct OctoHubProvider;
 
 impl Default for OctoHubProvider {
-    fn default() -> Self {
-        Self::new()
-    }
+	fn default() -> Self {
+		Self::new()
+	}
 }
 impl OctoHubProvider {
-    pub fn new() -> Self {
-        Self
-    }
+	pub fn new() -> Self {
+		Self
+	}
 
-    fn base_url() -> String {
-        std::env::var(OCTOHUB_API_URL_ENV).unwrap_or_else(|_| OCTOHUB_DEFAULT_BASE_URL.to_string())
-    }
+	fn base_url() -> String {
+		std::env::var(OCTOHUB_API_URL_ENV).unwrap_or_else(|_| OCTOHUB_DEFAULT_BASE_URL.to_string())
+	}
 
-    fn api_key() -> Option<String> {
-        std::env::var(OCTOHUB_API_KEY_ENV).ok()
-    }
+	fn api_key() -> Option<String> {
+		std::env::var(OCTOHUB_API_KEY_ENV).ok()
+	}
 }
 
 /// A rejected credential is the one failure users can actually fix, so say how.
@@ -64,394 +67,418 @@ impl OctoHubProvider {
 /// Only 401 gets the login hint: 403 is a plan/key restriction (e.g. "model
 /// 'X' is not permitted for this API key") where the server message is
 /// precise and logging in again would not help — pass it through.
-fn auth_aware_error(status: u16, body: &str) -> anyhow::Error {
-    // Server bodies are JSON like {"error":{"message":"..."}} — surface the
-    // message text, not the raw blob.
-    let msg = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
-        .unwrap_or_else(|| body.to_string());
-    if status == 401 {
-        let has_key = OctoHubProvider::api_key().is_some_and(|k| !k.trim().is_empty());
-        let hint = if has_key {
-            "the stored OctoHub key was rejected (revoked, or replaced by a newer login) — run `octomind login` to sign in again"
-        } else {
-            "no OctoHub key is set — run `octomind login` to sign in"
-        };
-        return anyhow::anyhow!("OctoHub API error {status}: {hint}. Server said: {msg}");
-    }
-    anyhow::anyhow!("OctoHub API error {status}: {msg}")
+fn auth_aware_error(status: u16, body: &str, per_call_key: bool) -> anyhow::Error {
+	// Server bodies are JSON like {"error":{"message":"..."}} — surface the
+	// message text, not the raw blob.
+	let msg = serde_json::from_str::<serde_json::Value>(body)
+		.ok()
+		.and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+		.unwrap_or_else(|| body.to_string());
+	if status == 401 {
+		let hint = if per_call_key {
+			"the OctoHub key passed for this request was rejected"
+		} else if OctoHubProvider::api_key().is_some_and(|k| !k.trim().is_empty()) {
+			"the stored OctoHub key was rejected (revoked, or replaced by a newer login) — run `octomind login` to sign in again"
+		} else {
+			"no OctoHub key is set — run `octomind login` to sign in"
+		};
+		return anyhow::anyhow!("OctoHub API error {status}: {hint}. Server said: {msg}");
+	}
+	anyhow::anyhow!("OctoHub API error {status}: {msg}")
+}
+
+// Normalize only this completion endpoint; embeddings and media keep their HTTP configuration.
+fn completion_url(base: &str) -> Result<String> {
+	let mut url = reqwest::Url::parse(base).map_err(|_| anyhow::anyhow!("Invalid OCTOHUB_API_URL"))?;
+	let scheme = match url.scheme() {
+		"http" | "ws" => "http",
+		"https" | "wss" => "https",
+		_ => anyhow::bail!("OCTOHUB_API_URL must use http, https, ws, or wss"),
+	};
+	if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
+		anyhow::bail!("OCTOHUB_API_URL must have a host and no embedded credentials; use OCTOHUB_API_KEY");
+	}
+	url.set_scheme(scheme)
+		.map_err(|_| anyhow::anyhow!("Invalid OCTOHUB_API_URL scheme"))?;
+	url.set_path(&format!("{}/v1/completions", url.path().trim_end_matches('/')));
+	url.set_fragment(None);
+	Ok(url.into())
+}
+
+fn request_headers(url: &str, api_key: &str, params: &ChatCompletionParams) -> Result<reqwest::header::HeaderMap> {
+	let mut request = shared::http_client()
+		.post(url)
+		.header("Content-Type", "application/json");
+	if !api_key.is_empty() {
+		request = request.bearer_auth(api_key);
+	}
+	// Attribution and purpose headers must be identical on POST and the upgrade handshake.
+	for (env, header) in [
+		("OPENROUTER_APP_TITLE", "X-Title"),
+		("OPENROUTER_HTTP_REFERER", "HTTP-Referer"),
+		("OPENROUTER_APP_CATEGORIES", "X-OpenRouter-Categories"),
+	] {
+		if let Ok(value) = std::env::var(env) {
+			request = request.header(header, value);
+		}
+	}
+	Ok(shared::apply_extra_headers(request, params.extra_headers.as_ref())
+		.build()?
+		.headers()
+		.clone())
+}
+
+fn retryable_response(response: shared::CapturedResponse) -> Result<shared::CapturedResponse> {
+	if retry::is_retryable_status(response.status.as_u16()) {
+		return Err(retry::retryable_status_error(
+			&response,
+			format!("OctoHub API error {}: {}", response.status, response.body),
+		));
+	}
+	Ok(response)
 }
 
 #[async_trait::async_trait]
 impl AiProvider for OctoHubProvider {
-    fn name(&self) -> &str {
-        "octohub"
-    }
+	fn name(&self) -> &str {
+		"octohub"
+	}
 
-    fn supported_sampling_params(&self, _model: &str) -> SamplingSupport {
-        // OctoHub uses OpenAI-compatible API — supports temperature and top_p, not top_k.
-        SamplingSupport::TEMPERATURE_AND_TOP_P
-    }
+	/// OctoHub accepts any model — it routes to the appropriate provider.
+	fn supports_model(&self, model: &str) -> bool {
+		!model.is_empty()
+	}
 
-    /// OctoHub accepts any model — it routes to the appropriate provider.
-    fn supports_model(&self, model: &str) -> bool {
-        !model.is_empty()
-    }
+	fn get_api_key(&self) -> Result<String> {
+		// OctoHub API key is optional (server may run without auth)
+		Ok(Self::api_key().unwrap_or_default())
+	}
 
-    fn get_api_key(&self) -> Result<String> {
-        // OctoHub API key is optional (server may run without auth)
-        Ok(Self::api_key().unwrap_or_default())
-    }
+	// OctoHub is a proxy fronting arbitrary (often custom) models — the real
+	// capability lives behind the proxy and is not knowable here. Advertise
+	// everything as supported so callers don't block on this layer; the
+	// upstream provider returns an explicit error if the underlying model
+	// can't honor a request.
+	fn supports_caching(&self, _model: &str) -> bool {
+		true
+	}
 
-    // OctoHub is a proxy fronting arbitrary (often custom) models — the real
-    // capability lives behind the proxy and is not knowable here. Advertise
-    // everything as supported so callers don't block on this layer; the
-    // upstream provider returns an explicit error if the underlying model
-    // can't honor a request.
-    fn supports_caching(&self, _model: &str) -> bool {
-        true
-    }
+	// Whether the lane serving this chain can be pre-warmed is the server's call:
+	// it answers a lane without a keepalive policy with an empty, zero-read reply
+	// and no upstream call, which ends the caller's keepalive as a cache miss.
+	fn keepalive_policy(&self, model: &str, use_long_cache: bool) -> Option<KeepalivePolicy> {
+		self.cache_lifetime(model, use_long_cache)
+			.map(KeepalivePolicy::before_expiry)
+	}
 
-    fn supports_vision(&self, _model: &str) -> bool {
-        true
-    }
+	/// The client's `cache_control` markers pass through to the lane unchanged,
+	/// so a hub lane that caches does so on their TTL: 5m, or 1h with
+	/// `use_long_cache`.
+	fn cache_lifetime(&self, _model: &str, use_long_cache: bool) -> Option<std::time::Duration> {
+		Some(crate::llm::config::CacheTTL::from_long_cache_flag(use_long_cache).to_duration())
+	}
 
-    fn supports_video(&self, _model: &str) -> bool {
-        true
-    }
+	fn supports_vision(&self, _model: &str) -> bool {
+		true
+	}
 
-    fn supports_structured_output(&self, _model: &str) -> bool {
-        true
-    }
+	fn supports_video(&self, _model: &str) -> bool {
+		true
+	}
 
-    fn enforces_response_schema(&self, model: &str) -> bool {
-        proxy_route_enforces_response_schema(model)
-    }
+	fn supports_structured_output(&self, _model: &str) -> bool {
+		true
+	}
 
-    fn get_max_input_tokens(&self, _model: &str) -> usize {
-        1_048_576
-    }
+	fn enforces_response_schema(&self, model: &str) -> bool {
+		proxy_route_enforces_response_schema(model)
+	}
 
-    async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
-        let base_url = Self::base_url();
-        let api_url = format!("{}/v1/completions", base_url.trim_end_matches('/'));
+	fn get_max_input_tokens(&self, _model: &str) -> usize {
+		1_048_576
+	}
 
-        // Resolve previous_response_id: explicit param > last non-compression assistant id.
-        // Compression summaries inherit the previous OctoHub completion id only so
-        // local clients can keep continuity metadata. For OctoHub itself they are
-        // a new compacted transcript boundary; treating that id as already-seen
-        // makes classic upstream providers (Z.ai, etc.) reconstruct the old
-        // pre-compression chain and lose the synthetic summary.
-        let previous_id = resolve_previous_id(&params.messages, params.previous_id.clone());
+	async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
+		let api_url = completion_url(&Self::base_url())?;
 
-        // Extract system instructions from messages
-        let instructions = extract_instructions(&params.messages);
+		// Resolve previous_response_id: explicit param > last non-compression assistant id.
+		// Compression summaries inherit the previous OctoHub completion id only so
+		// local clients can keep continuity metadata. For OctoHub itself they are
+		// a new compacted transcript boundary; treating that id as already-seen
+		// makes classic upstream providers (Z.ai, etc.) reconstruct the old
+		// pre-compression chain and lose the synthetic summary.
+		let previous_id = resolve_previous_id(&params.messages, params.previous_id.clone());
 
-        // Convert messages to input array. Use the selected previous_id, not just a
-        // boolean, so a compression summary that inherited an id but is not used as
-        // previous_completion_id is still sent inline to OctoHub.
-        let input_array = messages_to_input(&params.messages, previous_id.as_deref());
+		// Extract system instructions from messages
+		let instructions = extract_instructions(&params.messages);
 
-        // Build request body
-        let mut request_body = serde_json::json!({
-            "model": params.model,
-            "input": input_array,
-        });
+		// Convert messages to input array. Use the selected previous_id, not just a
+		// boolean, so a compression summary that inherited an id but is not used as
+		// previous_completion_id is still sent inline to OctoHub.
+		let input_array = messages_to_input(&params.messages, previous_id.as_deref());
 
-        if let Some(instr) = instructions {
-            request_body["instructions"] = instr;
-        }
+		// Build request body
+		let mut request_body = serde_json::json!({
+			"model": params.model,
+			"input": input_array,
+		});
 
-        if let Some(ref prev_id) = previous_id {
-            request_body["previous_completion_id"] = serde_json::json!(prev_id);
-        }
+		if let Some(instr) = instructions {
+			request_body["instructions"] = instr;
+		}
 
-        // Apply sampling parameters based on model support
-        let sampling = self.effective_sampling_params(&params);
-        if let Some(temp) = sampling.temperature {
-            request_body["temperature"] = serde_json::json!(temp);
-        }
-        if let Some(top_p) = sampling.top_p {
-            request_body["top_p"] = serde_json::json!(top_p);
-        }
-        // Note: OctoHub doesn't support top_k
+		if let Some(ref prev_id) = previous_id {
+			request_body["previous_completion_id"] = serde_json::json!(prev_id);
+		}
 
-        if params.max_tokens > 0 {
-            request_body["max_output_tokens"] = serde_json::json!(params.max_tokens);
-        }
+		if params.max_tokens > 0 {
+			request_body["max_output_tokens"] = serde_json::json!(params.max_tokens);
+		}
 
-        // OctoHub re-runs the request through this same library server-side, so we
-        // forward `reasoning_effort` as a plain string and let the server map it.
-        if let Some(effort) = params.reasoning_effort {
-            let s = match effort {
-                crate::llm::types::ReasoningEffort::Low => "low",
-                crate::llm::types::ReasoningEffort::Medium => "medium",
-                crate::llm::types::ReasoningEffort::High => "high",
-                crate::llm::types::ReasoningEffort::XHigh => "xhigh",
-                crate::llm::types::ReasoningEffort::Max => "max",
-            };
-            request_body["reasoning_effort"] = serde_json::json!(s);
-        }
+		// The rest of the body stays as a real request would send it (including
+		// max_output_tokens, which sizes the thinking budget) so the prefix matches.
+		if params.cache_prewarm {
+			request_body["cache_prewarm"] = serde_json::json!(true);
+		}
 
-        // Add tools
-        if let Some(tools) = &params.tools {
-            if !tools.is_empty() {
-                let mut sorted_tools = tools.clone();
-                sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
+		// OctoHub re-runs the request through this same library server-side, so we
+		// forward `reasoning_effort` as a plain string and let the server map it.
+		if let Some(effort) = params.reasoning_effort {
+			let s = match effort {
+				crate::llm::types::ReasoningEffort::None => "none",
+				crate::llm::types::ReasoningEffort::Low => "low",
+				crate::llm::types::ReasoningEffort::Medium => "medium",
+				crate::llm::types::ReasoningEffort::High => "high",
+				crate::llm::types::ReasoningEffort::XHigh => "xhigh",
+				crate::llm::types::ReasoningEffort::Max => "max",
+			};
+			request_body["reasoning_effort"] = serde_json::json!(s);
+		}
 
-                let tool_defs: Vec<serde_json::Value> = sorted_tools
-                    .iter()
-                    .map(|f| {
-                        let mut tool = serde_json::json!({
-                            "type": "function",
-                            "name": f.name,
-                            "description": f.description,
-                            "parameters": f.parameters
-                        });
-                        if let Some(ref cc) = f.cache_control {
-                            tool["cache_control"] = cc.clone();
-                        }
-                        tool
-                    })
-                    .collect();
+		// Add tools
+		if let Some(tools) = &params.tools {
+			if !tools.is_empty() {
+				let mut sorted_tools = tools.clone();
+				sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
 
-                request_body["tools"] = serde_json::json!(tool_defs);
-            }
-        }
+				let tool_defs: Vec<serde_json::Value> = sorted_tools
+					.iter()
+					.map(|f| {
+						let mut tool = serde_json::json!({
+							"type": "function",
+							"name": f.name,
+							"description": f.description,
+							"parameters": f.parameters
+						});
+						if let Some(ref cc) = f.cache_control {
+							tool["cache_control"] = cc.clone();
+						}
+						tool
+					})
+					.collect();
 
-        // Add structured output format if specified
-        if let Some(response_format) = &params.response_format {
-            match &response_format.format {
-                crate::llm::types::OutputFormat::Json => {
-                    request_body["text"] = serde_json::json!({
-                        "format": { "type": "json_object" }
-                    });
-                }
-                crate::llm::types::OutputFormat::JsonSchema => {
-                    if let Some(schema) = &response_format.schema {
-                        // Strict structured outputs need additionalProperties:false on
-                        // every nested object (no-op unless mode is Strict).
-                        let schema = crate::llm::utils::normalize_strict_schema(
-                            schema,
-                            response_format.mode,
-                        );
+				request_body["tools"] = serde_json::json!(tool_defs);
+			}
+		}
 
-                        let mut format_obj = serde_json::json!({
-                            "type": "json_schema",
-                            "name": "response_schema",
-                            "schema": schema
-                        });
+		// Add structured output format if specified
+		if let Some(response_format) = &params.response_format {
+			match &response_format.format {
+				crate::llm::types::OutputFormat::Json => {
+					request_body["text"] = serde_json::json!({
+						"format": { "type": "json_object" }
+					});
+				}
+				crate::llm::types::OutputFormat::JsonSchema => {
+					if let Some(schema) = &response_format.schema {
+						// Strict structured outputs need additionalProperties:false on
+						// every nested object (no-op unless mode is Strict).
+						let schema = crate::llm::utils::normalize_strict_schema(schema, response_format.mode);
 
-                        if matches!(
-                            response_format.mode,
-                            crate::llm::types::ResponseMode::Strict
-                        ) {
-                            format_obj["strict"] = serde_json::json!(true);
-                        }
+						let mut format_obj = serde_json::json!({
+							"type": "json_schema",
+							"name": "response_schema",
+							"schema": schema
+						});
 
-                        request_body["text"] = serde_json::json!({
-                            "format": format_obj
-                        });
-                    }
-                }
-            }
-        }
+						if matches!(response_format.mode, crate::llm::types::ResponseMode::Strict) {
+							format_obj["strict"] = serde_json::json!(true);
+						}
 
-        // Execute request with retry
-        let api_key = Self::api_key();
-        let start_time = std::time::Instant::now();
-        let request_timeout = params.request_timeout;
-        let extra_headers = params.extra_headers.clone();
+						request_body["text"] = serde_json::json!({
+							"format": format_obj
+						});
+					}
+				}
+			}
+		}
 
-        let response = retry::retry_with_exponential_backoff(
-            || {
-                let client = shared::http_client();
-                let api_key = api_key.clone();
-                let api_url = api_url.clone();
-                let request_body = request_body.clone();
-                let extra_headers = extra_headers.clone();
-                Box::pin(async move {
-                    let mut req = client
-                        .post(&api_url)
-                        .header("Content-Type", "application/json");
+		let api_key = shared::resolve_api_key(self, &params)?;
+		let headers = request_headers(&api_url, &api_key, &params)?;
+		let start_time = std::time::Instant::now();
+		let response = match params.octohub_transport {
+			OctoHubTransport::Http => {
+				retry::retry_provider_request(
+					|| {
+						let req = shared::http_client()
+							.post(&api_url)
+							.headers(headers.clone())
+							.json(&request_body);
+						let timeout = params.request_timeout;
+						Box::pin(async move {
+							let captured = shared::send_and_read(req, timeout, None).await?;
+							retryable_response(captured)
+						})
+					},
+					params.max_retries,
+					params.retry_timeout,
+					params.cancellation_token.as_ref(),
+					params.api_key.as_ref(),
+					params.retry_observer.as_ref(),
+				)
+				.await?
+			}
+			#[cfg(feature = "websockets")]
+			OctoHubTransport::WebSocket => websocket::complete(&params, &api_url, &api_key, &headers, &request_body).await?,
+		};
 
-                    if let Some(ref key) = api_key {
-                        if !key.is_empty() {
-                            req = req.header("Authorization", format!("Bearer {}", key));
-                        }
-                    }
+		let request_time_ms = start_time.elapsed().as_millis() as u64;
 
-                    let captured = shared::send_and_read(
-                        req.json(&request_body),
-                        request_timeout,
-                        extra_headers.as_ref(),
-                    )
-                    .await?;
+		if !response.status.is_success() {
+			return Err(auth_aware_error(
+				response.status.as_u16(),
+				&response.body,
+				params.api_key.is_some(),
+			));
+		}
 
-                    if retry::is_retryable_status(captured.status.as_u16()) {
-                        return Err(anyhow::anyhow!(
-                            "OctoHub API error {}: {}",
-                            captured.status,
-                            captured.body
-                        ));
-                    }
+		let api_response: OctoHubResponse = shared::parse_response(&response.body, params.api_key.as_ref())?;
 
-                    Ok(captured)
-                })
-            },
-            params.max_retries,
-            params.retry_timeout,
-            params.cancellation_token.as_ref(),
-            || crate::errors::ProviderError::Cancelled.into(),
-            |e| {
-                matches!(
-                    e.downcast_ref::<crate::errors::ProviderError>(),
-                    Some(crate::errors::ProviderError::Cancelled)
-                )
-            },
-            |e: &anyhow::Error| shared::is_connection_error(e),
-        )
-        .await?;
+		// Parse output items
+		let mut content = String::new();
+		let mut tool_calls: Option<Vec<ToolCall>> = None;
+		let mut reasoning_content: Option<String> = None;
 
-        let request_time_ms = start_time.elapsed().as_millis() as u64;
+		for output in &api_response.output {
+			match output.output_type.as_str() {
+				"message" => {
+					if let Some(content_array) = &output.content {
+						for item in content_array {
+							if item.content_type == "output_text" {
+								if let Some(text) = &item.text {
+									if !content.is_empty() {
+										content.push('\n');
+									}
+									content.push_str(text);
+								}
+							}
+						}
+					}
+				}
+				"function_call" => {
+					if let (Some(name), Some(args), Some(call_id)) = (&output.name, &output.arguments, &output.call_id)
+					{
+						let arguments: serde_json::Value = if args.is_string() {
+							serde_json::from_str(args.as_str().unwrap_or("{}")).unwrap_or(serde_json::json!({}))
+						} else {
+							args.clone()
+						};
 
-        if !response.status.is_success() {
-            return Err(auth_aware_error(response.status.as_u16(), &response.body));
-        }
+						let new_call = ToolCall {
+							id: call_id.clone(),
+							name: name.clone(),
+							arguments,
+						};
 
-        let response_text = response.body;
+						if let Some(ref mut calls) = tool_calls {
+							calls.push(new_call);
+						} else {
+							tool_calls = Some(vec![new_call]);
+						}
+					}
+				}
+				"reasoning" => {
+					if let Some(content_array) = &output.content {
+						for item in content_array {
+							if item.content_type == "output_text" {
+								if let Some(text) = &item.text {
+									reasoning_content = Some(text.clone());
+								}
+							}
+						}
+					}
+				}
+				_ => {}
+			}
+		}
 
-        let api_response: OctoHubResponse = serde_json::from_str(&response_text)?;
+		// Build usage from OctoHub's flat usage format.
+		//
+		// The OctoHub server forwards `input_tokens` straight from the
+		// upstream provider's octolib `TokenUsage`, which by convention is
+		// ALREADY CLEAN (no cache_read, no cache_write — see
+		// `octolib/src/llm/types.rs::TokenUsage::input_tokens`). Do NOT
+		// subtract cache_read_tokens here; that double-counts and makes the
+		// client believe no fresh input flowed whenever caching is active,
+		// which breaks the cost breakdown display (input line skipped) and
+		// skews cache_efficiency math.
+		let usage = &api_response.usage;
+		let cache_read_tokens = usage.cache_read_tokens.unwrap_or(0);
+		let cache_write_tokens = usage.cache_write_tokens.unwrap_or(0);
+		let input_tokens_clean = usage.input_tokens;
+		let reasoning_tokens = usage.reasoning_tokens.unwrap_or(0);
 
-        // Parse output items
-        let mut content = String::new();
-        let mut tool_calls: Option<Vec<ToolCall>> = None;
-        let mut reasoning_content: Option<String> = None;
+		let thinking = reasoning_content.map(|rc| ThinkingBlock {
+			content: rc,
+			tokens: reasoning_tokens,
+		});
 
-        for output in &api_response.output {
-            match output.output_type.as_str() {
-                "message" => {
-                    if let Some(content_array) = &output.content {
-                        for item in content_array {
-                            if item.content_type == "output_text" {
-                                if let Some(text) = &item.text {
-                                    if !content.is_empty() {
-                                        content.push('\n');
-                                    }
-                                    content.push_str(text);
-                                }
-                            }
-                        }
-                    }
-                }
-                "function_call" => {
-                    if let (Some(name), Some(args), Some(call_id)) =
-                        (&output.name, &output.arguments, &output.call_id)
-                    {
-                        let arguments: serde_json::Value = if args.is_string() {
-                            serde_json::from_str(args.as_str().unwrap_or("{}"))
-                                .unwrap_or(serde_json::json!({}))
-                        } else {
-                            args.clone()
-                        };
+		let token_usage = TokenUsage {
+			input_tokens: input_tokens_clean,
+			cache_read_tokens,
+			cache_write_tokens,
+			// Already split by the upstream provider, same forwarding convention
+			// as input_tokens above — splitting again here would double-subtract.
+			output_tokens: usage.output_tokens,
+			reasoning_tokens,
+			total_tokens: usage.total_tokens,
+			cost: usage.cost,
+			request_time_ms: Some(usage.request_time_ms.unwrap_or(request_time_ms)),
+		};
 
-                        let new_call = ToolCall {
-                            id: call_id.clone(),
-                            name: name.clone(),
-                            arguments,
-                        };
+		// Build response JSON and store tool_calls in unified format
+		let mut response_json: serde_json::Value = shared::parse_response(&response.body, params.api_key.as_ref())?;
+		if let Some(ref tc) = tool_calls {
+			shared::set_response_tool_calls(&mut response_json, tc, None);
+		}
 
-                        if let Some(ref mut calls) = tool_calls {
-                            calls.push(new_call);
-                        } else {
-                            tool_calls = Some(vec![new_call]);
-                        }
-                    }
-                }
-                "reasoning" => {
-                    if let Some(content_array) = &output.content {
-                        for item in content_array {
-                            if item.content_type == "output_text" {
-                                if let Some(text) = &item.text {
-                                    reasoning_content = Some(text.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+		let exchange = ProviderExchange::new(request_body, response_json, Some(token_usage), "octohub");
 
-        // Build usage from OctoHub's flat usage format.
-        //
-        // The OctoHub server forwards `input_tokens` straight from the
-        // upstream provider's octolib `TokenUsage`, which by convention is
-        // ALREADY CLEAN (no cache_read, no cache_write — see
-        // `octolib/src/llm/types.rs::TokenUsage::input_tokens`). Do NOT
-        // subtract cache_read_tokens here; that double-counts and makes the
-        // client believe no fresh input flowed whenever caching is active,
-        // which breaks the cost breakdown display (input line skipped) and
-        // skews cache_efficiency math.
-        let usage = &api_response.usage;
-        let cache_read_tokens = usage.cache_read_tokens.unwrap_or(0);
-        let cache_write_tokens = usage.cache_write_tokens.unwrap_or(0);
-        let input_tokens_clean = usage.input_tokens;
-        let reasoning_tokens = usage.reasoning_tokens.unwrap_or(0);
+		// OctoHub ≥ v0.2.0 mirrors `structured_output` from the upstream
+		// ProviderResponse on the wire — prefer it when present, since the
+		// upstream provider may have validated the JSON against the schema
+		// server-side and the canonical typed value is what we want here.
+		//
+		// Older OctoHub servers (which dropped the field) trigger the
+		// text-parse fallback so this client keeps working against them.
+		// The text-parse path also recovers from upstream providers that
+		// returned bare JSON without populating `structured_output` itself.
+		let structured_output = api_response
+			.structured_output
+			.or_else(|| shared::parse_structured_output_from_text(&content));
 
-        let thinking = reasoning_content.map(|rc| ThinkingBlock {
-            content: rc,
-            tokens: reasoning_tokens,
-        });
-
-        let token_usage = TokenUsage {
-            input_tokens: input_tokens_clean,
-            cache_read_tokens,
-            cache_write_tokens,
-            // Already split by the upstream provider, same forwarding convention
-            // as input_tokens above — splitting again here would double-subtract.
-            output_tokens: usage.output_tokens,
-            reasoning_tokens,
-            total_tokens: usage.total_tokens,
-            cost: usage.cost,
-            request_time_ms: Some(usage.request_time_ms.unwrap_or(request_time_ms)),
-        };
-
-        // Build response JSON and store tool_calls in unified format
-        let mut response_json: serde_json::Value = serde_json::from_str(&response_text)?;
-        if let Some(ref tc) = tool_calls {
-            shared::set_response_tool_calls(&mut response_json, tc, None);
-        }
-
-        let exchange =
-            ProviderExchange::new(request_body, response_json, Some(token_usage), "octohub");
-
-        // OctoHub ≥ v0.2.0 mirrors `structured_output` from the upstream
-        // ProviderResponse on the wire — prefer it when present, since the
-        // upstream provider may have validated the JSON against the schema
-        // server-side and the canonical typed value is what we want here.
-        //
-        // Older OctoHub servers (which dropped the field) trigger the
-        // text-parse fallback so this client keeps working against them.
-        // The text-parse path also recovers from upstream providers that
-        // returned bare JSON without populating `structured_output` itself.
-        let structured_output = api_response
-            .structured_output
-            .or_else(|| shared::parse_structured_output_from_text(&content));
-
-        Ok(ProviderResponse {
-            content,
-            thinking,
-            exchange,
-            tool_calls,
-            // Mirror the upstream `finish_reason` (now surfaced by OctoHub).
-            // `None` from older servers leaves this absent — same as before.
-            finish_reason: api_response.finish_reason,
-            structured_output,
-            id: api_response.id,
-        })
-    }
+		Ok(ProviderResponse {
+			content,
+			thinking,
+			exchange,
+			tool_calls,
+			// Mirror the upstream `finish_reason` (now surfaced by OctoHub).
+			// `None` from older servers leaves this absent — same as before.
+			finish_reason: api_response.finish_reason,
+			structured_output,
+			id: api_response.id,
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -462,43 +489,43 @@ impl AiProvider for OctoHubProvider {
 /// either a plain string or a structured array with `cache_control` when any
 /// system message is marked as cached.
 fn extract_instructions(messages: &[Message]) -> Option<serde_json::Value> {
-    let system_msgs: Vec<&Message> = messages.iter().filter(|m| m.role == "system").collect();
-    if system_msgs.is_empty() {
-        return None;
-    }
+	let system_msgs: Vec<&Message> = messages.iter().filter(|m| m.role == "system").collect();
+	if system_msgs.is_empty() {
+		return None;
+	}
 
-    let text = system_msgs
-        .iter()
-        .map(|m| m.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+	let text = system_msgs
+		.iter()
+		.map(|m| m.content.as_str())
+		.collect::<Vec<_>>()
+		.join("\n");
 
-    let any_cached = system_msgs.iter().any(|m| m.cached);
-    if any_cached {
-        let ttl = system_msgs.iter().find_map(|m| m.cache_ttl.as_deref());
-        let mut block = serde_json::json!([{
-            "type": "text",
-            "text": text,
-        }]);
-        block[0]["cache_control"] = shared::ephemeral_cache_control_with_ttl(ttl);
-        Some(block)
-    } else {
-        Some(serde_json::json!(text))
-    }
+	let any_cached = system_msgs.iter().any(|m| m.cached);
+	if any_cached {
+		let ttl = system_msgs.iter().find_map(|m| m.cache_ttl.as_deref());
+		let mut block = serde_json::json!([{
+			"type": "text",
+			"text": text,
+		}]);
+		block[0]["cache_control"] = shared::ephemeral_cache_control_with_ttl(ttl);
+		Some(block)
+	} else {
+		Some(serde_json::json!(text))
+	}
 }
 
 fn is_compression_summary(msg: &Message) -> bool {
-    msg.role == "assistant" && msg.name.as_deref() == Some("plan_compression")
+	msg.role == "assistant" && msg.name.as_deref() == Some("plan_compression")
 }
 
 fn resolve_previous_id(messages: &[Message], explicit: Option<String>) -> Option<String> {
-    explicit.or_else(|| {
-        messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "assistant" && m.id.is_some() && !is_compression_summary(m))
-            .and_then(|m| m.id.clone())
-    })
+	explicit.or_else(|| {
+		messages
+			.iter()
+			.rev()
+			.find(|m| m.role == "assistant" && m.id.is_some() && !is_compression_summary(m))
+			.and_then(|m| m.id.clone())
+	})
 }
 
 /// Convert conversation messages to OctoHub `input` array.
@@ -523,87 +550,85 @@ fn resolve_previous_id(messages: &[Message], explicit: Option<String>) -> Option
 /// `push_items` accepts interleaved `function_call_output` and `message`
 /// items in one input array, so we forward them together.
 fn messages_to_input(messages: &[Message], previous_id: Option<&str>) -> Vec<serde_json::Value> {
-    if let Some(previous_id) = previous_id {
-        let previous_assistant_idx = messages
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, m)| m.role == "assistant" && m.id.as_deref() == Some(previous_id))
-            .map(|(idx, _)| idx);
+	if let Some(previous_id) = previous_id {
+		let previous_assistant_idx = messages
+			.iter()
+			.enumerate()
+			.rev()
+			.find(|(_, m)| m.role == "assistant" && m.id.as_deref() == Some(previous_id))
+			.map(|(idx, _)| idx);
 
-        let start = previous_assistant_idx.map(|idx| idx + 1).unwrap_or(0);
+		let start = previous_assistant_idx.map(|idx| idx + 1).unwrap_or(0);
 
-        messages
-            .iter()
-            .skip(start)
-            .flat_map(input_items_for_message)
-            .collect()
-    } else {
-        // Initial or locally-compacted request: send the local transcript, not
-        // just user turns. This is required after compression because the
-        // synthetic assistant summary is the context replacement.
-        messages.iter().flat_map(input_items_for_message).collect()
-    }
+		messages.iter().skip(start).flat_map(input_items_for_message).collect()
+	} else {
+		// Initial or locally-compacted request: send the local transcript, not
+		// just user turns. This is required after compression because the
+		// synthetic assistant summary is the context replacement.
+		messages.iter().flat_map(input_items_for_message).collect()
+	}
 }
 
 fn input_items_for_message(msg: &Message) -> Vec<serde_json::Value> {
-    match msg.role.as_str() {
-        "tool" => {
-            let call_id = msg.tool_call_id.clone().unwrap_or_default();
-            let mut item = serde_json::json!({
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": msg.content
-            });
-            // Forward the rolling cache breakpoint octomind sets on the tail tool
-            // result. Without this the marker is dropped and the (large) tool-result
-            // history is re-sent uncached every turn. Mirrors `user_message_value`.
-            if msg.cached {
-                item["cache_control"] =
-                    shared::ephemeral_cache_control_with_ttl(msg.cache_ttl.as_deref());
-            }
-            vec![item]
-        }
-        "user" => vec![user_message_value(msg)],
-        "assistant" => {
-            let mut items = Vec::new();
+	match msg.role.as_str() {
+		"tool" => {
+			let call_id = msg.tool_call_id.clone().unwrap_or_default();
+			let mut item = serde_json::json!({
+				"type": "function_call_output",
+				"call_id": call_id,
+				"output": if msg.images.as_ref().is_some_and(|images| !images.is_empty()) {
+					user_message_value(msg)["content"].clone()
+				} else {
+					serde_json::json!(msg.content)
+				}
+			});
+			// Forward the rolling cache breakpoint octomind sets on the tail tool
+			// result. Without this the marker is dropped and the (large) tool-result
+			// history is re-sent uncached every turn. Mirrors `user_message_value`.
+			if msg.cached {
+				item["cache_control"] = shared::ephemeral_cache_control_with_ttl(msg.cache_ttl.as_deref());
+			}
+			vec![item]
+		}
+		"user" => vec![user_message_value(msg)],
+		"assistant" => {
+			let mut items = Vec::new();
 
-            if !msg.content.is_empty() {
-                // Plain string unless cached; when cached, use the typed-parts shape so
-                // the cache_control marker rides along (server reads it via is_cached()).
-                let content = if msg.cached {
-                    let mut block = serde_json::json!([{
-                        "type": "input_text",
-                        "text": msg.content,
-                    }]);
-                    block[0]["cache_control"] =
-                        shared::ephemeral_cache_control_with_ttl(msg.cache_ttl.as_deref());
-                    block
-                } else {
-                    serde_json::json!(msg.content)
-                };
-                items.push(serde_json::json!({
-                    "type": "message",
-                    "role": "assistant",
-                    "content": content
-                }));
-            }
+			if !msg.content.is_empty() {
+				// Plain string unless cached; when cached, use the typed-parts shape so
+				// the cache_control marker rides along (server reads it via is_cached()).
+				let content = if msg.cached {
+					let mut block = serde_json::json!([{
+						"type": "input_text",
+						"text": msg.content,
+					}]);
+					block[0]["cache_control"] = shared::ephemeral_cache_control_with_ttl(msg.cache_ttl.as_deref());
+					block
+				} else {
+					serde_json::json!(msg.content)
+				};
+				items.push(serde_json::json!({
+					"type": "message",
+					"role": "assistant",
+					"content": content
+				}));
+			}
 
-            // Without previous_completion_id the server has no stored assistant
-            // turn, so replay each function call before its function_call_output.
-            for call in shared::parse_generic_tool_calls_lossy(msg.tool_calls.as_ref(), "octohub") {
-                items.push(serde_json::json!({
-                    "type": "function_call",
-                    "call_id": call.id,
-                    "name": call.name,
-                    "arguments": shared::arguments_to_json_string(&call.arguments),
-                }));
-            }
+			// Without previous_completion_id the server has no stored assistant
+			// turn, so replay each function call before its function_call_output.
+			for call in shared::parse_generic_tool_calls_lossy(msg.tool_calls.as_ref(), "octohub") {
+				items.push(serde_json::json!({
+					"type": "function_call",
+					"call_id": call.id,
+					"name": call.name,
+					"arguments": shared::arguments_to_json_string(&call.arguments),
+				}));
+			}
 
-            items
-        }
-        _ => Vec::new(),
-    }
+			items
+		}
+		_ => Vec::new(),
+	}
 }
 
 /// Build a single user message JSON value. When the message has image/video
@@ -614,69 +639,67 @@ fn input_items_for_message(msg: &Message) -> Vec<serde_json::Value> {
 /// When there are no attachments and no cache marker, `content` stays a plain
 /// string — the simpler shape every OctoHub-supported provider accepts.
 fn user_message_value(msg: &Message) -> serde_json::Value {
-    let has_images = msg.images.as_ref().is_some_and(|v| !v.is_empty());
-    let has_videos = msg.videos.as_ref().is_some_and(|v| !v.is_empty());
+	let has_images = msg.images.as_ref().is_some_and(|v| !v.is_empty());
+	let has_videos = msg.videos.as_ref().is_some_and(|v| !v.is_empty());
 
-    let content: serde_json::Value = if has_images || has_videos {
-        let mut parts: Vec<serde_json::Value> = Vec::new();
-        let mut text_part = serde_json::json!({
-            "type": "input_text",
-            "text": msg.content,
-        });
-        if msg.cached {
-            text_part["cache_control"] =
-                shared::ephemeral_cache_control_with_ttl(msg.cache_ttl.as_deref());
-        }
-        parts.push(text_part);
+	let content: serde_json::Value = if has_images || has_videos {
+		let mut parts: Vec<serde_json::Value> = Vec::new();
+		let mut text_part = serde_json::json!({
+			"type": "input_text",
+			"text": msg.content,
+		});
+		if msg.cached {
+			text_part["cache_control"] = shared::ephemeral_cache_control_with_ttl(msg.cache_ttl.as_deref());
+		}
+		parts.push(text_part);
 
-        if let Some(images) = &msg.images {
-            for image in images {
-                let url = match &image.data {
-                    crate::llm::types::ImageData::Base64(data) => {
-                        format!("data:{};base64,{}", image.media_type, data)
-                    }
-                    crate::llm::types::ImageData::Url(u) => u.clone(),
-                };
-                parts.push(serde_json::json!({
-                    "type": "input_image",
-                    "image_url": url,
-                }));
-            }
-        }
+		if let Some(images) = &msg.images {
+			for image in images {
+				let url = match &image.data {
+					crate::llm::types::ImageData::Base64(data) => {
+						format!("data:{};base64,{}", image.media_type, data)
+					}
+					crate::llm::types::ImageData::Url(u) => u.clone(),
+				};
+				parts.push(serde_json::json!({
+					"type": "input_image",
+					"image_url": url,
+				}));
+			}
+		}
 
-        if let Some(videos) = &msg.videos {
-            for video in videos {
-                let url = match &video.data {
-                    crate::llm::types::VideoData::Base64(data) => {
-                        format!("data:{};base64,{}", video.media_type, data)
-                    }
-                    crate::llm::types::VideoData::Url(u) => u.clone(),
-                };
-                parts.push(serde_json::json!({
-                    "type": "input_video",
-                    "video_url": url,
-                }));
-            }
-        }
+		if let Some(videos) = &msg.videos {
+			for video in videos {
+				let url = match &video.data {
+					crate::llm::types::VideoData::Base64(data) => {
+						format!("data:{};base64,{}", video.media_type, data)
+					}
+					crate::llm::types::VideoData::Url(u) => u.clone(),
+				};
+				parts.push(serde_json::json!({
+					"type": "input_video",
+					"video_url": url,
+				}));
+			}
+		}
 
-        serde_json::Value::Array(parts)
-    } else if msg.cached {
-        let mut block = serde_json::json!([{
-            "type": "input_text",
-            "text": msg.content,
-        }]);
-        block[0]["cache_control"] =
-            shared::ephemeral_cache_control_with_ttl(msg.cache_ttl.as_deref());
-        block
-    } else {
-        serde_json::json!(msg.content)
-    };
+		serde_json::Value::Array(parts)
+	} else if msg.cached {
+		let mut block = serde_json::json!([{
+			"type": "input_text",
+			"text": msg.content,
+		}]);
+		block[0]["cache_control"] = shared::ephemeral_cache_control_with_ttl(msg.cache_ttl.as_deref());
+		block
+	} else {
+		serde_json::json!(msg.content)
+	};
 
-    serde_json::json!({
-        "type": "message",
-        "role": "user",
-        "content": content
-    })
+	serde_json::json!({
+		"type": "message",
+		"role": "user",
+		"content": content
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -685,61 +708,61 @@ fn user_message_value(msg: &Message) -> serde_json::Value {
 
 #[derive(Deserialize, Debug)]
 struct OctoHubResponse {
-    #[serde(default)]
-    id: Option<String>,
-    output: Vec<OutputItem>,
-    usage: OctoHubUsage,
-    /// Schema-validated JSON from the upstream provider, surfaced by OctoHub
-    /// since v0.2.0. When present, callers MUST prefer this over re-parsing
-    /// `output[].content[].text` — the upstream may have validated the JSON
-    /// against the schema server-side, so this is the canonical typed result.
-    /// `None` from older OctoHub servers triggers the text-parse fallback
-    /// path for backwards compatibility.
-    #[serde(default)]
-    structured_output: Option<serde_json::Value>,
-    /// Upstream finish_reason (`stop`, `length`, `tool_calls`,
-    /// `content_filter`, …). Surfaced by OctoHub since v0.2.0.
-    #[serde(default)]
-    finish_reason: Option<String>,
+	#[serde(default)]
+	id: Option<String>,
+	output: Vec<OutputItem>,
+	usage: OctoHubUsage,
+	/// Schema-validated JSON from the upstream provider, surfaced by OctoHub
+	/// since v0.2.0. When present, callers MUST prefer this over re-parsing
+	/// `output[].content[].text` — the upstream may have validated the JSON
+	/// against the schema server-side, so this is the canonical typed result.
+	/// `None` from older OctoHub servers triggers the text-parse fallback
+	/// path for backwards compatibility.
+	#[serde(default)]
+	structured_output: Option<serde_json::Value>,
+	/// Upstream finish_reason (`stop`, `length`, `tool_calls`,
+	/// `content_filter`, …). Surfaced by OctoHub since v0.2.0.
+	#[serde(default)]
+	finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
 struct OutputItem {
-    #[serde(rename = "type")]
-    output_type: String,
-    #[serde(default)]
-    call_id: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    arguments: Option<serde_json::Value>,
-    #[serde(default)]
-    content: Option<Vec<OutputContent>>,
+	#[serde(rename = "type")]
+	output_type: String,
+	#[serde(default)]
+	call_id: Option<String>,
+	#[serde(default)]
+	name: Option<String>,
+	#[serde(default)]
+	arguments: Option<serde_json::Value>,
+	#[serde(default)]
+	content: Option<Vec<OutputContent>>,
 }
 
 #[derive(Deserialize, Debug)]
 struct OutputContent {
-    #[serde(rename = "type")]
-    content_type: String,
-    #[serde(default)]
-    text: Option<String>,
+	#[serde(rename = "type")]
+	content_type: String,
+	#[serde(default)]
+	text: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
 struct OctoHubUsage {
-    input_tokens: u64,
-    output_tokens: u64,
-    total_tokens: u64,
-    #[serde(default)]
-    cache_read_tokens: Option<u64>,
-    #[serde(default)]
-    cache_write_tokens: Option<u64>,
-    #[serde(default)]
-    reasoning_tokens: Option<u64>,
-    #[serde(default)]
-    cost: Option<f64>,
-    #[serde(default)]
-    request_time_ms: Option<u64>,
+	input_tokens: u64,
+	output_tokens: u64,
+	total_tokens: u64,
+	#[serde(default)]
+	cache_read_tokens: Option<u64>,
+	#[serde(default)]
+	cache_write_tokens: Option<u64>,
+	#[serde(default)]
+	reasoning_tokens: Option<u64>,
+	#[serde(default)]
+	cost: Option<f64>,
+	#[serde(default)]
+	request_time_ms: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -747,278 +770,13 @@ struct OctoHubUsage {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "octohub_tests.rs"]
+mod tests;
 
-    #[test]
-    fn test_provider_name() {
-        let provider = OctoHubProvider::new();
-        assert_eq!(provider.name(), "octohub");
-    }
+#[cfg(test)]
+#[path = "octohub_http_tests.rs"]
+mod http_tests;
 
-    #[test]
-    fn test_supports_any_model() {
-        let provider = OctoHubProvider::new();
-        assert!(provider.supports_model("gpt-4o"));
-        assert!(provider.supports_model("claude-sonnet-4-20250514"));
-        assert!(provider.supports_model("any-model-name"));
-        assert!(!provider.supports_model(""));
-    }
-
-    #[test]
-    fn test_capabilities() {
-        let provider = OctoHubProvider::new();
-        assert!(provider.supports_caching("any"));
-        assert!(provider.supports_vision("any"));
-        assert!(provider.supports_video("any"));
-        assert!(provider.supports_structured_output("any"));
-        assert!(provider.enforces_response_schema("unknown-model"));
-        assert!(provider.enforces_response_schema("deepseek-v4-pro"));
-        assert!(!provider.enforces_response_schema("mistral-7b"));
-        assert_eq!(provider.get_max_input_tokens("any"), 1_048_576);
-    }
-
-    #[test]
-    fn test_extract_instructions_single() {
-        let messages = vec![Message::system("You are helpful."), Message::user("Hello")];
-        let instr = extract_instructions(&messages).unwrap();
-        assert_eq!(instr, serde_json::json!("You are helpful."));
-    }
-
-    #[test]
-    fn test_extract_instructions_none() {
-        let messages = vec![Message::user("Hello")];
-        assert_eq!(extract_instructions(&messages), None);
-    }
-
-    #[test]
-    fn test_extract_instructions_cached() {
-        let messages = vec![
-            Message::system("You are helpful.").with_cache_marker(),
-            Message::user("Hello"),
-        ];
-        let instr = extract_instructions(&messages).unwrap();
-        let arr = instr.as_array().expect("should be array when cached");
-        assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["type"], "text");
-        assert_eq!(arr[0]["text"], "You are helpful.");
-        assert_eq!(arr[0]["cache_control"]["type"], "ephemeral");
-    }
-
-    #[test]
-    fn test_user_message_value_plain() {
-        let msg = Message::user("Hello");
-        let val = user_message_value(&msg);
-        assert_eq!(val["content"], "Hello");
-    }
-
-    #[test]
-    fn test_user_message_value_cached() {
-        let msg = Message::user("Hello").with_cache_marker();
-        let val = user_message_value(&msg);
-        let content = val["content"].as_array().expect("should be array");
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["type"], "input_text");
-        assert_eq!(content[0]["text"], "Hello");
-        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
-    }
-
-    #[test]
-    fn test_messages_to_input_initial() {
-        let messages = vec![Message::system("You are helpful."), Message::user("Hello!")];
-
-        let input = messages_to_input(&messages, None);
-        // System messages go to instructions, not input
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["type"], "message");
-        assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[0]["content"], "Hello!");
-    }
-
-    #[test]
-    fn test_messages_to_input_continuation_user() {
-        let mut assistant = Message::assistant("Rust is a systems language.");
-        assistant.id = Some("resp_abc".to_string());
-        let messages = vec![
-            Message::user("What is Rust?"),
-            assistant,
-            Message::user("Tell me more."),
-        ];
-
-        let input = messages_to_input(&messages, Some("resp_abc"));
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["type"], "message");
-        assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[0]["content"], "Tell me more.");
-    }
-
-    #[test]
-    fn test_messages_to_input_tool_results() {
-        let mut assistant_msg = Message::assistant("");
-        assistant_msg.tool_calls = Some(serde_json::json!([{
-            "id": "call_xyz",
-            "name": "get_weather",
-            "arguments": {"location": "NYC"}
-        }]));
-        assistant_msg.id = Some("resp_123".to_string());
-        let messages = vec![
-            Message::user("What is the weather?"),
-            assistant_msg,
-            Message::tool("72°F sunny", "call_xyz", "get_weather"),
-        ];
-
-        let input = messages_to_input(&messages, Some("resp_123"));
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["type"], "function_call_output");
-        assert_eq!(input[0]["call_id"], "call_xyz");
-        assert_eq!(input[0]["output"], "72°F sunny");
-    }
-
-    #[test]
-    fn test_messages_to_input_rebased_tool_call_and_result() {
-        let mut assistant_msg = Message::assistant("");
-        assistant_msg.tool_calls = Some(serde_json::json!([{
-            "id": "call_xyz",
-            "name": "get_weather",
-            "arguments": {"location": "NYC"}
-        }]));
-        let messages = vec![
-            Message::user("What is the weather?"),
-            assistant_msg,
-            Message::tool("72°F sunny", "call_xyz", "get_weather"),
-        ];
-
-        let input = messages_to_input(&messages, None);
-        assert_eq!(input.len(), 3);
-        assert_eq!(input[0]["type"], "message");
-        assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[1]["type"], "function_call");
-        assert_eq!(input[1]["call_id"], "call_xyz");
-        assert_eq!(input[1]["name"], "get_weather");
-        assert_eq!(input[1]["arguments"], r#"{"location":"NYC"}"#);
-        assert_eq!(input[2]["type"], "function_call_output");
-        assert_eq!(input[2]["call_id"], "call_xyz");
-        assert_eq!(input[2]["output"], "72°F sunny");
-    }
-
-    /// Regression: after a multi-turn cancel that leaves a tool_result without
-    /// a follow-up assistant response, the next user message must be sent
-    /// alongside the tool_result — not dropped. Previously this case returned
-    /// only the tool_result and the user's question was silently lost,
-    /// causing the next assistant turn to reply to the tool result and the
-    /// model to drift "off-track" for the rest of the conversation.
-    #[test]
-    fn test_messages_to_input_tool_result_then_user_after_cancel() {
-        let mut assistant_msg = Message::assistant("");
-        assistant_msg.tool_calls = Some(serde_json::json!([{
-            "id": "call_xyz",
-            "name": "get_weather",
-            "arguments": {"location": "NYC"}
-        }]));
-        assistant_msg.id = Some("resp_123".to_string());
-        let messages = vec![
-            Message::user("What is the weather?"),
-            assistant_msg,
-            Message::tool("72°F sunny", "call_xyz", "get_weather"),
-            Message::user("Now write me a poem about it."),
-        ];
-
-        let input = messages_to_input(&messages, Some("resp_123"));
-        assert_eq!(
-            input.len(),
-            2,
-            "tool_result and follow-up user must both be sent"
-        );
-        assert_eq!(input[0]["type"], "function_call_output");
-        assert_eq!(input[0]["call_id"], "call_xyz");
-        assert_eq!(input[0]["output"], "72°F sunny");
-        assert_eq!(input[1]["type"], "message");
-        assert_eq!(input[1]["role"], "user");
-        assert_eq!(input[1]["content"], "Now write me a poem about it.");
-    }
-
-    #[test]
-    fn test_parse_response() {
-        let json = r#"{
-            "id": "resp_abc123",
-            "object": "response",
-            "model": "gpt-4o",
-            "output": [
-                {
-                    "type": "message",
-                    "id": "msg_001",
-                    "role": "assistant",
-                    "content": [
-                        {"type": "output_text", "text": "Hello!"}
-                    ]
-                }
-            ],
-            "usage": {
-                "input_tokens": 10,
-                "output_tokens": 5,
-                "total_tokens": 15,
-                "cost": 0.0001,
-                "request_time_ms": 500
-            },
-            "created_at": 1700000000
-        }"#;
-
-        let resp: OctoHubResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.id, Some("resp_abc123".to_string()));
-        assert_eq!(resp.output.len(), 1);
-        assert_eq!(resp.output[0].output_type, "message");
-        assert_eq!(resp.usage.input_tokens, 10);
-        assert_eq!(resp.usage.output_tokens, 5);
-        assert_eq!(resp.usage.cost, Some(0.0001));
-        assert_eq!(resp.usage.request_time_ms, Some(500));
-    }
-
-    #[test]
-    fn test_parse_function_call_response() {
-        let json = r#"{
-            "id": "resp_xyz",
-            "output": [
-                {
-                    "type": "function_call",
-                    "id": "fc_001",
-                    "call_id": "call_abc",
-                    "name": "get_weather",
-                    "arguments": "{\"location\":\"NYC\"}"
-                }
-            ],
-            "usage": {
-                "input_tokens": 20,
-                "output_tokens": 10,
-                "total_tokens": 30
-            }
-        }"#;
-
-        let resp: OctoHubResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.output.len(), 1);
-        assert_eq!(resp.output[0].output_type, "function_call");
-        assert_eq!(resp.output[0].name, Some("get_weather".to_string()));
-        assert_eq!(resp.output[0].call_id, Some("call_abc".to_string()));
-    }
-
-    #[test]
-    fn test_parse_usage_with_cache() {
-        let json = r#"{
-            "id": "resp_cache",
-            "output": [],
-            "usage": {
-                "input_tokens": 100,
-                "output_tokens": 50,
-                "total_tokens": 150,
-                "cache_read_tokens": 80,
-                "cache_write_tokens": 20,
-                "cost": 0.005,
-                "request_time_ms": 200
-            }
-        }"#;
-
-        let resp: OctoHubResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.usage.cache_read_tokens, Some(80));
-        assert_eq!(resp.usage.cache_write_tokens, Some(20));
-        assert_eq!(resp.usage.cost, Some(0.005));
-    }
-}
+#[cfg(test)]
+#[path = "octohub_transport_tests.rs"]
+mod transport_tests;

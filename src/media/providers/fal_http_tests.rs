@@ -1,0 +1,774 @@
+// Copyright 2026 Muvon Un Limited
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! MockHTTP-driven coverage for the fal queue adapter's submit/poll/cancel
+//! HTTP paths, complementing the pure-parser tests in `fal.rs`.
+
+use super::*;
+use crate::test_support::env::EnvGuard;
+use crate::test_support::mock_http::{MockHttp, RecordedRequest};
+
+const MODEL: &str = "fal-ai/flux/dev";
+/// Queue request URLs address the owner/app pair, dropping deeper segments.
+const APP: &str = "fal-ai/flux";
+
+/// What a test keeps alive besides the queue mock it inspects: the environment
+/// (restored when the test ends, pass or fail) and fal's model catalog.
+struct Scope {
+	_env: EnvGuard,
+	catalog: MockHttp,
+}
+
+/// fal's catalog listing for one endpoint.
+fn listing(model: &str, category: &str) -> (u16, String) {
+	(
+		200,
+		json!({"models": [{"endpoint_id": model, "metadata": {"category": category}}]}).to_string(),
+	)
+}
+
+/// Start the queue mock and point the adapter at it. The catalog gets its own
+/// mock: whether an endpoint's category is already cached must not shift the
+/// queue's replies.
+fn start_fal(catalog_reply: (u16, String), replies: Vec<(u16, String)>) -> (MockHttp, Scope) {
+	let mock = MockHttp::start(replies);
+	let catalog = MockHttp::start(vec![catalog_reply]);
+	let env = EnvGuard::new()
+		.set(API_BASE_ENV, mock.base_url())
+		.set(OPENAPI_URL_ENV, format!("{}/openapi.json", mock.base_url()))
+		.set(MODELS_URL_ENV, catalog.base_url())
+		.set(API_KEY_ENV, "mock-key");
+	(mock, Scope { _env: env, catalog })
+}
+
+fn start_mock(replies: Vec<(u16, String)>) -> (MockHttp, Scope) {
+	start_fal(listing(MODEL, "text-to-image"), replies)
+}
+
+async fn submit_handle(mock: &MockHttp) -> JobHandle {
+	let provider = FalMediaProvider::new();
+	let request = ImageGenerationRequest::new("a castle").with_model(MODEL);
+	let operation = provider.submit_image(request).await.expect("queue submitted");
+	assert_eq!(operation.status, OperationStatus::Queued);
+
+	let requests = mock.requests();
+	assert_eq!(requests[0].method, "POST");
+	assert_eq!(requests[0].path, format!("/{MODEL}"));
+	let body: Value = serde_json::from_str(&requests[0].body).expect("request json");
+	assert_eq!(body["prompt"], "a castle");
+
+	operation.handle.expect("handle present")
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn submit_image_enqueues_and_polls_queue_position() {
+	let (mock, _env) = start_mock(vec![
+		(200, r#"{"request_id":"req-1","status":"IN_QUEUE"}"#.to_string()),
+		(200, r#"{"status":"IN_QUEUE","queue_position":3}"#.to_string()),
+	]);
+
+	let provider = FalMediaProvider::new();
+	let handle = submit_handle(&mock).await;
+	assert_eq!(handle.remote_id, "req-1");
+	assert_eq!(handle.task, MediaTask::TextToImage);
+
+	let operation = provider.poll_image(&handle).await.expect("status polled");
+	assert_eq!(operation.status, OperationStatus::Queued);
+	assert_eq!(operation.handle.expect("handle present").remote_id, "req-1");
+
+	let requests = mock.requests();
+	assert_eq!(requests[1].method, "GET");
+	assert_eq!(requests[1].path, format!("/{APP}/requests/req-1/status"));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn poll_image_fetches_the_result_once_completed() {
+	let (_submit_mock, _env) = start_mock(vec![(200, r#"{"request_id":"req-1"}"#.to_string())]);
+	let provider = FalMediaProvider::new();
+	let request = ImageGenerationRequest::new("a castle").with_model(MODEL);
+	let handle = provider
+		.submit_image(request)
+		.await
+		.expect("queue submitted")
+		.handle
+		.expect("handle present");
+
+	let (mock, _env) = start_mock(vec![
+		(200, r#"{"status":"COMPLETED"}"#.to_string()),
+		(
+			200,
+			r#"{"images":[{"url":"https://v3.fal.media/files/a.png"}]}"#.to_string(),
+		),
+	]);
+	let operation = provider.poll_image(&handle).await.expect("result fetched");
+	assert_eq!(operation.status, OperationStatus::Succeeded);
+	let result = operation.result.expect("result present");
+	assert_eq!(result.artifacts.len(), 1);
+	assert_eq!(result.artifacts[0].media_type, "image/png");
+
+	let requests = mock.requests();
+	assert_eq!(requests[0].path, format!("/{APP}/requests/req-1/status"));
+	assert_eq!(requests[1].path, format!("/{APP}/requests/req-1"));
+}
+
+/// The prod case (2026-10-23): a music model submitted as an image finished with
+/// audio only. That is the job's final outcome, so it must come back Failed —
+/// as an error it left the job live and every poll re-read the same output.
+#[tokio::test]
+#[serial_test::serial]
+async fn poll_image_fails_a_completed_request_with_no_image_output() {
+	let (_mock, _env) = start_mock(vec![
+		(200, r#"{"request_id":"req-1"}"#.to_string()),
+		(200, r#"{"status":"COMPLETED"}"#.to_string()),
+		(
+			200,
+			r#"{"audio":{"url":"https://v3.fal.media/files/track.mp3"}}"#.to_string(),
+		),
+	]);
+
+	let provider = FalMediaProvider::new();
+	let request = ImageGenerationRequest::new("a calm track").with_model(MODEL);
+	let handle = provider
+		.submit_image(request)
+		.await
+		.expect("queue submitted")
+		.handle
+		.expect("handle present");
+
+	let operation = provider.poll_image(&handle).await.expect("outcome, not an error");
+	assert_eq!(operation.status, OperationStatus::Failed);
+	let error = operation.error.expect("failure present");
+	assert_eq!(error.category, FailureCategory::InvalidResponse);
+	assert!(error.message.contains("image"), "unexpected message: {error:?}");
+	assert_eq!(error.request_id.as_deref(), Some("req-1"));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn poll_image_maps_a_422_result_to_invalid_input_failure() {
+	let (_mock, _env) = start_mock(vec![
+		(200, r#"{"request_id":"req-1"}"#.to_string()),
+		(200, r#"{"status":"COMPLETED"}"#.to_string()),
+		(422, r#"{"detail":"prompt violates policy"}"#.to_string()),
+	]);
+
+	let provider = FalMediaProvider::new();
+	let request = ImageGenerationRequest::new("a castle").with_model(MODEL);
+	let handle = provider
+		.submit_image(request)
+		.await
+		.expect("queue submitted")
+		.handle
+		.expect("handle present");
+
+	let operation = provider.poll_image(&handle).await.expect("failure fetched");
+	assert_eq!(operation.status, OperationStatus::Failed);
+	let error = operation.error.expect("failure present");
+	assert_eq!(error.category, FailureCategory::InvalidInput);
+	assert_eq!(error.http_status, Some(422));
+	assert!(error.message.contains("policy"), "unexpected message: {error:?}");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cancel_image_puts_the_cancel_route() {
+	let (mock, _env) = start_mock(vec![
+		(200, r#"{"request_id":"req-1"}"#.to_string()),
+		(200, "{}".to_string()),
+	]);
+
+	let provider = FalMediaProvider::new();
+	let request = ImageGenerationRequest::new("a castle").with_model(MODEL);
+	let handle = provider
+		.submit_image(request)
+		.await
+		.expect("queue submitted")
+		.handle
+		.expect("handle present");
+
+	provider.cancel_image(&handle).await.expect("request cancelled");
+
+	let requests = mock.requests();
+	assert_eq!(requests[1].method, "PUT");
+	assert_eq!(requests[1].path, format!("/{APP}/requests/req-1/cancel"));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn submit_image_surfaces_authentication_errors() {
+	let (_mock, _env) = start_mock(vec![(401, r#"{"detail":"invalid key"}"#.to_string())]);
+
+	let provider = FalMediaProvider::new();
+	let request = ImageGenerationRequest::new("a castle").with_model(MODEL);
+	let error = provider.submit_image(request).await.expect_err("401 surfaces");
+	assert!(
+		matches!(error, MediaError::Authentication { .. }),
+		"unexpected error: {error}"
+	);
+}
+
+/// Minimal fal OpenAPI document: one path, one input schema with `properties`.
+fn openapi_reply(model: &str, properties: Value) -> (u16, String) {
+	let document = json!({
+		"paths": {format!("/{model}"): {"post": {"requestBody": {"content": {
+			"application/json": {"schema": {"$ref": "#/components/schemas/VideoInput"}}
+		}}}}},
+		"components": {"schemas": {"VideoInput": {"properties": properties}}}
+	});
+	(200, document.to_string())
+}
+
+fn start_video_mock(model: &str, replies: Vec<(u16, String)>) -> (MockHttp, Scope) {
+	start_fal(listing(model, "text-to-video"), replies)
+}
+
+fn video_request(model: &str, duration: f64) -> VideoGenerationRequest {
+	let mut request = VideoGenerationRequest::new("a wave").with_model(model);
+	request.duration_secs = Some(duration);
+	request
+}
+
+const QUEUED: &str = r#"{"request_id":"req-1"}"#;
+
+/// The prod case (2026-10-23): a music endpoint submitted as an image. fal's
+/// catalog says it makes audio, so nothing is queued — while its own route
+/// still goes through.
+#[tokio::test]
+#[serial_test::serial]
+async fn submit_refuses_a_route_the_endpoint_does_not_make() {
+	let model = "fal-ai/test-music";
+	let (mock, _scope) = start_fal(listing(model, "text-to-audio"), vec![(200, QUEUED.to_string())]);
+
+	let error = FalMediaProvider::new()
+		.submit_image(ImageGenerationRequest::new("a calm track").with_model(model))
+		.await
+		.expect_err("an audio endpoint is not an image route");
+	assert!(
+		matches!(
+			error,
+			MediaError::UnsupportedTask {
+				task: MediaTask::TextToImage,
+				..
+			}
+		),
+		"unexpected error: {error}"
+	);
+	assert!(mock.requests().is_empty(), "nothing may be queued");
+
+	FalMediaProvider::new()
+		.submit_speech(SpeechSynthesisRequest::new("a calm track", "default").with_model(model))
+		.await
+		.expect("the audio route is accepted");
+	assert_eq!(mock.requests().len(), 1);
+}
+
+/// A private app is absent from fal's public catalog (404). It cannot be
+/// checked, so it is submitted as before.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_endpoint_the_catalog_does_not_list_is_submitted_unchecked() {
+	let (mock, _scope) = start_fal(
+		(404, r#"{"error":{"type":"not_found"}}"#.to_string()),
+		vec![(200, QUEUED.to_string())],
+	);
+	FalMediaProvider::new()
+		.submit_image(ImageGenerationRequest::new("a castle").with_model("someone/private-app"))
+		.await
+		.expect("submitted unchecked");
+	assert_eq!(mock.requests().len(), 1);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn the_catalog_is_read_once_per_endpoint() {
+	let model = "fal-ai/test-catalog-cache";
+	let (mock, scope) = start_fal(listing(model, "text-to-image"), vec![(200, QUEUED.to_string())]);
+	let provider = FalMediaProvider::new();
+	for _ in 0..2 {
+		provider
+			.submit_image(ImageGenerationRequest::new("a castle").with_model(model))
+			.await
+			.expect("submitted");
+	}
+	assert_eq!(scope.catalog.requests().len(), 1);
+	assert_eq!(mock.requests().len(), 2);
+}
+
+/// Submit with the given `duration` property schema and return the queue POST
+/// body; also checks the schema GET came first.
+async fn submitted_duration_body(model: &str, property: Value, duration: f64) -> Value {
+	let (mock, _env) = start_video_mock(
+		model,
+		vec![
+			openapi_reply(model, json!({"duration": property})),
+			(200, QUEUED.to_string()),
+		],
+	);
+	FalMediaProvider::new()
+		.submit_video(video_request(model, duration))
+		.await
+		.expect("queue submitted");
+	let requests = mock.requests();
+	assert_eq!(requests[0].method, "GET");
+	assert!(
+		requests[0]
+			.path
+			.ends_with(&format!("endpoint_id={}", model.replace('/', "%2F")))
+			|| requests[0].path.ends_with(&format!("endpoint_id={model}")),
+		"unexpected schema path: {}",
+		requests[0].path
+	);
+	assert_eq!(requests[1].method, "POST");
+	serde_json::from_str(&requests[1].body).expect("request json")
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn video_duration_uses_enum_string_when_schema_declares_it() {
+	let body = submitted_duration_body(
+		"bytedance/test-enum/text-to-video",
+		json!({"type": "string", "enum": ["auto", "4", "5"]}),
+		5.0,
+	)
+	.await;
+	assert_eq!(body["duration"], "5");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn video_duration_uses_suffixed_enum_string() {
+	let body = submitted_duration_body(
+		"fal-ai/test-veo/text-to-video",
+		json!({"type": "string", "enum": ["4s", "8s"]}),
+		8.0,
+	)
+	.await;
+	assert_eq!(body["duration"], "8s");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn video_duration_enum_without_match_is_invalid_request_naming_values() {
+	let model = "fal-ai/test-enum-miss/text-to-video";
+	let (mock, _env) = start_video_mock(
+		model,
+		vec![
+			openapi_reply(model, json!({"duration": {"type": "string", "enum": ["5", "10"]}})),
+			(200, QUEUED.to_string()),
+		],
+	);
+	let error = FalMediaProvider::new()
+		.submit_video(video_request(model, 7.0))
+		.await
+		.expect_err("7s is not allowed");
+	assert!(
+		matches!(&error, MediaError::InvalidRequest(message) if message.contains(model) && message.contains("5, 10")),
+		"unexpected error: {error}"
+	);
+	assert_eq!(mock.requests().len(), 1, "no queue POST after a rejected duration");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn video_duration_integer_schema_gets_whole_number() {
+	let body = submitted_duration_body("minimax/test-int/text-to-video", json!({"type": "integer"}), 5.0).await;
+	assert_eq!(body["duration"], json!(5));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn video_duration_integer_schema_rejects_fractional_seconds() {
+	let model = "minimax/test-int-frac/text-to-video";
+	let (mock, _env) = start_video_mock(
+		model,
+		vec![
+			openapi_reply(model, json!({"duration": {"type": "integer"}})),
+			(200, QUEUED.to_string()),
+		],
+	);
+	let error = FalMediaProvider::new()
+		.submit_video(video_request(model, 5.5))
+		.await
+		.expect_err("fractional seconds rejected");
+	assert!(
+		matches!(error, MediaError::InvalidRequest(_)),
+		"unexpected error: {error}"
+	);
+	assert_eq!(mock.requests().len(), 1, "no queue POST after a rejected duration");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn video_duration_matches_an_integer_enum() {
+	let body = submitted_duration_body(
+		"fal-ai/test-int-enum/text-to-video",
+		json!({"type": "integer", "enum": [5, 10]}),
+		10.0,
+	)
+	.await;
+	assert_eq!(body["duration"], json!(10));
+}
+
+/// FastAPI writes an Enum field as a `$ref` to its own schema; pydantic v1
+/// wraps that reference in `allOf`.
+#[tokio::test]
+#[serial_test::serial]
+async fn video_duration_follows_schema_references() {
+	let model = "fal-ai/test-ref/text-to-video";
+	let document = json!({
+		"paths": {format!("/{model}"): {"post": {"requestBody": {"content": {
+			"application/json": {"schema": {"$ref": "#/components/schemas/VideoInput"}}
+		}}}}},
+		"components": {"schemas": {
+			"VideoInput": {"properties": {"duration": {
+				"allOf": [{"$ref": "#/components/schemas/Duration"}],
+				"default": "5"
+			}}},
+			"Duration": {"type": "string", "enum": ["5", "10"]}
+		}}
+	});
+	let (mock, _scope) = start_video_mock(model, vec![(200, document.to_string()), (200, QUEUED.to_string())]);
+	FalMediaProvider::new()
+		.submit_video(video_request(model, 10.0))
+		.await
+		.expect("queue submitted");
+	let body: Value = serde_json::from_str(&mock.requests()[1].body).expect("request json");
+	assert_eq!(body["duration"], "10");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn video_duration_number_schema_keeps_fraction() {
+	let body = submitted_duration_body(
+		"minimax/test-number/text-to-video",
+		json!({"type": "number", "minimum": 0.92, "maximum": 15}),
+		5.5,
+	)
+	.await;
+	assert_eq!(body["duration"], json!(5.5));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn video_duration_optional_integer_unwraps_any_of() {
+	let body = submitted_duration_body(
+		"fal-ai/test-anyof/text-to-video",
+		json!({"anyOf": [{"type": "integer"}, {"type": "null"}]}),
+		6.0,
+	)
+	.await;
+	assert_eq!(body["duration"], json!(6));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn video_duration_absent_field_errors_by_default() {
+	let model = "fal-ai/test-absent-error/text-to-video";
+	let (mock, _env) = start_video_mock(
+		model,
+		vec![
+			openapi_reply(model, json!({"prompt": {"type": "string"}})),
+			(200, QUEUED.to_string()),
+		],
+	);
+	let error = FalMediaProvider::new()
+		.submit_video(video_request(model, 5.0))
+		.await
+		.expect_err("duration unsupported");
+	assert!(
+		matches!(&error, MediaError::UnsupportedParameter { parameter, .. } if parameter == "duration_secs"),
+		"unexpected error: {error}"
+	);
+	assert_eq!(mock.requests().len(), 1);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn video_duration_absent_field_is_dropped_with_warning_under_warn_and_drop() {
+	let model = "fal-ai/test-absent-warn/text-to-video";
+	let (mock, _env) = start_video_mock(
+		model,
+		vec![
+			openapi_reply(model, json!({"prompt": {"type": "string"}})),
+			(200, QUEUED.to_string()),
+		],
+	);
+	let mut request = video_request(model, 5.0);
+	request.request_options.unsupported_parameter_policy = UnsupportedParameterPolicy::WarnAndDrop;
+	let operation = FalMediaProvider::new()
+		.submit_video(request)
+		.await
+		.expect("submit succeeds when duration is dropped");
+	let body: Value = serde_json::from_str(&mock.requests()[1].body).expect("request json");
+	assert!(body.get("duration").is_none());
+	let warnings = operation.handle.expect("handle present").warnings;
+	assert!(warnings
+		.iter()
+		.any(|warning| warning.parameter.as_deref() == Some("duration_secs")));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn video_duration_schema_404_fails_without_queue_post() {
+	let model = "fal-ai/test-404/text-to-video";
+	let (mock, _env) = start_video_mock(
+		model,
+		vec![
+			(404, r#"{"detail":"not found"}"#.to_string()),
+			(200, QUEUED.to_string()),
+		],
+	);
+	FalMediaProvider::new()
+		.submit_video(video_request(model, 5.0))
+		.await
+		.expect_err("schema fetch failure surfaces");
+	assert!(mock.requests().iter().all(|request| request.method == "GET"));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn video_duration_schema_is_fetched_once_per_model() {
+	let model = "fal-ai/test-cache/text-to-video";
+	let (mock, _env) = start_video_mock(
+		model,
+		vec![
+			openapi_reply(model, json!({"duration": {"type": "integer"}})),
+			(200, QUEUED.to_string()),
+			(200, QUEUED.to_string()),
+		],
+	);
+	let provider = FalMediaProvider::new();
+	provider
+		.submit_video(video_request(model, 5.0))
+		.await
+		.expect("first submit");
+	provider
+		.submit_video(video_request(model, 5.0))
+		.await
+		.expect("second submit");
+	let methods: Vec<String> = mock.requests().into_iter().map(|request| request.method).collect();
+	assert_eq!(methods, ["GET", "POST", "POST"]);
+}
+
+/// The queue (which also serves the OpenAPI document), catalog and storage
+/// mocks for an image-to-video submit. fal's catalog and schema answers are
+/// cached per endpoint for the whole process, so every test uses its own model
+/// id. `schema_reads` OpenAPI replies come before the queue's accept reply.
+fn start_with_storage(
+	model: &str,
+	category: &str,
+	frame_fields: Value,
+	schema_reads: usize,
+	storage_replies: Vec<(u16, String)>,
+) -> (MockHttp, MockHttp, Scope) {
+	let mut queue_replies = vec![openapi_reply(model, frame_fields); schema_reads];
+	queue_replies.push((200, QUEUED.to_string()));
+	let queue = MockHttp::start(queue_replies);
+	let catalog = MockHttp::start(vec![listing(model, category)]);
+	let storage = MockHttp::start(storage_replies);
+	let env = EnvGuard::new()
+		.set(API_BASE_ENV, queue.base_url())
+		.set(OPENAPI_URL_ENV, format!("{}/openapi.json", queue.base_url()))
+		.set(MODELS_URL_ENV, catalog.base_url())
+		.set(STORAGE_BASE_ENV, storage.base_url())
+		.set(API_KEY_ENV, "mock-key");
+	(queue, storage, Scope { _env: env, catalog })
+}
+
+fn image_url_field() -> Value {
+	json!({"image_url": {"type": "string"}})
+}
+
+fn queued_posts(queue: &MockHttp) -> Vec<RecordedRequest> {
+	queue
+		.requests()
+		.into_iter()
+		.filter(|request| request.method == "POST")
+		.collect()
+}
+
+fn i2v_request(model: &str, first_frame: MediaSource) -> VideoGenerationRequest {
+	let mut request = VideoGenerationRequest::new("the octo smiles").with_model(model);
+	request.mode = VideoGenerationMode::ImageToVideo;
+	request.first_frame = Some(first_frame);
+	request
+}
+
+fn png_frame() -> MediaSource {
+	MediaSource::Bytes {
+		data: b"\x89PNG\r\n\x1a\nframe".to_vec(),
+		media_type: "image/png".to_string(),
+	}
+}
+
+fn frame_url() -> MediaSource {
+	MediaSource::Url {
+		url: "https://example.test/frame.png".to_string(),
+		media_type: None,
+	}
+}
+
+/// A user's frame goes to fal's CDN locked to this account and deleted after an
+/// hour (fal's default is public to anyone with the link), and an upload target
+/// that is not HTTPS is refused before any bytes leave or anything is queued.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_inline_frame_is_uploaded_private_and_short_lived() {
+	let model = "fal-ai/test-i2v-private";
+	let ticket = json!({"upload_url": "http://storage.test/put", "file_url": "https://v3b.fal.media/files/in.png"});
+	let (queue, storage, _scope) = start_with_storage(
+		model,
+		"image-to-video",
+		image_url_field(),
+		1,
+		vec![(200, ticket.to_string())],
+	);
+
+	let error = FalMediaProvider::new()
+		.submit_video(i2v_request(model, png_frame()))
+		.await
+		.expect_err("a plain-http upload target is refused");
+	assert!(
+		matches!(error, MediaError::InvalidRequest(_)),
+		"unexpected error: {error}"
+	);
+
+	let requests = storage.requests();
+	assert_eq!(
+		requests.len(),
+		1,
+		"the initiate call only, no PUT to a non-https target"
+	);
+	let initiate = &requests[0];
+	assert_eq!(initiate.method, "POST");
+	assert_eq!(initiate.path, "/storage/upload/initiate?storage_type=fal-cdn-v3");
+	assert_eq!(initiate.header("authorization"), Some("Key mock-key"));
+	let lifecycle: Value =
+		serde_json::from_str(initiate.header(LIFECYCLE_HEADER).expect("lifecycle header")).expect("lifecycle json");
+	assert_eq!(
+		lifecycle,
+		json!({"initial_acl": {"default": "forbid", "rules": []}, "expiration_duration_seconds": 3600})
+	);
+	let body: Value = serde_json::from_str(&initiate.body).expect("initiate json");
+	assert_eq!(body, json!({"file_name": "input.png", "content_type": "image/png"}));
+	assert!(
+		queued_posts(&queue).is_empty(),
+		"nothing is queued without the uploaded frame"
+	);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_failed_upload_queues_nothing() {
+	let model = "fal-ai/test-i2v-upload-down";
+	let (queue, storage, _scope) = start_with_storage(
+		model,
+		"image-to-video",
+		image_url_field(),
+		1,
+		vec![(500, r#"{"detail":"storage down"}"#.to_string())],
+	);
+	FalMediaProvider::new()
+		.submit_video(i2v_request(model, png_frame()))
+		.await
+		.expect_err("the upload failed");
+	assert_eq!(storage.requests()[0].method, "POST");
+	assert!(queued_posts(&queue).is_empty(), "no generation without its input");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_url_frame_is_passed_through_without_upload() {
+	let model = "fal-ai/test-i2v-url";
+	let (queue, storage, _scope) = start_with_storage(
+		model,
+		"image-to-video",
+		image_url_field(),
+		1,
+		vec![(500, String::new())],
+	);
+	FalMediaProvider::new()
+		.submit_video(i2v_request(model, frame_url()))
+		.await
+		.expect("queued");
+	assert!(storage.requests().is_empty(), "a URL is never re-uploaded");
+	let body: Value = serde_json::from_str(&queued_posts(&queue)[0].body).expect("submit json");
+	assert_eq!(body["image_url"], "https://example.test/frame.png");
+}
+
+/// A request refused before submit must not have put the user's image on fal.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_refused_request_uploads_nothing() {
+	let model = "fal-ai/test-i2v-refused";
+	let (queue, storage, _scope) =
+		start_with_storage(model, "text-to-audio", image_url_field(), 1, vec![(500, String::new())]);
+	FalMediaProvider::new()
+		.submit_video(i2v_request(model, png_frame()))
+		.await
+		.expect_err("an audio endpoint is not a video route");
+	assert!(storage.requests().is_empty(), "validated before any upload");
+	assert!(queue.requests().is_empty());
+}
+
+/// Prod 2026-10-31: every image-to-video job was queued on the face's
+/// text-to-video endpoint, which takes no first frame — the frame was dropped
+/// and the clip billed. It goes to the sibling image-to-video route, and that
+/// route is the one the catalog check, the schema read and the job handle name.
+#[tokio::test]
+#[serial_test::serial]
+async fn image_to_video_is_queued_on_the_image_to_video_route() {
+	let face = "bytedance/test-family/text-to-video";
+	let endpoint = "bytedance/test-family/image-to-video";
+	let (queue, _storage, _scope) = start_with_storage(
+		endpoint,
+		"image-to-video",
+		image_url_field(),
+		1,
+		vec![(500, String::new())],
+	);
+	let operation = FalMediaProvider::new()
+		.submit_video(i2v_request(face, frame_url()))
+		.await
+		.expect("queued");
+	assert_eq!(queued_posts(&queue)[0].path, format!("/{endpoint}"));
+	let handle = operation.handle.expect("handle present");
+	assert_eq!(handle.model, endpoint);
+	assert_eq!(handle.task, MediaTask::ImageToVideo);
+}
+
+/// fal's Kling v3 Standard image-to-video takes the frame only as
+/// `start_image_url`; sent as `image_url` the request is refused.
+#[tokio::test]
+#[serial_test::serial]
+async fn the_first_frame_uses_the_field_the_endpoint_declares() {
+	let face = "fal-ai/test-kling/v3/standard/text-to-video";
+	let endpoint = "fal-ai/test-kling/v3/standard/image-to-video";
+	let (queue, _storage, _scope) = start_with_storage(
+		endpoint,
+		"image-to-video",
+		json!({"start_image_url": {"type": "string"}, "end_image_url": {"type": "string"}}),
+		2,
+		vec![(500, String::new())],
+	);
+	FalMediaProvider::new()
+		.submit_video(i2v_request(face, frame_url()))
+		.await
+		.expect("queued");
+	let body: Value = serde_json::from_str(&queued_posts(&queue)[0].body).expect("submit json");
+	assert_eq!(body["start_image_url"], "https://example.test/frame.png");
+	assert!(body.get("image_url").is_none());
+}

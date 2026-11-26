@@ -1,0 +1,192 @@
+// Copyright 2026 Muvon Un Limited
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! MockHTTP-driven coverage for the Higgsfield adapter's submit/poll/cancel
+//! HTTP paths, complementing the pure-parser tests in `higgsfield_tests.rs`.
+
+use super::*;
+use crate::test_support::env::EnvGuard;
+use crate::test_support::mock_http::MockHttp;
+
+const MODEL: &str = "higgsfield-ai/soul";
+
+/// Start the mock and point the adapter at it. The guard restores the
+/// environment when the test ends, pass or fail.
+fn start_mock(replies: Vec<(u16, String)>) -> (MockHttp, EnvGuard) {
+	let mock = MockHttp::start(replies);
+	let env = EnvGuard::new()
+		.set(API_BASE_ENV, mock.base_url())
+		.set(API_KEY_ENV, "key-id:key-secret");
+	(mock, env)
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn submit_image_posts_the_endpoint_and_polls_status() {
+	let (mock, _env) = start_mock(vec![
+		(200, r#"{"request_id":"req-9","status":"queued"}"#.to_string()),
+		(200, r#"{"status":"in_progress"}"#.to_string()),
+	]);
+
+	let provider = HiggsfieldMediaProvider::new();
+	let request = ImageGenerationRequest::new("a castle").with_model(MODEL);
+	let operation = provider.submit_image(request).await.expect("request submitted");
+	assert_eq!(operation.status, OperationStatus::Queued);
+	let handle = operation.handle.expect("handle present");
+	assert_eq!(handle.remote_id, "req-9");
+	assert_eq!(handle.task, MediaTask::TextToImage);
+
+	let requests = mock.requests();
+	assert_eq!(requests[0].method, "POST");
+	assert_eq!(requests[0].path, format!("/{MODEL}"));
+	let body: Value = serde_json::from_str(&requests[0].body).expect("request json");
+	assert_eq!(body["prompt"], "a castle");
+
+	let operation = provider.poll_image(&handle).await.expect("status polled");
+	assert_eq!(operation.status, OperationStatus::Running);
+	assert_eq!(mock.requests()[1].path, "/requests/req-9/status");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn poll_image_returns_completed_artifacts() {
+	let (_mock, _env) = start_mock(vec![
+		(200, r#"{"request_id":"req-9"}"#.to_string()),
+		(
+			200,
+			r#"{"status":"completed","images":[{"url":"https://cdn.example.test/a.jpg"}]}"#.to_string(),
+		),
+	]);
+
+	let provider = HiggsfieldMediaProvider::new();
+	let request = ImageGenerationRequest::new("a castle").with_model(MODEL);
+	let handle = provider
+		.submit_image(request)
+		.await
+		.expect("request submitted")
+		.handle
+		.expect("handle present");
+
+	let operation = provider.poll_image(&handle).await.expect("status polled");
+	assert_eq!(operation.status, OperationStatus::Succeeded);
+	let result = operation.result.expect("result present");
+	assert_eq!(result.artifacts.len(), 1);
+	assert_eq!(result.artifacts[0].media_type, "image/jpeg");
+}
+
+/// A request Higgsfield reports completed whose output has no usable image is
+/// the job's outcome: Failed, never an error that leaves it live for re-polling.
+#[tokio::test]
+#[serial_test::serial]
+async fn poll_image_fails_a_completed_request_with_no_image_output() {
+	let (_mock, _env) = start_mock(vec![
+		(200, r#"{"request_id":"req-9"}"#.to_string()),
+		(200, r#"{"status":"completed","images":[]}"#.to_string()),
+	]);
+
+	let provider = HiggsfieldMediaProvider::new();
+	let request = ImageGenerationRequest::new("a castle").with_model(MODEL);
+	let handle = provider
+		.submit_image(request)
+		.await
+		.expect("request submitted")
+		.handle
+		.expect("handle present");
+
+	let operation = provider.poll_image(&handle).await.expect("outcome, not an error");
+	assert_eq!(operation.status, OperationStatus::Failed);
+	let error = operation.error.expect("failure present");
+	assert_eq!(error.category, FailureCategory::InvalidResponse);
+	assert_eq!(error.request_id.as_deref(), Some("req-9"));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cancel_image_posts_the_cancel_route() {
+	let (mock, _env) = start_mock(vec![
+		(200, r#"{"request_id":"req-9"}"#.to_string()),
+		(200, "{}".to_string()),
+	]);
+
+	let provider = HiggsfieldMediaProvider::new();
+	let request = ImageGenerationRequest::new("a castle").with_model(MODEL);
+	let handle = provider
+		.submit_image(request)
+		.await
+		.expect("request submitted")
+		.handle
+		.expect("handle present");
+
+	provider.cancel_image(&handle).await.expect("request cancelled");
+
+	let requests = mock.requests();
+	assert_eq!(requests[1].method, "POST");
+	assert_eq!(requests[1].path, "/requests/req-9/cancel");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn submit_image_surfaces_authentication_errors() {
+	let (_mock, _env) = start_mock(vec![(401, r#"{"error":{"message":"invalid key"}}"#.to_string())]);
+
+	let provider = HiggsfieldMediaProvider::new();
+	let request = ImageGenerationRequest::new("a castle").with_model(MODEL);
+	let error = provider.submit_image(request).await.expect_err("401 surfaces");
+	assert!(
+		matches!(error, MediaError::Authentication { .. }),
+		"unexpected error: {error}"
+	);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn submit_image_rejects_malformed_credentials_before_any_http_traffic() {
+	let (mock, env) = start_mock(vec![(200, r#"{"request_id":"req-9"}"#.to_string())]);
+	let _env = env.set(API_KEY_ENV, "not-a-pair");
+
+	let provider = HiggsfieldMediaProvider::new();
+	let request = ImageGenerationRequest::new("a castle").with_model(MODEL);
+	let error = provider.submit_image(request).await.expect_err("bad key rejected");
+	assert!(
+		matches!(error, MediaError::Authentication { .. }),
+		"unexpected error: {error}"
+	);
+	assert_eq!(mock.requests().len(), 0);
+}
+
+/// Prod 2026-10-31: image-to-video was posted to the face's text-to-video
+/// endpoint, which ignores `image_url`. It goes to the image-to-video route.
+#[tokio::test]
+#[serial_test::serial]
+async fn image_to_video_posts_the_image_to_video_route() {
+	let (mock, _env) = start_mock(vec![(200, r#"{"request_id":"req-9","status":"queued"}"#.to_string())]);
+	let mut request = VideoGenerationRequest::new("the octo smiles").with_model("kling-video/v3.0/std/text-to-video");
+	request.mode = VideoGenerationMode::ImageToVideo;
+	request.first_frame = Some(MediaSource::Url {
+		url: "https://example.test/frame.png".to_string(),
+		media_type: None,
+	});
+	let operation = HiggsfieldMediaProvider::new()
+		.submit_video(request)
+		.await
+		.expect("request submitted");
+	let requests = mock.requests();
+	assert_eq!(requests[0].path, "/kling-video/v3.0/std/image-to-video");
+	let body: Value = serde_json::from_str(&requests[0].body).expect("request json");
+	assert_eq!(body["image_url"], "https://example.test/frame.png");
+	assert_eq!(
+		operation.handle.expect("handle present").model,
+		"kling-video/v3.0/std/image-to-video"
+	);
+}

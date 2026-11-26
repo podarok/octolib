@@ -20,7 +20,7 @@
 //! Hosts ByteDance Seed models plus third-party models (GLM, DeepSeek, Kimi, etc.).
 //! Also supports the Coding Plan subscription via endpoint override.
 //!
-//! PRICING UPDATE: April 2026
+//! PRICING UPDATE: September 2026
 //! Source: <https://docs.byteplus.com/en/docs/ModelArk/1544106>
 //!
 //! Configuration:
@@ -28,7 +28,7 @@
 //! - `BYTEPLUS_API_URL`: Optional endpoint override (e.g. coding plan URL)
 
 use crate::llm::providers::openai_compat::{
-    chat_completion as openai_compat_chat_completion, get_api_url, OpenAiCompatConfig,
+	chat_completion as openai_compat_chat_completion, get_api_url, OpenAiCompatConfig,
 };
 use crate::llm::traits::AiProvider;
 use crate::llm::types::{ChatCompletionParams, ProviderResponse};
@@ -41,266 +41,207 @@ use std::env;
 pub struct BytePlusProvider;
 
 impl Default for BytePlusProvider {
-    fn default() -> Self {
-        Self::new()
-    }
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 impl BytePlusProvider {
-    pub fn new() -> Self {
-        Self
-    }
+	pub fn new() -> Self {
+		Self
+	}
 }
 
-const BYTEPLUS_API_KEY_ENV: &str = "BYTEPLUS_API_KEY";
+pub(crate) const BYTEPLUS_API_KEY_ENV: &str = "BYTEPLUS_API_KEY";
 const BYTEPLUS_API_URL_ENV: &str = "BYTEPLUS_API_URL";
 const BYTEPLUS_API_URL: &str = "https://ark.ap-southeast.bytepluses.com/api/v3/chat/completions";
 
-// BytePlus ModelArk pricing (per 1M tokens in USD) - Apr 2026
+// BytePlus ModelArk pricing (per 1M tokens in USD) - Sep 2026
 // Source: https://docs.byteplus.com/en/docs/ModelArk/1544106
 // Format: (model, input, output, cache_write, cache_read)
 // cache_write = input price, cache_read = cache-hit price
 const PRICING: &[PricingTuple] = &[
-    // Seed 2.1 family (Aug 2026) — Turbo only; Pro has no published USD rates
-    ("seed-2-1-turbo", 0.50, 2.50, 0.50, 0.50),
-    // Seed 2.0 family (256K context)
-    ("seed-2-0-pro", 0.50, 3.00, 0.50, 0.10),
-    ("seed-2-0-code-preview", 0.50, 3.00, 0.50, 0.10),
-    ("seed-2-0-lite", 0.25, 2.00, 0.25, 0.05),
-    ("seed-2-0-mini", 0.10, 0.40, 0.10, 0.02),
-    // Coding Plan aliases
-    ("dola-seed-2.0-pro", 0.50, 3.00, 0.50, 0.10),
-    ("dola-seed-2.0-lite", 0.25, 2.00, 0.25, 0.05),
-    ("dola-seed-2.0-code", 0.50, 3.00, 0.50, 0.10),
-    ("bytedance-seed-code", 0.50, 3.00, 0.50, 0.10),
-    // Seed 1.x family (128K context)
-    ("seed-1-8", 0.25, 2.00, 0.25, 0.05),
-    ("seed-1-6-flash", 0.075, 0.30, 0.075, 0.015),
-    ("seed-1-6", 0.25, 2.00, 0.25, 0.05),
-    // Third-party models hosted on BytePlus (BytePlus-specific pricing)
-    ("glm-4-7-251222", 0.60, 2.20, 0.60, 0.11),
-    ("gpt-oss-120b-250805", 0.10, 0.50, 0.10, 0.00),
+	// Seed 2.1 family (Aug 2026) — Turbo only; Pro has no published USD rates
+	("seed-2-1-turbo", 0.50, 2.50, 0.50, 0.10),
+	// Seed 2.0 family (256K context)
+	("seed-2-0-pro", 0.50, 3.00, 0.50, 0.10),
+	("seed-2-0-code-preview", 0.50, 3.00, 0.50, 0.10),
+	("seed-2-0-lite", 0.25, 2.00, 0.25, 0.05),
+	("seed-2-0-mini", 0.10, 0.40, 0.10, 0.02),
+	// Coding Plan aliases
+	(DOLA_SEED_PRO, 0.50, 3.00, 0.50, 0.10),
+	(DOLA_SEED_LITE, 0.25, 2.00, 0.25, 0.05),
+	(DOLA_SEED_CODE, 0.50, 3.00, 0.50, 0.10),
+	(BYTEDANCE_SEED_CODE, 0.50, 3.00, 0.50, 0.10),
+	// Third-party models hosted on BytePlus (BytePlus-specific pricing).
+	// The DeepSeek V4 rows cover both the `-260425` preview IDs and the GA
+	// snapshots (`-ga-260731`, `-ga-260813`), which share one rate card.
+	// V4.1 Flash bills peak/off-peak (off-peak is half); peak is the baseline,
+	// matching the price the console displays. The `-260910` and `-261017`
+	// snapshots share one rate card; Economy must precede the base row.
+	("deepseek-v4-1-flash-economy", 0.24, 0.96, 0.24, 0.0048),
+	("deepseek-v4-1-flash", 0.30, 1.20, 0.30, 0.006),
+	("deepseek-v4-pro", 1.32, 3.96, 1.32, 0.044),
+	("deepseek-v4-flash", 0.44, 1.32, 0.44, 0.014),
+	(GLM_5_3_FLASH, 0.15, 0.50, 0.15, 0.03),
+	("glm-5-2", 1.40, 4.40, 1.40, 0.26),
 ];
+
+const DOLA_SEED_PRO: &str = "dola-seed-2.0-pro";
+const DOLA_SEED_LITE: &str = "dola-seed-2.0-lite";
+const DOLA_SEED_CODE: &str = "dola-seed-2.0-code";
+const BYTEDANCE_SEED_CODE: &str = "bytedance-seed-code";
+const GLM_5_3_FLASH: &str = "glm-5-3-flash-260828";
+
+pub(crate) fn setup_models() -> impl Iterator<Item = &'static str> {
+	// Other rows are family prefixes whose callable IDs require snapshot suffixes.
+	PRICING.iter().map(|row| row.0).filter(|model| {
+		matches!(
+			*model,
+			DOLA_SEED_PRO | DOLA_SEED_LITE | DOLA_SEED_CODE | BYTEDANCE_SEED_CODE | GLM_5_3_FLASH
+		)
+	})
+}
 
 const SEED_2_LONG_CONTEXT_THRESHOLD: u64 = 128_000;
 
 /// Calculate BytePlus usage cost, including the documented 2x Seed 2.0 tier
 /// when the prompt exceeds 128K tokens.
 fn calculate_usage_cost(
-    model: &str,
-    input_tokens: u64,
-    cache_write_tokens: u64,
-    cache_read_tokens: u64,
-    output_tokens: u64,
+	model: &str,
+	input_tokens: u64,
+	cache_write_tokens: u64,
+	cache_read_tokens: u64,
+	output_tokens: u64,
 ) -> Option<f64> {
-    let (mut input, mut output, mut cache_write, mut cache_read) =
-        crate::llm::utils::get_model_pricing(model, PRICING)?;
-    let total_input_tokens = input_tokens
-        .saturating_add(cache_write_tokens)
-        .saturating_add(cache_read_tokens);
-    let normalized = normalize_model_name(model);
-    if (normalized.contains("seed-2-0") || normalized.contains("seed-2.0"))
-        && total_input_tokens > SEED_2_LONG_CONTEXT_THRESHOLD
-    {
-        input *= 2.0;
-        output *= 2.0;
-        cache_write *= 2.0;
-        cache_read *= 2.0;
-    }
+	let (mut input, mut output, mut cache_write, mut cache_read) =
+		crate::llm::utils::get_model_pricing(model, PRICING)?;
+	let total_input_tokens = input_tokens
+		.saturating_add(cache_write_tokens)
+		.saturating_add(cache_read_tokens);
+	let normalized = normalize_model_name(model);
+	if (normalized.contains("seed-2-0") || normalized.contains("seed-2.0"))
+		&& total_input_tokens > SEED_2_LONG_CONTEXT_THRESHOLD
+	{
+		input *= 2.0;
+		output *= 2.0;
+		cache_write *= 2.0;
+		cache_read *= 2.0;
+	}
 
-    Some(
-        (input_tokens as f64 / 1_000_000.0) * input
-            + (cache_write_tokens as f64 / 1_000_000.0) * cache_write
-            + (cache_read_tokens as f64 / 1_000_000.0) * cache_read
-            + (output_tokens as f64 / 1_000_000.0) * output,
-    )
+	Some(
+		(input_tokens as f64 / 1_000_000.0) * input
+			+ (cache_write_tokens as f64 / 1_000_000.0) * cache_write
+			+ (cache_read_tokens as f64 / 1_000_000.0) * cache_read
+			+ (output_tokens as f64 / 1_000_000.0) * output,
+	)
 }
 
 #[async_trait::async_trait]
 impl AiProvider for BytePlusProvider {
-    fn name(&self) -> &str {
-        "byteplus"
-    }
+	fn name(&self) -> &str {
+		"byteplus"
+	}
 
-    fn supports_model(&self, model: &str) -> bool {
-        !model.is_empty()
-    }
+	fn supports_model(&self, model: &str) -> bool {
+		!model.is_empty()
+	}
 
-    fn get_api_key(&self) -> Result<String> {
-        env::var(BYTEPLUS_API_KEY_ENV).map_err(|_| {
-            anyhow::anyhow!(
-                "BytePlus API key not found in environment variable: {}",
-                BYTEPLUS_API_KEY_ENV
-            )
-        })
-    }
+	fn get_api_key(&self) -> Result<String> {
+		env::var(BYTEPLUS_API_KEY_ENV)
+			.map_err(|_| crate::errors::missing_api_key("byteplus", BYTEPLUS_API_KEY_ENV).into())
+	}
 
-    fn supports_caching(&self, _model: &str) -> bool {
-        true
-    }
+	fn supports_caching(&self, _model: &str) -> bool {
+		true
+	}
 
-    fn supports_structured_output(&self, _model: &str) -> bool {
-        true
-    }
+	/// ModelArk supports native JSON Schema only for the models whose model-list
+	/// entry shows structured output. Other hosted models use shared forced-tool
+	/// enforcement plus local validation.
+	fn supports_structured_output(&self, _model: &str) -> bool {
+		true
+	}
 
-    fn enforces_response_schema(&self, _model: &str) -> bool {
-        true
-    }
+	fn enforces_response_schema(&self, model: &str) -> bool {
+		natively_enforces_response_schema(model)
+	}
 
-    fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
-        // Try local pricing table first (BytePlus-specific prices)
-        if let Some((input, output, cache_write, cache_read)) =
-            crate::llm::utils::get_model_pricing(model, PRICING)
-        {
-            return Some(crate::llm::types::ModelPricing::new(
-                input,
-                output,
-                cache_write,
-                cache_read,
-            ));
-        }
-        crate::llm::reference_models::get_reference_pricing(model)
-    }
+	fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
+		// Try local pricing table first (BytePlus-specific prices)
+		if let Some((input, output, cache_write, cache_read)) = crate::llm::utils::get_model_pricing(model, PRICING) {
+			return Some(crate::llm::types::ModelPricing::new(
+				input,
+				output,
+				cache_write,
+				cache_read,
+			));
+		}
+		crate::llm::reference_models::get_reference_pricing(model)
+	}
 
-    async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
-        let api_key = self.get_api_key()?;
-        let api_url = get_api_url(BYTEPLUS_API_URL_ENV, BYTEPLUS_API_URL);
-        let model = params.model.clone();
+	async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
+		let api_key = super::shared::resolve_api_key(self, &params)?;
+		let api_url = get_api_url(BYTEPLUS_API_URL_ENV, BYTEPLUS_API_URL);
+		let model = params.model.clone();
 
-        let mut response = openai_compat_chat_completion(
-            OpenAiCompatConfig {
-                provider_name: "byteplus",
-                usage_fallback_cost: None,
-                use_response_cost: true,
-            },
-            api_key,
-            api_url,
-            params,
-        )
-        .await?;
+		let mut response = openai_compat_chat_completion(
+			OpenAiCompatConfig {
+				provider_name: "byteplus",
+				usage_fallback_cost: None,
+				use_response_cost: true,
+				enforces_response_schema: natively_enforces_response_schema(&model),
+				supports_required_tool_choice: false,
+				supports_parallel_tool_calls: true,
+			},
+			api_key,
+			api_url,
+			params,
+		)
+		.await?;
 
-        // Derive cost from pricing if not returned in the response
-        if let Some(ref mut usage) = response.exchange.usage {
-            if usage.cost.is_none() {
-                let input_tokens = usage.input_tokens;
-                let cache_write_tokens = usage.cache_write_tokens;
-                let cache_read_tokens = usage.cache_read_tokens;
-                let output_tokens = usage.billable_output_tokens();
-                usage.cost = calculate_usage_cost(
-                    &model,
-                    input_tokens,
-                    cache_write_tokens,
-                    cache_read_tokens,
-                    output_tokens,
-                )
-                .or_else(|| {
-                    self.get_model_pricing(&model).map(|pricing| {
-                        pricing.calculate_cost(
-                            input_tokens,
-                            cache_write_tokens,
-                            cache_read_tokens,
-                            output_tokens,
-                        )
-                    })
-                });
-            }
-        }
+		// Derive cost from pricing if not returned in the response
+		if let Some(ref mut usage) = response.exchange.usage {
+			if usage.cost.is_none() {
+				let input_tokens = usage.input_tokens;
+				let cache_write_tokens = usage.cache_write_tokens;
+				let cache_read_tokens = usage.cache_read_tokens;
+				let output_tokens = usage.billable_output_tokens();
+				usage.cost = calculate_usage_cost(
+					&model,
+					input_tokens,
+					cache_write_tokens,
+					cache_read_tokens,
+					output_tokens,
+				)
+				.or_else(|| {
+					self.get_model_pricing(&model).map(|pricing| {
+						pricing.calculate_cost(input_tokens, cache_write_tokens, cache_read_tokens, output_tokens)
+					})
+				});
+			}
+		}
 
-        Ok(response)
-    }
+		Ok(response)
+	}
+}
+
+/// JSON Schema is native only for the model families the ModelArk model list
+/// shows with structured output. The DeepSeek V4 preview snapshots, Seed 2.0
+/// Pro/Code and GLM have none, and DeepSeek V4.1 Flash is `json_object` only.
+fn natively_enforces_response_schema(model: &str) -> bool {
+	let model = normalize_model_name(model);
+	[
+		"seed-2-0-lite",
+		"seed-2-0-mini",
+		"dola-seed-2-1-turbo",
+		"deepseek-v4-pro-ga",
+		"deepseek-v4-flash-ga",
+	]
+	.iter()
+	.any(|prefix| model.starts_with(prefix))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_supports_model() {
-        let provider = BytePlusProvider::new();
-        assert!(provider.supports_model("seed-2-0-pro-260328"));
-        assert!(provider.supports_model("seed-2-0-lite-260228"));
-        assert!(provider.supports_model("dola-seed-2.0-pro"));
-        assert!(provider.supports_model("glm-4-7-251222"));
-        assert!(provider.supports_model("any-model"));
-        assert!(!provider.supports_model(""));
-    }
-
-    #[test]
-    fn test_default_capabilities() {
-        let provider = BytePlusProvider::new();
-        assert_eq!(provider.name(), "byteplus");
-        assert!(provider.supports_caching("any-model"));
-        assert!(provider.supports_structured_output("any-model"));
-    }
-
-    #[test]
-    fn test_pricing_seed_models() {
-        let provider = BytePlusProvider::new();
-
-        let p = provider.get_model_pricing("seed-2-0-pro-260328").unwrap();
-        assert_eq!(p.input_price_per_1m, 0.50);
-        assert_eq!(p.output_price_per_1m, 3.00);
-        assert_eq!(p.cache_read_price_per_1m, 0.10);
-
-        let p = provider.get_model_pricing("seed-2-0-mini-260215").unwrap();
-        assert_eq!(p.input_price_per_1m, 0.10);
-        assert_eq!(p.output_price_per_1m, 0.40);
-
-        let p = provider.get_model_pricing("seed-2-1-turbo-260812").unwrap();
-        assert_eq!(p.input_price_per_1m, 0.50);
-        assert_eq!(p.output_price_per_1m, 2.50);
-
-        let p = provider.get_model_pricing("seed-1-6-flash-250715").unwrap();
-        assert_eq!(p.input_price_per_1m, 0.075);
-        assert_eq!(p.output_price_per_1m, 0.30);
-    }
-
-    #[test]
-    fn test_pricing_coding_plan_aliases() {
-        let provider = BytePlusProvider::new();
-
-        let p = provider.get_model_pricing("dola-seed-2.0-pro").unwrap();
-        assert_eq!(p.input_price_per_1m, 0.50);
-        assert_eq!(p.output_price_per_1m, 3.00);
-
-        let p = provider.get_model_pricing("dola-seed-2.0-lite").unwrap();
-        assert_eq!(p.input_price_per_1m, 0.25);
-
-        let p = provider.get_model_pricing("bytedance-seed-code").unwrap();
-        assert_eq!(p.input_price_per_1m, 0.50);
-    }
-
-    #[test]
-    fn test_pricing_falls_back_to_reference() {
-        let provider = BytePlusProvider::new();
-        let p = provider.get_model_pricing("glm-5.1").unwrap();
-        assert!(p.input_price_per_1m > 0.0);
-    }
-
-    #[test]
-    fn test_cost_calculation() {
-        let provider = BytePlusProvider::new();
-        let pricing = provider.get_model_pricing("seed-2-0-pro-260328").unwrap();
-
-        // 1M input + 500K output, no cache
-        let cost = pricing.calculate_cost(1_000_000, 0, 0, 500_000);
-        let expected = 0.50 + 0.5 * 3.00; // $2.00
-        assert!((cost - expected).abs() < 0.001);
-
-        // With cache: 500K regular + 500K cache_read + 500K output
-        let cost_cached = pricing.calculate_cost(500_000, 0, 500_000, 500_000);
-        let expected_cached = 0.25 + 0.5 * 0.10 + 0.5 * 3.00; // $1.80
-        assert!((cost_cached - expected_cached).abs() < 0.001);
-        assert!(cost_cached < cost);
-
-        // Seed 2.0 prompts above 128K use the documented 2x tier.
-        let long = calculate_usage_cost("seed-2-0-pro-260328", 128_001, 0, 0, 100_000).unwrap();
-        let expected_long = 128_001.0 / 1_000_000.0 * 1.00 + 0.1 * 6.00;
-        assert!((long - expected_long).abs() < 0.001);
-
-        // Exactly 128K remains in the base tier.
-        let boundary = calculate_usage_cost("seed-2-0-pro-260328", 128_000, 0, 0, 100_000).unwrap();
-        let expected_boundary = 0.128 * 0.50 + 0.1 * 3.00;
-        assert!((boundary - expected_boundary).abs() < 0.001);
-    }
-}
+#[path = "byteplus_tests.rs"]
+mod tests;

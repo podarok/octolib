@@ -1,0 +1,141 @@
+// Copyright 2026 Muvon Un Limited
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::*;
+
+#[test]
+fn test_supports_model_before_cache() {
+	let provider = GoogleVertexProvider::new();
+
+	// Before cache is populated, accept any non-empty model
+	assert!(provider.supports_model("gemini-1.5-pro"));
+	assert!(provider.supports_model("gemini-3.5-flash"));
+	assert!(provider.supports_model("anything-goes"));
+	assert!(!provider.supports_model(""));
+}
+
+#[test]
+fn test_supports_caching() {
+	let provider = GoogleVertexProvider::new();
+	assert!(provider.supports_caching("gemini-3-flash"));
+	assert!(provider.supports_caching("gemini-2.5-pro"));
+	assert!(provider.supports_caching("gemini-2.5-flash"));
+	assert!(!provider.supports_caching("gemini-1.5-pro"));
+}
+
+#[test]
+fn test_model_pricing() {
+	let provider = GoogleVertexProvider::new();
+
+	// Intro rate through Nov 30, 2026
+	let p = provider.get_model_pricing("gemini-4-argon").unwrap();
+	assert_eq!(p.input_price_per_1m, 2.00);
+	assert_eq!(p.output_price_per_1m, 10.00);
+	assert_eq!(p.cache_read_price_per_1m, 0.10);
+
+	// Carbon shares Argon's time-limited rate; Hydrogen has a flat rate.
+	let p = provider.get_model_pricing("gemini-4-carbon").unwrap();
+	assert_eq!(p.input_price_per_1m, 2.00);
+	assert_eq!(p.output_price_per_1m, 10.00);
+	assert_eq!(p.cache_read_price_per_1m, 0.10);
+
+	let p = provider.get_model_pricing("gemini-4-hydrogen").unwrap();
+	assert_eq!(p.input_price_per_1m, 1.50);
+	assert_eq!(p.output_price_per_1m, 7.50);
+	assert_eq!(p.cache_read_price_per_1m, 0.075);
+
+	let p = provider.get_model_pricing("gemini-3.1-pro").unwrap();
+	assert_eq!(p.input_price_per_1m, 2.00);
+	assert_eq!(p.output_price_per_1m, 12.00);
+
+	let p = provider.get_model_pricing("gemini-3.5-flash").unwrap();
+	assert_eq!(p.input_price_per_1m, 1.50);
+	assert_eq!(p.output_price_per_1m, 9.00);
+
+	let p = provider.get_model_pricing("gemini-3.8-flash").unwrap();
+	assert_eq!(p.input_price_per_1m, 0.75);
+	assert_eq!(p.output_price_per_1m, 3.75);
+
+	let p = provider.get_model_pricing("gemini-3.7-flash").unwrap();
+	assert_eq!(p.input_price_per_1m, 0.75);
+	assert_eq!(p.output_price_per_1m, 3.75);
+
+	// Intro rate applies to 3.6 Flash too, through Dec 31, 2026
+	let p = provider.get_model_pricing("gemini-3.6-flash").unwrap();
+	assert_eq!(p.input_price_per_1m, 0.75);
+	assert_eq!(p.output_price_per_1m, 3.75);
+
+	let p = provider.get_model_pricing("gemini-2.5-flash").unwrap();
+	assert_eq!(p.input_price_per_1m, 0.30);
+	assert_eq!(p.output_price_per_1m, 2.50);
+
+	// "-lite" variants must not be shadowed by their shorter prefixes
+	let p = provider.get_model_pricing("gemini-3.1-flash-lite").unwrap();
+	assert_eq!(p.input_price_per_1m, 0.25);
+	assert_eq!(p.output_price_per_1m, 1.50);
+
+	let p = provider.get_model_pricing("gemini-3.5-flash-lite").unwrap();
+	assert_eq!(p.input_price_per_1m, 0.30);
+	assert_eq!(p.output_price_per_1m, 2.50);
+
+	let p = provider.get_model_pricing("gemini-3-flash").unwrap();
+	assert_eq!(p.input_price_per_1m, 0.50);
+	assert_eq!(p.output_price_per_1m, 3.00);
+
+	let p = provider.get_model_pricing("gemini-omni-1.1-flash").unwrap();
+	assert_eq!(p.input_price_per_1m, 1.50);
+	assert_eq!(p.output_price_per_1m, 9.00);
+	assert!(provider.get_model_pricing("gemini-omni-flash-preview").is_some());
+
+	let p = provider.get_model_pricing("gemini-robotics-er-2-preview").unwrap();
+	assert_eq!(p.input_price_per_1m, 1.00);
+	assert_eq!(p.output_price_per_1m, 5.00);
+	assert_eq!(p.cache_read_price_per_1m, 0.10);
+	assert!(provider
+		.get_model_pricing("gemini-robotics-er-2-streaming-preview")
+		.is_some());
+
+	// Removed from the live pricing page; must not fall through to a neighbouring row
+	assert!(provider.get_model_pricing("gemini-3.1-flash").is_none());
+	assert!(provider.get_model_pricing("gemini-3-pro").is_none());
+	assert!(provider.get_model_pricing("gemini-3-pro-preview").is_none());
+	assert!(provider.get_model_pricing("gemini-2.0-flash").is_none());
+
+	// Unknown models return None (no fallback to zero)
+	assert!(provider.get_model_pricing("gemma-3-27b").is_none());
+}
+
+#[test]
+fn test_max_input_tokens_fallback() {
+	let provider = GoogleVertexProvider::new();
+	assert_eq!(provider.get_max_input_tokens("gemini-4-argon"), 1_048_576);
+	assert_eq!(provider.get_max_input_tokens("gemini-3-flash"), 1_048_576);
+	assert_eq!(provider.get_max_input_tokens("gemini-2.5-pro"), 1_048_576);
+	assert_eq!(provider.get_max_input_tokens("gemini-1.5-pro"), 1_000_000);
+	assert_eq!(provider.get_max_input_tokens("text-bison"), 8_192);
+}
+
+#[test]
+fn gemini_4_defaults_to_a_supported_vertex_location() {
+	assert_eq!(default_vertex_location("gemini-4-argon"), "global");
+	assert_eq!(default_vertex_location("google/gemini-4-argon"), "global");
+	assert_eq!(default_vertex_location("gemini-4-carbon"), "global");
+	assert_eq!(default_vertex_location("gemini-4-hydrogen"), "global");
+	assert_eq!(default_vertex_location("gemini-2.5-pro"), "us-central1");
+	assert_eq!(
+		default_vertex_api_url("project", "global"),
+		"https://aiplatform.googleapis.com/v1/projects/project/locations/global/endpoints/openapi/chat/completions"
+	);
+	assert!(default_vertex_api_url("project", "eu").contains("/locations/eu/"));
+}

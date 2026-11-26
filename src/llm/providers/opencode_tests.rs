@@ -1,0 +1,263 @@
+// Copyright 2026 Muvon Un Limited
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::*;
+use crate::test_support::env::EnvGuard;
+
+#[test]
+fn test_supports_model() {
+	let zen = OpenCodeZenProvider::new();
+	assert!(zen.supports_model("claude-opus-5"));
+	assert!(zen.supports_model("gpt-5.5"));
+	assert!(zen.supports_model("deepseek-v4-flash-free"));
+	assert!(zen.supports_model("deepseek-v4.1-flash-free"));
+	assert!(zen.supports_model("beam-free"));
+	assert!(zen.supports_model("flint-40b-free"));
+	assert!(!zen.supports_model(""));
+
+	let go = OpenCodeGoProvider::new();
+	assert!(go.supports_model("kimi-k2.7-code"));
+	assert!(go.supports_model("glm-5.2"));
+	assert!(!go.supports_model(""));
+}
+
+#[test]
+fn test_adjust_reasoning_effort_kimi_rules() {
+	// K3: five levels floored onto Moonshot's low/high/max tiers
+	assert_eq!(
+		adjust_reasoning_effort("kimi-k3", Some(ReasoningEffort::Low)),
+		Some(ReasoningEffort::Low)
+	);
+	assert_eq!(
+		adjust_reasoning_effort("kimi-k3", Some(ReasoningEffort::Medium)),
+		Some(ReasoningEffort::Low)
+	);
+	assert_eq!(
+		adjust_reasoning_effort("kimi-k3", Some(ReasoningEffort::High)),
+		Some(ReasoningEffort::High)
+	);
+	assert_eq!(
+		adjust_reasoning_effort("kimi-k3", Some(ReasoningEffort::XHigh)),
+		Some(ReasoningEffort::High)
+	);
+	assert_eq!(
+		adjust_reasoning_effort("kimi-k3", Some(ReasoningEffort::Max)),
+		Some(ReasoningEffort::Max)
+	);
+	// Unset stays unset — K3 applies its own default ("max")
+	assert_eq!(adjust_reasoning_effort("kimi-k3", None), None);
+
+	// Other Kimi models don't support the field at all
+	assert_eq!(
+		adjust_reasoning_effort("kimi-k2.7-code", Some(ReasoningEffort::High)),
+		None
+	);
+	assert_eq!(adjust_reasoning_effort("kimi-k2.6", Some(ReasoningEffort::Max)), None);
+	assert_eq!(adjust_reasoning_effort("Kimi-K2.5", Some(ReasoningEffort::Low)), None);
+
+	// Non-Kimi families pass through untouched
+	assert_eq!(
+		adjust_reasoning_effort("gpt-5.5", Some(ReasoningEffort::Medium)),
+		Some(ReasoningEffort::Medium)
+	);
+	assert_eq!(
+		adjust_reasoning_effort("glm-5.2", Some(ReasoningEffort::Max)),
+		Some(ReasoningEffort::Max)
+	);
+	assert_eq!(adjust_reasoning_effort("claude-opus-5", None), None);
+}
+
+#[test]
+fn test_go_zero_response_cost_falls_back_to_reference_pricing() {
+	let usage = TokenUsage {
+		input_tokens: 1_000,
+		cache_read_tokens: 500,
+		cache_write_tokens: 0,
+		output_tokens: 100,
+		reasoning_tokens: 50,
+		total_tokens: 1_650,
+		cost: Some(0.0),
+		request_time_ms: None,
+	};
+
+	let cost = resolve_opencode_cost("opencode-go", "kimi-k3", None, &usage).unwrap();
+	let expected = 1_000.0 / 1_000_000.0 * 3.00 + 500.0 / 1_000_000.0 * 0.30 + 150.0 / 1_000_000.0 * 15.00;
+	assert!((cost - expected).abs() < 1e-12);
+	assert!(cost > 0.0);
+}
+
+#[test]
+fn test_opencode_reported_cost_precedence() {
+	let usage = TokenUsage {
+		input_tokens: 1_000,
+		cache_read_tokens: 0,
+		cache_write_tokens: 0,
+		output_tokens: 100,
+		reasoning_tokens: 0,
+		total_tokens: 1_100,
+		cost: Some(0.25),
+		request_time_ms: None,
+	};
+
+	assert_eq!(
+		resolve_opencode_cost("opencode-go", "kimi-k3", None, &usage),
+		Some(0.25)
+	);
+	assert_eq!(
+		resolve_opencode_cost("opencode-zen", "kimi-k3", Some(0.125), &usage),
+		Some(0.125)
+	);
+}
+
+#[test]
+fn test_empty_kimi_assistant_placeholders_are_removed() {
+	let mut messages = vec![
+		Message::tool("Memory stored", "memorize_9", "memorize"),
+		Message::assistant(""),
+		Message::user("proceed"),
+	];
+
+	remove_empty_kimi_assistant_messages("kimi-k3", &mut messages);
+
+	assert_eq!(messages.len(), 2);
+	assert_eq!(messages[0].role, "tool");
+	assert_eq!(messages[1].role, "user");
+}
+
+#[test]
+fn test_kimi_assistant_state_is_never_removed() {
+	let mut tool_call = Message::assistant("");
+	tool_call.tool_calls = Some(serde_json::json!([{
+		"id": "memorize_9",
+		"name": "memorize",
+		"arguments": {}
+	}]));
+	let mut thinking = Message::assistant("");
+	thinking.thinking = Some(crate::llm::types::ThinkingBlock {
+		content: "reasoning".to_string(),
+		tokens: 1,
+	});
+	let mut messages = vec![Message::assistant("answer"), tool_call, thinking];
+
+	remove_empty_kimi_assistant_messages("kimi-k3", &mut messages);
+
+	assert_eq!(messages.len(), 3);
+}
+
+#[test]
+fn test_empty_non_kimi_assistant_is_untouched() {
+	let mut messages = vec![Message::assistant("")];
+
+	remove_empty_kimi_assistant_messages("gpt-5.5", &mut messages);
+
+	assert_eq!(messages.len(), 1);
+}
+
+#[test]
+fn test_default_capabilities() {
+	let zen = OpenCodeZenProvider::new();
+	assert_eq!(zen.name(), "opencode-zen");
+	assert!(!zen.supports_caching("any-model"));
+
+	let go = OpenCodeGoProvider::new();
+	assert_eq!(go.name(), "opencode-go");
+	assert!(go.supports_caching("any-model"));
+	assert!(go.supports_structured_output("any-model"));
+}
+
+#[test]
+fn test_session_header_is_added_unless_caller_set_it() {
+	let mut params = ChatCompletionParams::new(&[], "kimi-k3", 0);
+	set_session_header(&mut params);
+	let headers = params.extra_headers.unwrap();
+	assert_eq!(headers.len(), 1);
+	assert!(!headers[OPENCODE_SESSION_HEADER].is_empty());
+
+	// Caller-supplied session wins, whatever the header casing
+	let mut params = ChatCompletionParams::new(&[], "kimi-k3", 0);
+	params.extra_headers = Some(std::collections::HashMap::from([(
+		"X-OpenCode-Session".to_string(),
+		"caller-session".to_string(),
+	)]));
+	set_session_header(&mut params);
+	let headers = params.extra_headers.unwrap();
+	assert_eq!(headers.len(), 1);
+	assert_eq!(headers["X-OpenCode-Session"], "caller-session");
+}
+
+#[test]
+fn haiku_5_5_opencode_reference_fallback() {
+	let model = "claude-haiku-5-5";
+	let pricing = crate::llm::reference_models::get_reference_pricing(model).unwrap();
+	for provider in [
+		&OpenCodeZenProvider::new() as &dyn AiProvider,
+		&OpenCodeGoProvider::new() as &dyn AiProvider,
+	] {
+		let actual_pricing = provider.get_model_pricing(model).unwrap();
+		assert_eq!(actual_pricing.input_price_per_1m, pricing.input_price_per_1m);
+		assert_eq!(actual_pricing.output_price_per_1m, pricing.output_price_per_1m);
+		assert_eq!(
+			actual_pricing.cache_write_price_per_1m,
+			pricing.cache_write_price_per_1m
+		);
+		assert_eq!(actual_pricing.cache_read_price_per_1m, pricing.cache_read_price_per_1m);
+		assert_eq!(provider.get_max_input_tokens(model), 1_000_000);
+		assert!(provider.supports_vision(model));
+	}
+	for prompt_tokens in [100_000, 100_001] {
+		let usage = TokenUsage {
+			input_tokens: 10_000,
+			cache_write_tokens: prompt_tokens - 20_000,
+			cache_read_tokens: 10_000,
+			output_tokens: 10_000,
+			reasoning_tokens: 10_000,
+			total_tokens: prompt_tokens + 20_000,
+			cost: None,
+			request_time_ms: None,
+		};
+		let expected = pricing.calculate_cost(
+			usage.input_tokens,
+			usage.cache_write_tokens,
+			usage.cache_read_tokens,
+			usage.billable_output_tokens(),
+		) * if prompt_tokens > 100_000 { 5.0 } else { 1.0 };
+		for provider_name in ["opencode-go", "opencode-zen"] {
+			let actual = resolve_opencode_cost(provider_name, model, None, &usage).unwrap();
+			assert!((actual - expected).abs() < 1e-12);
+		}
+		assert_eq!(
+			resolve_opencode_cost("opencode-zen", model, Some(0.01), &usage),
+			Some(0.01)
+		);
+	}
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn request_omits_sampling_fields() {
+	let mock = crate::test_support::mock_http::MockHttp::start(vec![(
+		200,
+		crate::test_support::mock_http::chat_completion_body("ok"),
+	)]);
+	let _env = EnvGuard::new().set("OPENCODE_ZEN_API_URL", mock.url.clone());
+	let params = ChatCompletionParams::new(&[], "gpt-5.6-luna", 10).with_api_key("mock-key".to_owned());
+	OpenCodeZenProvider::new()
+		.chat_completion(params)
+		.await
+		.expect("mock completion");
+	let body: serde_json::Value = serde_json::from_str(&mock.requests()[0].body).expect("request json");
+	for field in ["temperature", "top_p", "top_k"] {
+		assert!(body.get(field).is_none(), "{field} must not be sent");
+	}
+}

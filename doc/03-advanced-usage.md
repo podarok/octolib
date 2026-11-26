@@ -159,7 +159,7 @@ match provider.chat_completion(params).await {
 ### Configurable Retry Strategy
 
 ```rust
-let params = ChatCompletionParams::new(&messages, &model, 0.7, 1.0, 50, 1000)
+let params = ChatCompletionParams::new(&messages, &model, 1000)
     .with_max_retries(5)  // Maximum retry attempts
     .with_retry_timeout(Duration::from_secs(2)); // Base timeout for exponential backoff
 
@@ -196,7 +196,7 @@ let function_def = FunctionDefinition {
 
 ```rust
 // Get provider based on model
-let (provider, model) = ProviderFactory::get_provider_for_model("anthropic:claude-3.5-sonnet")?;
+let (provider, model) = ProviderFactory::get_provider_for_model("anthropic:claude-sonnet-5-5")?;
 
 // Check provider capabilities
 if provider.supports_vision(&model) {

@@ -15,133 +15,162 @@
 //! OpenAI provider implementation
 
 use super::shared;
-use crate::errors::ProviderError;
 use crate::llm::retry;
 use crate::llm::traits::AiProvider;
 use crate::llm::types::{
-    ChatCompletionParams, ImageData, Message, ProviderExchange, ProviderResponse, ReasoningEffort,
-    SamplingSupport, ThinkingBlock, TokenUsage, ToolCall, VideoData,
+	ChatCompletionParams, FunctionDefinition, ImageData, Message, ProviderExchange, ProviderResponse, ReasoningEffort,
+	StructuredOutputRequest, ThinkingBlock, TokenUsage, ToolCall, VideoData,
 };
-use crate::llm::utils::{
-    get_model_pricing, is_model_in_pricing_table, normalize_model_name, PricingTuple,
-};
-use anyhow::Result;
+use crate::llm::utils::{get_model_pricing, is_model_in_pricing_table, normalize_model_name, PricingTuple};
+use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::env;
 
+const FREEFORM_GRAMMAR: &str = "start: plain_source\nplain_source: SOURCE\nSOURCE: /[\\s\\S]+/\n";
+
 /// OpenAI pricing constants (per 1M tokens in USD)
-/// Source: https://developers.openai.com/api/docs/pricing (verified Aug 22, 2026)
+/// Source: https://developers.openai.com/api/docs/pricing (verified Sep 22, 2026)
 /// Format: (model, input, output, cache_write, cache_read)
 /// Note: For models without caching, cache_write = input and cache_read = input
-const PRICING: &[PricingTuple] = &[
-    // GPT-5.6 family. The gpt-5.6 alias routes to gpt-5.6-sol.
-    // Cache writes cost 1.25x uncached input; cache reads cost 0.1x.
-    // Sol is on promotional pricing at least through Nov 21, 2026.
-    ("gpt-5.6-sol", 4.00, 20.00, 5.00, 0.40),
-    ("gpt-5.6-terra", 2.00, 12.00, 2.50, 0.20),
-    ("gpt-5.6-luna", 0.20, 1.20, 0.25, 0.02),
-    ("gpt-5.6-cyber", 12.50, 75.00, 15.625, 1.25),
-    ("gpt-5.6", 4.00, 20.00, 5.00, 0.40),
-    // GPT-5.5 family
-    ("gpt-5.5-pro", 30.00, 180.00, 30.00, 30.00),
-    ("gpt-5.5", 5.00, 30.00, 5.00, 0.50),
-    // GPT-5.4 family
-    ("gpt-5.4-pro", 30.00, 180.00, 30.00, 30.00),
-    ("gpt-5.4", 2.50, 15.00, 2.50, 0.25),
-    ("gpt-5.4-mini", 0.75, 4.50, 0.75, 0.075),
-    ("gpt-5.4-nano", 0.20, 1.25, 0.20, 0.02),
-    // GPT-5.3 family
-    ("gpt-5.3-instant", 1.75, 14.00, 0.175, 0.175),
-    ("gpt-5.3-codex", 1.75, 14.00, 1.75, 0.175),
-    ("gpt-5.3-chat-latest", 1.75, 14.00, 1.75, 0.175),
-    // GPT-5.2 family
-    ("gpt-5.2-pro", 21.00, 168.00, 21.00, 21.00),
-    ("gpt-5.2-codex", 1.75, 14.00, 1.75, 0.175),
-    ("gpt-5.2-chat-latest", 1.75, 14.00, 1.75, 0.175),
-    ("gpt-5.2", 1.75, 14.00, 1.75, 0.175),
-    // GPT-5.1 family
-    ("gpt-5.1-codex-mini", 0.25, 2.00, 0.25, 0.025),
-    ("gpt-5.1-codex-max", 1.25, 10.00, 1.25, 0.125),
-    ("gpt-5.1-codex", 1.25, 10.00, 1.25, 0.125),
-    ("gpt-5.1-chat-latest", 1.25, 10.00, 1.25, 0.125),
-    ("gpt-5.1", 1.25, 10.00, 1.25, 0.125),
-    // GPT-5 family
-    ("gpt-5-pro", 15.00, 120.00, 15.00, 15.00),
-    ("gpt-5-codex", 1.25, 10.00, 1.25, 0.125),
-    ("gpt-5-chat-latest", 1.25, 10.00, 1.25, 0.125),
-    ("gpt-5-mini", 0.25, 2.00, 0.25, 0.025),
-    ("gpt-5-nano", 0.05, 0.40, 0.05, 0.005),
-    ("gpt-5", 1.25, 10.00, 1.25, 0.125),
-    // Codex CLI optimized model
-    ("codex-mini-latest", 1.50, 6.00, 1.50, 0.375),
-    // GPT-4.1 family
-    ("gpt-4.1-mini", 0.40, 1.60, 0.40, 0.10),
-    ("gpt-4.1-nano", 0.10, 0.40, 0.10, 0.025),
-    ("gpt-4.1", 2.00, 8.00, 2.00, 0.50),
-    // Open-weight models
-    ("gpt-oss-120b", 0.039, 0.10, 0.039, 0.039),
-    ("gpt-oss-20b", 0.03, 0.10, 0.03, 0.03),
-    // GPT-4o / realtime / audio
-    ("gpt-realtime-2.1-mini", 0.60, 2.40, 0.60, 0.06),
-    ("gpt-realtime-2.1", 4.00, 24.00, 4.00, 0.40),
-    ("gpt-realtime-1.5", 4.00, 16.00, 4.00, 0.40),
-    ("gpt-realtime-mini", 0.60, 2.40, 0.60, 0.06),
-    ("gpt-realtime", 4.00, 16.00, 4.00, 0.40),
-    ("gpt-audio-1.5", 2.50, 10.00, 2.50, 0.25),
-    ("gpt-audio-mini", 0.15, 0.60, 0.15, 0.015),
-    ("gpt-audio", 2.50, 10.00, 2.50, 2.50),
-    ("gpt-4o-mini-realtime-preview", 0.60, 2.40, 0.60, 0.30),
-    ("gpt-4o-realtime-preview", 5.00, 20.00, 5.00, 2.50),
-    ("gpt-4o-mini", 0.15, 0.60, 0.15, 0.075),
-    ("gpt-4o-2024-05-13", 5.00, 15.00, 5.00, 5.00),
-    ("gpt-4o", 2.50, 10.00, 2.50, 1.25),
-    // Legacy/long-tail models retained for compatibility
-    ("gpt-4.5-preview", 75.00, 150.00, 75.00, 75.00),
-    ("o1", 15.00, 60.00, 15.00, 7.50),
-    ("o1-pro", 150.00, 600.00, 150.00, 150.00),
-    ("o1-mini", 1.10, 4.40, 1.10, 0.55),
-    ("o3", 2.00, 8.00, 2.00, 0.50),
-    ("o3-pro", 20.00, 80.00, 20.00, 20.00),
-    ("o3-mini", 1.10, 4.40, 1.10, 0.55),
-    ("o3-deep-research", 5.00, 20.00, 5.00, 1.25),
-    ("o4-mini", 1.10, 4.40, 1.10, 0.275),
-    ("o4-mini-deep-research", 1.00, 4.00, 1.00, 0.25),
-    ("gpt-4-turbo", 10.00, 30.00, 10.00, 10.00),
-    ("gpt-4", 30.00, 60.00, 30.00, 30.00),
-    ("gpt-4-32k", 60.00, 120.00, 60.00, 60.00),
-    ("gpt-3.5-turbo-instruct", 1.50, 2.00, 1.50, 1.50),
-    ("gpt-3.5-turbo-16k-0613", 3.00, 4.00, 3.00, 3.00),
-    ("gpt-3.5-turbo", 0.50, 1.50, 0.50, 0.50),
+pub(crate) const PRICING: &[PricingTuple] = &[
+	// GPT-6 family. Cache writes cost 1.25x uncached input; cache reads 0.1x
+	// (0.05x for the gpt-6.1 and gpt-6.2 models).
+	// gpt-6.2-astra and gpt-6.2-sol verified Nov 18, 2026 against
+	// https://developers.openai.com/api/docs/models/gpt-6.2-astra and
+	// https://developers.openai.com/api/docs/models/gpt-6.2-sol
+	("gpt-6.2-astra", 8.00, 40.00, 10.00, 0.40),
+	("gpt-6.2-sol", 2.00, 10.00, 2.50, 0.10),
+	// gpt-6.1-sol verified Sep 30, 2026 against the official pricing page above.
+	// gpt-6.1-terra verified Oct 27, 2026 against
+	// https://developers.openai.com/api/docs/models/gpt-6.1-terra
+	("gpt-6.1-terra", 1.00, 5.00, 1.25, 0.05),
+	("gpt-6.1-sol", 2.00, 10.00, 2.50, 0.10),
+	("gpt-6-astra", 10.00, 50.00, 12.50, 1.00),
+	// Sol/Luna verified Sep 24, 2026 against the official pricing page above.
+	("gpt-6-sol", 2.00, 10.00, 2.50, 0.20),
+	("gpt-6-luna", 0.10, 0.50, 0.125, 0.01),
+	// GPT-5.6 family. The gpt-5.6 alias routes to gpt-5.6-sol.
+	// Cache writes cost 1.25x uncached input; cache reads cost 0.1x.
+	// Sol is on promotional pricing at least through Nov 21, 2026.
+	("gpt-5.6-sol", 4.00, 20.00, 5.00, 0.40),
+	("gpt-5.6-terra", 2.00, 12.00, 2.50, 0.20),
+	("gpt-5.6-luna", 0.20, 1.20, 0.25, 0.02),
+	("gpt-5.6-cyber", 12.50, 75.00, 15.625, 1.25),
+	("gpt-5.6", 4.00, 20.00, 5.00, 0.40),
+	// Daybreak aliases currently point to gpt-5.6-sol (blue) and gpt-5.6-cyber (red);
+	// pricing follows the underlying model.
+	("gpt-daybreak-blue-latest", 4.00, 20.00, 5.00, 0.40),
+	("gpt-daybreak-red-latest", 12.50, 75.00, 15.625, 1.25),
+	// GPT-5.5 family. gpt-5.5-cyber has no long-context tier.
+	("gpt-5.5-cyber", 12.50, 75.00, 12.50, 1.25),
+	("gpt-5.5-pro", 30.00, 180.00, 30.00, 30.00),
+	("gpt-5.5", 5.00, 30.00, 5.00, 0.50),
+	// GPT-5.4 family
+	("gpt-5.4-pro", 30.00, 180.00, 30.00, 30.00),
+	("gpt-5.4-mini", 0.75, 4.50, 0.75, 0.075),
+	("gpt-5.4-nano", 0.20, 1.25, 0.20, 0.02),
+	("gpt-5.4", 2.50, 15.00, 2.50, 0.25),
+	// GPT-5.3 family
+	("gpt-5.3-codex", 1.75, 14.00, 1.75, 0.175),
+	("gpt-5.3-chat-latest", 1.75, 14.00, 1.75, 0.175),
+	// GPT-5.2 family
+	("gpt-5.2-pro", 21.00, 168.00, 21.00, 21.00),
+	("gpt-5.2-codex", 1.75, 14.00, 1.75, 0.175),
+	("gpt-5.2-chat-latest", 1.75, 14.00, 1.75, 0.175),
+	("gpt-5.2", 1.75, 14.00, 1.75, 0.175),
+	// GPT-5.1 family
+	("gpt-5.1-codex-mini", 0.25, 2.00, 0.25, 0.025),
+	("gpt-5.1-codex-max", 1.25, 10.00, 1.25, 0.125),
+	("gpt-5.1-codex", 1.25, 10.00, 1.25, 0.125),
+	("gpt-5.1-chat-latest", 1.25, 10.00, 1.25, 0.125),
+	("gpt-5.1", 1.25, 10.00, 1.25, 0.125),
+	// GPT-5 family
+	("gpt-5-pro", 15.00, 120.00, 15.00, 15.00),
+	("gpt-5-codex", 1.25, 10.00, 1.25, 0.125),
+	("gpt-5-chat-latest", 1.25, 10.00, 1.25, 0.125),
+	("gpt-5-mini", 0.25, 2.00, 0.25, 0.025),
+	("gpt-5-nano", 0.05, 0.40, 0.05, 0.005),
+	("gpt-5-search-api", 1.25, 10.00, 1.25, 0.125),
+	("gpt-5", 1.25, 10.00, 1.25, 0.125),
+	// Specialized models. `chat-latest` must stay below every `gpt-5.x-chat-latest`
+	// row because lookups are substring matches in table order.
+	("chat-latest", 5.00, 30.00, 5.00, 0.50),
+	// Billing starts Oct 5, 2026; cache-write pricing does not apply.
+	("gpt-rosalind-research", 5.00, 25.00, 5.00, 0.50),
+	("gpt-rosalind-discovery", 5.00, 25.00, 5.00, 0.50),
+	// GPT-4.1 family
+	("gpt-4.1-mini", 0.40, 1.60, 0.40, 0.10),
+	("gpt-4.1-nano", 0.10, 0.40, 0.10, 0.025),
+	("gpt-4.1", 2.00, 8.00, 2.00, 0.50),
+	// GPT-4o / realtime / audio
+	("gpt-realtime-2.1-mini", 0.60, 2.40, 0.60, 0.06),
+	("gpt-realtime-2.1", 4.00, 24.00, 4.00, 0.40),
+	// Must follow the gpt-realtime-2.1 rows: lookups are substring matches.
+	("gpt-realtime-2", 4.00, 24.00, 4.00, 0.40),
+	("gpt-realtime-1.5", 4.00, 16.00, 4.00, 0.40),
+	("gpt-realtime-mini", 0.60, 2.40, 0.60, 0.06),
+	("gpt-realtime", 4.00, 16.00, 4.00, 0.40),
+	("gpt-audio-1.5", 2.50, 10.00, 2.50, 2.50),
+	("gpt-audio-mini", 0.60, 2.40, 0.60, 0.60),
+	("gpt-audio", 2.50, 10.00, 2.50, 2.50),
+	("gpt-4o-mini-realtime-preview", 0.60, 2.40, 0.60, 0.30),
+	("gpt-4o-realtime-preview", 5.00, 20.00, 5.00, 2.50),
+	("gpt-4o-mini", 0.15, 0.60, 0.15, 0.075),
+	("gpt-4o-2024-05-13", 5.00, 15.00, 5.00, 5.00),
+	("gpt-4o", 2.50, 10.00, 2.50, 1.25),
+	// Legacy/long-tail models retained for compatibility.
+	// Variants stay above their base name so the substring lookup hits them first.
+	("o1-pro", 150.00, 600.00, 150.00, 150.00),
+	("o1", 15.00, 60.00, 15.00, 7.50),
+	("o3-pro", 20.00, 80.00, 20.00, 20.00),
+	("o3-mini", 1.10, 4.40, 1.10, 0.55),
+	("o3", 2.00, 8.00, 2.00, 0.50),
+	("o4-mini", 1.10, 4.40, 1.10, 0.275),
+	("gpt-4-turbo", 10.00, 30.00, 10.00, 10.00),
+	("gpt-4", 30.00, 60.00, 30.00, 30.00),
+	("gpt-3.5-turbo-instruct", 1.50, 2.00, 1.50, 1.50),
+	("gpt-3.5-turbo-1106", 1.00, 2.00, 1.00, 1.00),
+	("gpt-3.5-turbo", 0.50, 1.50, 0.50, 0.50),
 ];
 
 /// Tiered GPT-5 requests above this many input tokens use long-context pricing
 /// for the entire request: 2x input/cache rates and 1.5x output rates.
 const GPT_5_LONG_CONTEXT_THRESHOLD: u64 = 272_000;
 
+/// GPT-5.6 and later share billed cache writes with explicit breakpoints and
+/// `max` reasoning effort. The Daybreak aliases resolve to gpt-5.6-sol (blue)
+/// and gpt-5.6-cyber (red).
+fn is_gpt_5_6_or_later(normalized: &str) -> bool {
+	normalized.starts_with("gpt-5.6") || normalized.starts_with("gpt-6") || normalized.starts_with("gpt-daybreak")
+}
+
 fn get_usage_pricing(model: &str, input_tokens: u64) -> Option<(f64, f64, f64, f64)> {
-    let (mut input, mut output, mut cache_write, mut cache_read) =
-        get_model_pricing(model, PRICING)?;
+	let (mut input, mut output, mut cache_write, mut cache_read) = get_model_pricing(model, PRICING)?;
 
-    let normalized = normalize_model_name(model);
-    let tiered_long_context = normalized.starts_with("gpt-5.6")
-        || (normalized.starts_with("gpt-5.5") && !normalized.starts_with("gpt-5.5-pro"));
-    if tiered_long_context && input_tokens > GPT_5_LONG_CONTEXT_THRESHOLD {
-        input *= 2.0;
-        output *= 1.5;
-        cache_write *= 2.0;
-        cache_read *= 2.0;
-    }
+	let normalized = normalize_model_name(model);
+	// Cyber models and the daybreak-red alias have no long-context tier.
+	let tiered_long_context = (is_gpt_5_6_or_later(&normalized)
+		&& !normalized.starts_with("gpt-5.6-cyber")
+		&& !normalized.starts_with("gpt-daybreak-red"))
+		|| (normalized.starts_with("gpt-5.5") && !normalized.starts_with("gpt-5.5-cyber"))
+		|| (normalized.starts_with("gpt-5.4")
+			&& !normalized.starts_with("gpt-5.4-mini")
+			&& !normalized.starts_with("gpt-5.4-nano"));
+	if tiered_long_context && input_tokens > GPT_5_LONG_CONTEXT_THRESHOLD {
+		input *= 2.0;
+		output *= 1.5;
+		cache_write *= 2.0;
+		cache_read *= 2.0;
+	}
 
-    Some((input, output, cache_write, cache_read))
+	Some((input, output, cache_write, cache_read))
 }
 
 /// Calculate cost for OpenAI models with basic pricing (case-insensitive)
 fn calculate_cost(model: &str, input_tokens: u64, completion_tokens: u64) -> Option<f64> {
-    let (input, output, _, _) = get_usage_pricing(model, input_tokens)?;
-    Some(
-        (input_tokens as f64 / 1_000_000.0) * input
-            + (completion_tokens as f64 / 1_000_000.0) * output,
-    )
+	let (input, output, _, _) = get_usage_pricing(model, input_tokens)?;
+	Some((input_tokens as f64 / 1_000_000.0) * input + (completion_tokens as f64 / 1_000_000.0) * output)
 }
 
 /// Calculate cost with cache-aware pricing (case-insensitive)
@@ -149,28 +178,24 @@ fn calculate_cost(model: &str, input_tokens: u64, completion_tokens: u64) -> Opt
 /// - cache_read_tokens: charged at model-specific cached-input price
 /// - output_tokens: charged at normal price
 fn calculate_cost_with_cache(
-    model: &str,
-    regular_input_tokens: u64,
-    cache_write_tokens: u64,
-    cache_read_tokens: u64,
-    completion_tokens: u64,
+	model: &str,
+	regular_input_tokens: u64,
+	cache_write_tokens: u64,
+	cache_read_tokens: u64,
+	completion_tokens: u64,
 ) -> Option<f64> {
-    let total_input_tokens = regular_input_tokens
-        .saturating_add(cache_write_tokens)
-        .saturating_add(cache_read_tokens);
-    let (input, output, cache_write, cache_read) = get_usage_pricing(model, total_input_tokens)?;
+	let total_input_tokens = regular_input_tokens
+		.saturating_add(cache_write_tokens)
+		.saturating_add(cache_read_tokens);
+	let (input, output, cache_write, cache_read) = get_usage_pricing(model, total_input_tokens)?;
 
-    Some(
-        (regular_input_tokens as f64 / 1_000_000.0) * input
-            + (cache_write_tokens as f64 / 1_000_000.0) * cache_write
-            + (cache_read_tokens as f64 / 1_000_000.0) * cache_read
-            + (completion_tokens as f64 / 1_000_000.0) * output,
-    )
+	Some(
+		(regular_input_tokens as f64 / 1_000_000.0) * input
+			+ (cache_write_tokens as f64 / 1_000_000.0) * cache_write
+			+ (cache_read_tokens as f64 / 1_000_000.0) * cache_read
+			+ (completion_tokens as f64 / 1_000_000.0) * output,
+	)
 }
-
-/// Models that reject temperature and top_p (reasoning models).
-/// O1, O2, O3, O4 and GPT-5 series use internal reasoning and don't accept sampling params.
-const NO_TEMPERATURE_PREFIXES: &[&str] = &["o1", "o2", "o3", "o4", "gpt-5"];
 
 /// Convert messages to Responses API input format
 ///
@@ -180,197 +205,394 @@ const NO_TEMPERATURE_PREFIXES: &[&str] = &["o1", "o2", "o3", "o4", "gpt-5"];
 ///
 /// # Behavior
 /// - **Initial/rebased request** (no previous_id): Send the complete local transcript
-/// - **Tool response**: Send ONLY new tool results after last assistant message as function_call_output
-/// - **Continuation**: Send ONLY new user/system messages after last assistant message
-///
-/// # Arguments
-/// * `messages` - Full conversation history
-/// * `previous_response_id` - Exact OpenAI response being continued, if any
-/// * `explicit_cache_breakpoints` - Map `Message.cached` to GPT-5.6 content breakpoints
-fn messages_to_input(
-    messages: &[Message],
-    previous_response_id: Option<&str>,
-    explicit_cache_breakpoints: bool,
-) -> Vec<serde_json::Value> {
-    let content = |msg: &Message| {
-        let has_images = msg.images.as_ref().is_some_and(|v| !v.is_empty());
-        let has_videos = msg.videos.as_ref().is_some_and(|v| !v.is_empty());
-        let text_type = if msg.role == "assistant" {
-            "output_text"
-        } else {
-            "input_text"
-        };
+/// - **Continuation**: Send only messages after the exact response being continued
+pub(super) fn messages_to_input(
+	messages: &[Message],
+	previous_response_id: Option<&str>,
+	explicit_cache_breakpoints: bool,
+	tools: Option<&[FunctionDefinition]>,
+	replay_provider: Option<&str>,
+) -> Result<Vec<serde_json::Value>> {
+	let content = |msg: &Message| {
+		let has_images = msg.images.as_ref().is_some_and(|v| !v.is_empty());
+		let has_videos = msg.videos.as_ref().is_some_and(|v| !v.is_empty());
+		let text_type = if msg.role == "assistant" {
+			"output_text"
+		} else {
+			"input_text"
+		};
 
-        if !has_images && !has_videos {
-            // No attachments: keep the simple string shape unless a cache breakpoint
-            // is explicitly requested.
-            if explicit_cache_breakpoints && msg.cached {
-                serde_json::json!([{
-                    "type": text_type,
-                    "text": msg.content,
-                    "prompt_cache_breakpoint": {
-                        "mode": "explicit"
-                    }
-                }])
-            } else {
-                serde_json::json!(msg.content)
-            }
-        } else {
-            // Multimodal input: build an array of typed parts for the Responses API.
-            let mut parts = Vec::new();
-            let mut text_part = serde_json::json!({
-                "type": text_type,
-                "text": msg.content,
-            });
-            if explicit_cache_breakpoints && msg.cached {
-                text_part["prompt_cache_breakpoint"] = serde_json::json!({ "mode": "explicit" });
-            }
-            parts.push(text_part);
+		if !has_images && !has_videos {
+			// No attachments: keep the simple string shape unless a cache breakpoint
+			// is explicitly requested.
+			if explicit_cache_breakpoints && msg.cached {
+				serde_json::json!([{
+					"type": text_type,
+					"text": msg.content,
+					"prompt_cache_breakpoint": {
+						"mode": "explicit"
+					}
+				}])
+			} else {
+				serde_json::json!(msg.content)
+			}
+		} else {
+			// Multimodal input: build an array of typed parts for the Responses API.
+			let mut parts = Vec::new();
+			let mut text_part = serde_json::json!({
+				"type": text_type,
+				"text": msg.content,
+			});
+			if explicit_cache_breakpoints && msg.cached {
+				text_part["prompt_cache_breakpoint"] = serde_json::json!({ "mode": "explicit" });
+			}
+			parts.push(text_part);
 
-            if let Some(images) = &msg.images {
-                for image in images {
-                    let url = match &image.data {
-                        ImageData::Base64(data) => {
-                            format!("data:{};base64,{}", image.media_type, data)
-                        }
-                        ImageData::Url(u) => u.clone(),
-                    };
-                    parts.push(serde_json::json!({
-                        "type": "input_image",
-                        "image_url": url,
-                    }));
-                }
-            }
+			if let Some(images) = &msg.images {
+				for image in images {
+					let url = match &image.data {
+						ImageData::Base64(data) => {
+							format!("data:{};base64,{}", image.media_type, data)
+						}
+						ImageData::Url(u) => u.clone(),
+					};
+					parts.push(serde_json::json!({
+						"type": "input_image",
+						"image_url": url,
+					}));
+				}
+			}
 
-            if let Some(videos) = &msg.videos {
-                for video in videos {
-                    let url = match &video.data {
-                        VideoData::Base64(data) => {
-                            format!("data:{};base64,{}", video.media_type, data)
-                        }
-                        VideoData::Url(u) => u.clone(),
-                    };
-                    parts.push(serde_json::json!({
-                        "type": "input_video",
-                        "video_url": url,
-                    }));
-                }
-            }
+			if let Some(videos) = &msg.videos {
+				for video in videos {
+					let url = match &video.data {
+						VideoData::Base64(data) => {
+							format!("data:{};base64,{}", video.media_type, data)
+						}
+						VideoData::Url(u) => u.clone(),
+					};
+					parts.push(serde_json::json!({
+						"type": "input_video",
+						"video_url": url,
+					}));
+				}
+			}
 
-            serde_json::Value::Array(parts)
-        }
-    };
+			serde_json::Value::Array(parts)
+		}
+	};
 
-    let input_items = |msg: &Message| {
-        let mut items = Vec::new();
+	// Include tool results and user follow-ups together after the continued turn.
+	let start = previous_response_id
+		.and_then(|id| {
+			messages
+				.iter()
+				.rposition(|m| m.role == "assistant" && m.id.as_deref() == Some(id))
+		})
+		.map_or(0, |idx| idx + 1);
+	// Results must match the original call even when its turn is omitted from
+	// a continuation or the active tool definition has changed.
+	let mut captured_calls = HashMap::new();
+	let mut assistant_calls = Vec::with_capacity(messages.len());
+	for msg in messages {
+		if msg.role != "assistant" {
+			assistant_calls.push(Vec::new());
+			continue;
+		}
+		if let Some(captured) = msg.provider_items.as_ref().and_then(|items| items["items"].as_array()) {
+			for item in captured {
+				let call_id = match item["type"].as_str() {
+					Some("custom_tool_call") => Some(
+						item["call_id"]
+							.as_str()
+							.context("Captured custom_tool_call is missing call_id")?,
+					),
+					Some("function_call") => item["call_id"].as_str(),
+					_ => continue,
+				};
+				if let Some(call_id) = call_id {
+					captured_calls.insert(call_id, item);
+				}
+			}
+		}
+		assistant_calls.push(shared::parse_generic_tool_calls_lossy(
+			msg.tool_calls.as_ref(),
+			"openai",
+		));
+	}
 
-        match msg.role.as_str() {
-            "tool" => {
-                let call_id = msg.tool_call_id.clone().unwrap_or_default();
-                items.push(serde_json::json!({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": msg.content
-                }));
-            }
-            "user" | "system" => items.push(serde_json::json!({
-                "role": msg.role,
-                "content": content(msg)
-            })),
-            "assistant" => {
-                if !msg.content.is_empty() {
-                    items.push(serde_json::json!({
-                        "role": "assistant",
-                        "content": content(msg)
-                    }));
-                }
+	let legacy_call_types: HashMap<_, _> = assistant_calls
+		.iter()
+		.flatten()
+		.filter(|call| !captured_calls.contains_key(call.id.as_str()))
+		.map(|call| {
+			let is_custom =
+				freeform_parameter(tools, &call.name).is_some_and(|parameter| call.arguments[parameter].is_string());
+			(call.id.as_str(), is_custom)
+		})
+		.collect();
 
-                for call in
-                    shared::parse_generic_tool_calls_lossy(msg.tool_calls.as_ref(), "openai")
-                {
-                    items.push(serde_json::json!({
-                        "type": "function_call",
-                        "call_id": call.id,
-                        "name": call.name,
-                        "arguments": call.arguments.to_string()
-                    }));
-                }
-            }
-            _ => {}
-        }
+	let mut items = Vec::new();
+	for (msg, calls) in messages.iter().zip(&assistant_calls).skip(start) {
+		if let Some(replayed) = replay_provider.and_then(|provider| replay_provider_items(msg, provider)) {
+			items.extend_from_slice(replayed);
+			continue;
+		}
 
-        items
-    };
+		match msg.role.as_str() {
+			"tool" => {
+				let call_id = msg.tool_call_id.clone().unwrap_or_default();
+				let is_custom = if let Some(call) = captured_calls.get(call_id.as_str()) {
+					call["type"] == "custom_tool_call"
+				} else if let Some(is_custom) = legacy_call_types.get(call_id.as_str()) {
+					*is_custom
+				} else {
+					msg.name
+						.as_deref()
+						.and_then(|name| freeform_parameter(tools, name))
+						.is_some()
+				};
+				items.push(serde_json::json!({
+					"type": if is_custom { "custom_tool_call_output" } else { "function_call_output" },
+					"call_id": call_id,
+					"output": if msg.images.as_ref().is_some_and(|images| !images.is_empty()) {
+						content(msg)
+					} else {
+						serde_json::json!(msg.content)
+					}
+				}));
+			}
+			"user" | "system" => items.push(serde_json::json!({
+				"role": msg.role,
+				"content": content(msg)
+			})),
+			"assistant" => {
+				if !msg.content.is_empty() {
+					items.push(serde_json::json!({
+						"role": "assistant",
+						"content": content(msg)
+					}));
+				}
 
-    if let Some(previous_response_id) = previous_response_id {
-        // Everything after the exact response being continued is new input. Send tool
-        // results AND user follow-ups together — splitting them silently
-        // drops the user message when both exist (e.g. after a multi-turn
-        // cancel that left a tool_result without a follow-up assistant).
-        let last_assistant_idx = messages
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, m)| m.role == "assistant" && m.id.as_deref() == Some(previous_response_id))
-            .map(|(idx, _)| idx);
-
-        let start = last_assistant_idx.map(|idx| idx + 1).unwrap_or(0);
-
-        messages.iter().skip(start).flat_map(input_items).collect()
-    } else {
-        // Initial or provider-rebased request: OpenAI has no server-side chain for
-        // this transcript. Include assistant summaries/history as manual state.
-        messages.iter().flat_map(input_items).collect()
-    }
+				for call in calls {
+					let input = match captured_calls.get(call.id.as_str()) {
+						Some(item) if item["type"] == "custom_tool_call" => {
+							Some(item["input"].as_str().with_context(|| {
+								format!("Captured custom_tool_call '{}' requires a string input", call.id)
+							})?)
+						}
+						Some(_) => None,
+						None => freeform_parameter(tools, &call.name)
+							.and_then(|parameter| call.arguments[parameter].as_str()),
+					};
+					if let Some(input) = input {
+						items.push(serde_json::json!({
+							"type": "custom_tool_call",
+							"call_id": call.id,
+							"name": call.name,
+							"input": input,
+						}));
+					} else {
+						items.push(serde_json::json!({
+							"type": "function_call",
+							"call_id": call.id,
+							"name": call.name,
+							"arguments": call.arguments.to_string()
+						}));
+					}
+				}
+			}
+			_ => {}
+		}
+	}
+	Ok(items)
 }
 
 fn is_openai_response_id(id: &str) -> bool {
-    id.starts_with("resp_")
+	id.starts_with("resp_")
 }
 
 /// Select a continuation only when the current local tail is an OpenAI Responses
 /// turn. Chat Completions-compatible providers also return an `id` (commonly
 /// `chatcmpl-*`), but that is request metadata, not Responses API conversation state.
 fn resolve_previous_response_id(messages: &[Message], explicit: Option<String>) -> Option<String> {
-    match explicit {
-        Some(id) => is_openai_response_id(&id).then_some(id),
-        None => messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "assistant")
-            .and_then(|m| m.id.clone())
-            .filter(|id| is_openai_response_id(id)),
-    }
+	match explicit {
+		Some(id) => is_openai_response_id(&id).then_some(id),
+		None => messages
+			.iter()
+			.rev()
+			.find(|m| m.role == "assistant")
+			.and_then(|m| m.id.clone())
+			.filter(|id| is_openai_response_id(id)),
+	}
 }
 
 fn count_explicit_cache_breakpoints(input: &[serde_json::Value]) -> usize {
-    input
-        .iter()
-        .filter_map(|item| item.get("content").and_then(serde_json::Value::as_array))
-        .flatten()
-        .filter(|block| block.get("prompt_cache_breakpoint").is_some())
-        .count()
+	input
+		.iter()
+		.filter_map(|item| item.get("content").and_then(serde_json::Value::as_array))
+		.flatten()
+		.filter(|block| block.get("prompt_cache_breakpoint").is_some())
+		.count()
 }
 
-fn apply_explicit_cache_options(
-    request_body: &mut serde_json::Value,
-    breakpoint_count: usize,
-) -> Result<()> {
-    if breakpoint_count > 4 {
-        return Err(anyhow::anyhow!(
-            "OpenAI GPT-5.6 supports at most 4 explicit prompt cache breakpoints per request; got {}",
-            breakpoint_count
-        ));
-    }
+fn apply_explicit_cache_options(request_body: &mut serde_json::Value, breakpoint_count: usize) -> Result<()> {
+	if breakpoint_count > 4 {
+		return Err(anyhow::anyhow!(
+			"OpenAI GPT-5.6 supports at most 4 explicit prompt cache breakpoints per request; got {}",
+			breakpoint_count
+		));
+	}
 
-    if breakpoint_count > 0 {
-        request_body["prompt_cache_options"] = serde_json::json!({
-            "mode": "explicit",
-            "ttl": "30m"
-        });
-    }
+	if breakpoint_count > 0 {
+		request_body["prompt_cache_options"] = serde_json::json!({
+			"mode": "explicit",
+			"ttl": "30m"
+		});
+	}
 
-    Ok(())
+	Ok(())
+}
+
+/// Responses API `reasoning.effort` for reasoning models (o1/o3/o4/gpt-5/gpt-6/daybreak);
+/// `None` for models without one. GPT-5.6 and later additionally accept "max".
+/// An unset effort is omitted so the model's own default applies; defaults vary
+/// by model (gpt-5.1 "none", gpt-5.6 "medium", gpt-5.5-pro "high").
+///
+/// Levels a model lacks snap to its nearest supported one. Per-model sets from
+/// https://developers.openai.com/api/docs/models/<model> (verified Oct 2026):
+///   - gpt-5-pro: "high" only
+///   - gpt-5.2-pro / gpt-5.4-pro / gpt-5.5-pro: medium, high, xhigh
+///   - gpt-5: minimal, low, medium, high
+///   - gpt-5.1: none, low, medium, high
+pub(super) fn reasoning_effort(model: &str, effort: Option<ReasoningEffort>) -> Option<&'static str> {
+	let effort = effort?;
+	let is_reasoning_model = model.starts_with("o1")
+		|| model.starts_with("o3")
+		|| model.starts_with("o4")
+		|| model.starts_with("gpt-5")
+		|| model.starts_with("gpt-6")
+		|| model.starts_with("gpt-daybreak");
+	if !is_reasoning_model {
+		return None;
+	}
+
+	let normalized = normalize_model_name(model);
+	if normalized.starts_with("gpt-5-pro") {
+		return Some("high");
+	}
+	if ["gpt-5.2-pro", "gpt-5.4-pro", "gpt-5.5-pro"]
+		.iter()
+		.any(|p| normalized.starts_with(p))
+	{
+		return Some(match effort {
+			ReasoningEffort::None | ReasoningEffort::Low | ReasoningEffort::Medium => "medium",
+			ReasoningEffort::High => "high",
+			ReasoningEffort::XHigh | ReasoningEffort::Max => "xhigh",
+		});
+	}
+	// The base model or a dated snapshot (`gpt-5-2025-08-07`), not its variants.
+	let is_base = |base: &str| {
+		normalized
+			.strip_prefix(base)
+			.is_some_and(|rest| rest.is_empty() || rest.starts_with("-20"))
+	};
+	if is_base("gpt-5") || is_base("gpt-5.1") {
+		return Some(match effort {
+			ReasoningEffort::None if is_base("gpt-5") => "minimal",
+			ReasoningEffort::None => "none",
+			ReasoningEffort::Low => "low",
+			ReasoningEffort::Medium => "medium",
+			ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max => "high",
+		});
+	}
+
+	let is_gpt_5_6_plus = is_gpt_5_6_or_later(&normalized);
+	Some(match effort {
+		// GPT-5.x and GPT-6.1 Terra accept "none" (no reasoning); the o-series
+		// and the rest of GPT-6 do not (GPT-6 answers "none" with a 400 listing
+		// low..max), so "low" is their floor.
+		ReasoningEffort::None if model.starts_with("gpt-6") && !normalized.starts_with("gpt-6.1-terra") => "low",
+		ReasoningEffort::None if model.starts_with("gpt-") => "none",
+		ReasoningEffort::None => "low",
+		ReasoningEffort::Low => "low",
+		ReasoningEffort::Medium => "medium",
+		ReasoningEffort::High => "high",
+		ReasoningEffort::XHigh => "xhigh",
+		ReasoningEffort::Max if is_gpt_5_6_plus => "max",
+		ReasoningEffort::Max => "xhigh",
+	})
+}
+
+fn freeform_parameter<'a>(tools: Option<&'a [FunctionDefinition]>, name: &str) -> Option<&'a str> {
+	let tool = tools?.iter().find(|tool| tool.name == name)?;
+	tool.freeform.as_deref()
+}
+
+/// Responses API tools sorted by name, or `None` when there are none.
+pub(super) fn function_tools(tools: Option<&[FunctionDefinition]>) -> Option<Vec<serde_json::Value>> {
+	let tools = tools.filter(|tools| !tools.is_empty())?;
+	let mut sorted_tools = tools.to_vec();
+	sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
+
+	Some(
+		sorted_tools
+			.iter()
+			.map(|f| {
+				if f.freeform.is_some() {
+					return serde_json::json!({
+						"type": "custom",
+						"name": f.name,
+						"description": f.description,
+						"format": {
+							"type": "grammar",
+							"syntax": "lark",
+							"definition": FREEFORM_GRAMMAR,
+						},
+					});
+				}
+				serde_json::json!({
+					"type": "function",
+					"name": f.name,
+					"description": f.description,
+					// Omitted `strict` lets Responses normalize the schema to
+					// strict mode, which makes every optional field required:
+					// the model then fills all of them with guessed values.
+					"strict": false,
+					"parameters": f.parameters
+				})
+			})
+			.collect(),
+	)
+}
+
+/// Responses API `text` block for structured output; `None` for a JSON-schema
+/// request that carries no schema.
+pub(super) fn text_format(response_format: &StructuredOutputRequest) -> Option<serde_json::Value> {
+	let format = match &response_format.format {
+		crate::llm::types::OutputFormat::Json => serde_json::json!({ "type": "json_object" }),
+		crate::llm::types::OutputFormat::JsonSchema => {
+			// Strict structured outputs need additionalProperties:false on
+			// every nested object (no-op unless mode is Strict).
+			let schema =
+				crate::llm::utils::normalize_strict_schema(response_format.schema.as_ref()?, response_format.mode);
+
+			let mut format_obj = serde_json::json!({
+				"type": "json_schema",
+				"name": "response_schema",
+				"schema": schema
+			});
+
+			// Add strict mode if specified
+			if matches!(response_format.mode, crate::llm::types::ResponseMode::Strict) {
+				format_obj["strict"] = serde_json::json!(true);
+			}
+
+			format_obj
+		}
+	};
+
+	Some(serde_json::json!({ "format": format }))
 }
 
 /// OpenAI provider
@@ -378,44 +600,61 @@ fn apply_explicit_cache_options(
 pub struct OpenAiProvider;
 
 impl Default for OpenAiProvider {
-    fn default() -> Self {
-        Self::new()
-    }
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 impl OpenAiProvider {
-    pub fn new() -> Self {
-        Self
-    }
+	pub fn new() -> Self {
+		Self
+	}
+
+	fn auth_headers(&self, params: &ChatCompletionParams) -> Result<reqwest::header::HeaderMap> {
+		let mut headers = reqwest::header::HeaderMap::new();
+		let token = if params.api_key.is_some() {
+			shared::resolve_api_key(self, params)?
+		} else if let (Ok(token), Ok(account_id)) = (
+			env::var(OPENAI_OAUTH_ACCESS_TOKEN_ENV),
+			env::var(OPENAI_OAUTH_ACCOUNT_ID_ENV),
+		) {
+			headers.insert("ChatGPT-Account-ID", account_id.parse()?);
+			token
+		} else {
+			shared::resolve_api_key(self, params)?
+		};
+		headers.insert("Authorization", shared::sensitive_header(&format!("Bearer {token}"))?);
+		Ok(headers)
+	}
 }
 
-const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
+pub(crate) const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 const OPENAI_OAUTH_ACCESS_TOKEN_ENV: &str = "OPENAI_OAUTH_ACCESS_TOKEN";
 const OPENAI_OAUTH_ACCOUNT_ID_ENV: &str = "OPENAI_OAUTH_ACCOUNT_ID";
 const OPENAI_API_URL_ENV: &str = "OPENAI_API_URL";
 const OPENAI_API_URL: &str = "https://api.openai.com/v1/responses";
 #[async_trait::async_trait]
 impl AiProvider for OpenAiProvider {
-    fn name(&self) -> &str {
-        "openai"
-    }
+	fn name(&self) -> &str {
+		"openai"
+	}
 
-    fn supports_model(&self, model: &str) -> bool {
-        // OpenAI models - check against pricing table (strict, if not in pricing = not supported)
-        is_model_in_pricing_table(model, PRICING)
-    }
+	fn supports_model(&self, model: &str) -> bool {
+		// OpenAI models - check against pricing table (strict, if not in pricing = not supported)
+		is_model_in_pricing_table(model, PRICING)
+	}
 
-    fn get_api_key(&self) -> Result<String> {
-        // Check for OAuth tokens first (priority)
-        if env::var(OPENAI_OAUTH_ACCESS_TOKEN_ENV).is_ok() {
-            return Err(anyhow::anyhow!(
-                "Using OAuth authentication. API key not available when {} is set.",
-                OPENAI_OAUTH_ACCESS_TOKEN_ENV
-            ));
-        }
+	fn get_api_key(&self) -> Result<String> {
+		// Check for OAuth tokens first (priority)
+		if env::var(OPENAI_OAUTH_ACCESS_TOKEN_ENV).is_ok() {
+			return Err(anyhow::anyhow!(
+				"Using OAuth authentication. API key not available when {} is set.",
+				OPENAI_OAUTH_ACCESS_TOKEN_ENV
+			));
+		}
 
-        // Fall back to API key
-        match env::var(OPENAI_API_KEY_ENV) {
+		// Fall back to API key
+		match env::var(OPENAI_API_KEY_ENV) {
             Ok(key) => Ok(key),
             Err(_) => Err(anyhow::anyhow!(
                 "OpenAI API key not found in environment variable: {}. Set either {} for API key auth or {} + {} for OAuth.",
@@ -425,1458 +664,687 @@ impl AiProvider for OpenAiProvider {
                 OPENAI_OAUTH_ACCOUNT_ID_ENV
             )),
         }
-    }
+	}
 
-    fn supports_caching(&self, model: &str) -> bool {
-        // OpenAI supports automatic prompt caching for most text models.
-        // Exclude known no-cache models (pro and audio variants).
-        let model_lower = normalize_model_name(model);
-        !(model_lower.starts_with("gpt-5-pro")
-            || model_lower.starts_with("gpt-5.2-pro")
-            || model_lower.starts_with("gpt-audio"))
-            && (model_lower.contains("gpt-4o")
-                || model_lower.contains("gpt-4.1")
-                || model_lower.contains("gpt-5")
-                || model_lower.contains("codex-mini")
-                || model_lower.contains("gpt-realtime")
-                || model_lower.contains("o1-preview")
-                || model_lower.contains("o1-mini")
-                || model_lower.contains("o1")
-                || model_lower.contains("o3")
-                || model_lower.contains("o4"))
-    }
+	fn supports_caching(&self, model: &str) -> bool {
+		// OpenAI supports automatic prompt caching for most text models.
+		// Exclude known no-cache models (pro and audio variants).
+		let model_lower = normalize_model_name(model);
+		!(model_lower.starts_with("gpt-5-pro")
+			|| model_lower.starts_with("gpt-5.2-pro")
+			|| model_lower.starts_with("gpt-audio"))
+			&& (model_lower.contains("gpt-4o")
+				|| model_lower.contains("gpt-4.1")
+				|| model_lower.contains("gpt-5")
+				|| model_lower.contains("gpt-6")
+				|| model_lower.contains("gpt-daybreak")
+				|| model_lower.contains("chat-latest")
+				|| model_lower.contains("gpt-rosalind")
+				|| model_lower.contains("gpt-realtime")
+				|| model_lower.contains("o1-preview")
+				|| model_lower.contains("o1")
+				|| model_lower.contains("o3")
+				|| model_lower.contains("o4"))
+	}
 
-    fn supports_vision(&self, model: &str) -> bool {
-        // OpenAI vision-capable models (case-insensitive)
-        let normalized = normalize_model_name(model);
-        normalized.starts_with("gpt-4o")
-            || normalized.starts_with("gpt-4.1")
-            || normalized.starts_with("gpt-4-turbo")
-            || normalized.starts_with("gpt-4-vision-preview")
-            || normalized.starts_with("gpt-4o-")
-            || normalized.starts_with("gpt-5")
-            || normalized.starts_with("codex-mini")
-            || normalized.starts_with("gpt-realtime")
-    }
+	/// GPT-5.6 and later: "Minimum lifetime 30 minutes", and a read refreshes it
+	/// (<https://developers.openai.com/api/docs/guides/prompt-caching>). Measured
+	/// 2026-11-07 on gpt-6-luna (Responses API, explicit breakpoint, 30m TTL):
+	/// unique ~6.8k-token prompts re-sent once after an idle delay hit in full
+	/// on 18 of 18 calls from 5s to 30m and missed on all 4 at 35m and 40m.
+	/// Earlier models only "typically remain active for around 5 to 10
+	/// minutes", which is no guarantee.
+	fn cache_lifetime(&self, model: &str, _use_long_cache: bool) -> Option<std::time::Duration> {
+		const GPT_5_6_MINIMUM_CACHE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+		(self.supports_caching(model) && is_gpt_5_6_or_later(&normalize_model_name(model)))
+			.then_some(GPT_5_6_MINIMUM_CACHE_LIFETIME)
+	}
 
-    fn get_max_input_tokens(&self, model: &str) -> usize {
-        // OpenAI model context window limits (case-insensitive)
-        // These are the actual context windows - API handles output limits
-        let normalized = normalize_model_name(model);
+	fn supports_vision(&self, model: &str) -> bool {
+		// OpenAI vision-capable models (case-insensitive)
+		let normalized = normalize_model_name(model);
+		normalized.starts_with("gpt-4o")
+			|| normalized.starts_with("gpt-4.1")
+			|| normalized.starts_with("gpt-4-turbo")
+			|| normalized.starts_with("gpt-4-vision-preview")
+			|| normalized.starts_with("gpt-4o-")
+			|| normalized.starts_with("gpt-5")
+			|| normalized.starts_with("gpt-6")
+			|| normalized.starts_with("gpt-daybreak")
+			|| normalized.starts_with("chat-latest")
+			|| normalized.starts_with("gpt-realtime")
+	}
 
-        // GPT-5.6 Cyber is a separately provisioned 400K-context model.
-        if normalized.starts_with("gpt-5.6-cyber") {
-            return 400_000;
-        }
-        // General GPT-5.6 family: 1.05M context window.
-        if normalized.starts_with("gpt-5.6") {
-            return 1_050_000;
-        }
-        // GPT-5.5 family: 1.05M context window.
-        if normalized.starts_with("gpt-5.5") {
-            return 1_050_000;
-        }
-        // GPT-5.3 Instant: 128K context window
-        if normalized.starts_with("gpt-5.3-instant") {
-            return 128_000;
-        }
-        // GPT-5 family: 400K context window
-        if normalized.starts_with("gpt-5") {
-            return 400_000;
-        }
-        // codex-mini-latest: 200K context window
-        if normalized.starts_with("codex-mini") {
-            return 200_000;
-        }
-        // Realtime models: 32K context window
-        if normalized.starts_with("gpt-realtime") {
-            return 32_000;
-        }
-        // GPT Audio: 128K context window
-        if normalized.starts_with("gpt-audio") {
-            return 128_000;
-        }
-        // GPT-4o models: 128K context window
-        if normalized.starts_with("gpt-4o") {
-            return 128_000;
-        }
-        // GPT-4 models: varies by version
-        if normalized.starts_with("gpt-4-turbo")
-            || normalized.starts_with("gpt-4.5")
-            || normalized.starts_with("gpt-4.1")
-        {
-            return 128_000;
-        }
-        if normalized.starts_with("gpt-4") && !normalized.starts_with("gpt-4o") {
-            return 8_192; // Old GPT-4: 8K context window
-        }
-        // O-series models: 128K context window
-        if normalized.starts_with("o1")
-            || normalized.starts_with("o2")
-            || normalized.starts_with("o3")
-        {
-            return 128_000;
-        }
-        // GPT-3.5: 16K context window
-        if normalized.starts_with("gpt-3.5") {
-            return 16_384;
-        }
-        // Default conservative limit
-        8_192
-    }
+	fn get_max_input_tokens(&self, model: &str) -> usize {
+		// OpenAI model context window limits (case-insensitive)
+		// These are the actual context windows - API handles output limits
+		let normalized = normalize_model_name(model);
 
-    fn supports_structured_output(&self, _model: &str) -> bool {
-        true // All OpenAI models support structured output
-    }
+		// GPT-6 family: 1.05M context window.
+		if normalized.starts_with("gpt-6") {
+			return 1_050_000;
+		}
+		// GPT-5.6 Cyber is a separately provisioned 400K-context model.
+		if normalized.starts_with("gpt-5.6-cyber") {
+			return 400_000;
+		}
+		// General GPT-5.6 family: 1.05M context window.
+		if normalized.starts_with("gpt-5.6") {
+			return 1_050_000;
+		}
+		// GPT-5.5 family: 1.05M context window.
+		if normalized.starts_with("gpt-5.5") {
+			return 1_050_000;
+		}
+		// GPT-5.x chat-latest snapshots: 128K context window
+		if normalized.starts_with("gpt-5") && normalized.contains("chat-latest") {
+			return 128_000;
+		}
+		// GPT-5.4 and GPT-5.4 Pro: 1.05M context window; mini/nano stay at 400K.
+		if normalized.starts_with("gpt-5.4")
+			&& !normalized.starts_with("gpt-5.4-mini")
+			&& !normalized.starts_with("gpt-5.4-nano")
+		{
+			return 1_050_000;
+		}
+		// GPT-5 family: 400K context window
+		if normalized.starts_with("gpt-5") {
+			return 400_000;
+		}
+		// Daybreak aliases follow their targets: blue = gpt-5.6-sol, red = gpt-5.6-cyber.
+		if normalized.starts_with("gpt-daybreak-blue") {
+			return 1_050_000;
+		}
+		if normalized.starts_with("gpt-daybreak-red") {
+			return 400_000;
+		}
+		// chat-latest: 400K context window
+		if normalized.starts_with("chat-latest") {
+			return 400_000;
+		}
+		// GPT-Realtime-2 family (2, 2.1, 2.1-mini): 128K context window
+		if normalized.starts_with("gpt-realtime-2") {
+			return 128_000;
+		}
+		// Realtime models: 32K context window
+		if normalized.starts_with("gpt-realtime") {
+			return 32_000;
+		}
+		// GPT Audio: 128K context window
+		if normalized.starts_with("gpt-audio") {
+			return 128_000;
+		}
+		// GPT-4o models: 128K context window
+		if normalized.starts_with("gpt-4o") {
+			return 128_000;
+		}
+		// GPT-4.1 family: 1,047,576 context window
+		if normalized.starts_with("gpt-4.1") {
+			return 1_047_576;
+		}
+		// GPT-4 Turbo: 128K context window
+		if normalized.starts_with("gpt-4-turbo") {
+			return 128_000;
+		}
+		if normalized.starts_with("gpt-4") && !normalized.starts_with("gpt-4o") {
+			return 8_192; // Old GPT-4: 8K context window
+		}
+		// O-series models: 200K context window
+		if normalized.starts_with("o1")
+			|| normalized.starts_with("o2")
+			|| normalized.starts_with("o3")
+			|| normalized.starts_with("o4")
+		{
+			return 200_000;
+		}
+		// GPT-3.5: 16K context window
+		if normalized.starts_with("gpt-3.5") {
+			return 16_384;
+		}
+		// Default conservative limit
+		8_192
+	}
 
-    fn enforces_response_schema(&self, _model: &str) -> bool {
-        true
-    }
+	fn supports_structured_output(&self, _model: &str) -> bool {
+		true // All OpenAI models support structured output
+	}
 
-    fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
-        let (input_price, output_price, cache_write_price, cache_read_price) =
-            get_model_pricing(model, PRICING)?;
+	fn enforces_response_schema(&self, _model: &str) -> bool {
+		true
+	}
 
-        Some(crate::llm::types::ModelPricing::new(
-            input_price,
-            output_price,
-            cache_write_price,
-            cache_read_price,
-        ))
-    }
+	fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
+		let (input_price, output_price, cache_write_price, cache_read_price) = get_model_pricing(model, PRICING)?;
 
-    fn supported_sampling_params(&self, model: &str) -> SamplingSupport {
-        // OpenAI never supports top_k.
-        // Reasoning models (o1/o2/o3/o4/gpt-5) also reject temperature and top_p.
-        let is_reasoning = NO_TEMPERATURE_PREFIXES.iter().any(|p| model.starts_with(p));
-        SamplingSupport {
-            temperature: !is_reasoning,
-            top_p: !is_reasoning,
-            top_k: false, // OpenAI API doesn't support top_k
-        }
-    }
+		Some(crate::llm::types::ModelPricing::new(
+			input_price,
+			output_price,
+			cache_write_price,
+			cache_read_price,
+		))
+	}
 
-    async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
-        // Check for OAuth tokens first (priority), otherwise use API key
-        let (use_oauth, oauth_account_id) = if let (Ok(access_token), Ok(account_id)) = (
-            env::var(OPENAI_OAUTH_ACCESS_TOKEN_ENV),
-            env::var(OPENAI_OAUTH_ACCOUNT_ID_ENV),
-        ) {
-            (true, Some((access_token, account_id)))
-        } else {
-            (false, None)
-        };
+	async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
+		let auth_headers = self.auth_headers(&params)?;
 
-        let auth_token = if use_oauth {
-            oauth_account_id.as_ref().unwrap().0.clone()
-        } else {
-            self.get_api_key()?
-        };
+		// Only a Responses API id from the current local tail can continue an
+		// OpenAI server-side chain. Other provider ids force a transcript rebase.
+		let previous_id = resolve_previous_response_id(&params.messages, params.previous_id.clone());
 
-        // Only a Responses API id from the current local tail can continue an
-        // OpenAI server-side chain. Other provider ids force a transcript rebase.
-        let previous_id =
-            resolve_previous_response_id(&params.messages, params.previous_id.clone());
+		// Convert messages to array input format for Responses API
+		let is_gpt_5_6_plus = is_gpt_5_6_or_later(&normalize_model_name(&params.model));
+		let input_array = messages_to_input(
+			&params.messages,
+			previous_id.as_deref(),
+			is_gpt_5_6_plus,
+			params.tools.as_deref(),
+			None,
+		)?;
+		let explicit_cache_breakpoints = count_explicit_cache_breakpoints(&input_array);
 
-        // Convert messages to array input format for Responses API
-        let is_gpt_5_6 = normalize_model_name(&params.model).starts_with("gpt-5.6");
-        let input_array = messages_to_input(&params.messages, previous_id.as_deref(), is_gpt_5_6);
-        let explicit_cache_breakpoints = count_explicit_cache_breakpoints(&input_array);
+		// Create the request body for Responses API
+		let mut request_body = serde_json::json!({
+			"stream": true,
+			"model": params.model,
+			"input": input_array,
+		});
 
-        // Create the request body for Responses API
-        let mut request_body = serde_json::json!({
-            "model": params.model,
-            "input": input_array,
-        });
+		// `Message.cached` means the caller selected exact write boundaries.
+		// Disable the additional implicit latest-message write so only those
+		// marked prefixes can incur GPT-5.6 cache-write charges.
+		apply_explicit_cache_options(&mut request_body, explicit_cache_breakpoints)?;
 
-        // `Message.cached` means the caller selected exact write boundaries.
-        // Disable the additional implicit latest-message write so only those
-        // marked prefixes can incur GPT-5.6 cache-write charges.
-        apply_explicit_cache_options(&mut request_body, explicit_cache_breakpoints)?;
+		// Add previous_id for multi-turn conversations
+		if let Some(ref prev_id) = previous_id {
+			request_body["previous_response_id"] = serde_json::json!(prev_id);
+		}
 
-        // Apply sampling parameters based on model support
-        let sampling = self.effective_sampling_params(&params);
-        if let Some(temp) = sampling.temperature {
-            request_body["temperature"] = serde_json::json!(temp);
-        }
-        if let Some(top_p) = sampling.top_p {
-            request_body["top_p"] = serde_json::json!(top_p);
-        }
-        // Note: OpenAI doesn't support top_k
+		// Add max_output_tokens if specified
+		if params.max_tokens > 0 {
+			request_body["max_output_tokens"] = serde_json::json!(params.max_tokens);
+		}
 
-        // Add previous_id for multi-turn conversations
-        if let Some(ref prev_id) = previous_id {
-            request_body["previous_response_id"] = serde_json::json!(prev_id);
-        }
+		if let Some(effort) = reasoning_effort(&params.model, params.reasoning_effort) {
+			request_body["reasoning"] = serde_json::json!({ "effort": effort });
+		}
 
-        // Add max_output_tokens if specified
-        if params.max_tokens > 0 {
-            request_body["max_output_tokens"] = serde_json::json!(params.max_tokens);
-        }
+		if let Some(tools) = function_tools(params.tools.as_deref()) {
+			request_body["tools"] = serde_json::json!(tools);
+		}
 
-        // Add reasoning effort for reasoning models (o1/o3/o4/gpt-5/gpt-5.5+).
-        // Maps generic ReasoningEffort -> OpenAI Responses API "effort" string.
-        // GPT-5.6 additionally accepts "max".
-        // Default when caller omits is "medium" (per OpenAI guidance).
-        if params.model.starts_with("o1")
-            || params.model.starts_with("o3")
-            || params.model.starts_with("o4")
-            || params.model.starts_with("gpt-5")
-        {
-            let effort = match params.reasoning_effort {
-                Some(ReasoningEffort::Low) => "low",
-                Some(ReasoningEffort::Medium) => "medium",
-                Some(ReasoningEffort::High) => "high",
-                Some(ReasoningEffort::XHigh) => "xhigh",
-                Some(ReasoningEffort::Max) if params.model.starts_with("gpt-5.6") => "max",
-                Some(ReasoningEffort::Max) => "xhigh",
-                None => "medium",
-            };
-            request_body["reasoning"] = serde_json::json!({ "effort": effort });
-        }
+		if let Some(text) = params.response_format.as_ref().and_then(text_format) {
+			request_body["text"] = text;
+		}
 
-        // Add tools if available
-        if let Some(tools) = &params.tools {
-            if !tools.is_empty() {
-                let mut sorted_tools = tools.clone();
-                sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
+		// GPT-5.6 replaced the old maximum-retention field with
+		// prompt_cache_options.ttl. Its sole supported TTL is already the 30m
+		// default, so do not send the deprecated 24h field for this family.
+		if params.use_long_cache && !is_gpt_5_6_plus {
+			request_body["prompt_cache_retention"] = serde_json::json!("24h");
+		}
 
-                let openai_tools: Vec<serde_json::Value> = sorted_tools
-                    .iter()
-                    .map(|f| {
-                        serde_json::json!({
-                            "type": "function",
-                            "name": f.name,
-                            "description": f.description,
-                            "parameters": f.parameters
-                        })
-                    })
-                    .collect();
+		// Explicit cache routing key: pins requests with a shared long prefix to the
+		// same cache for better hit rates (automatic prefix-hash routing still applies).
+		if let Some(ref cache_key) = params.prompt_cache_key {
+			request_body["prompt_cache_key"] = serde_json::json!(cache_key);
+		}
 
-                request_body["tools"] = serde_json::json!(openai_tools);
-            }
-        }
+		// Execute the request with retry logic
+		let api_url = env::var(OPENAI_API_URL_ENV).unwrap_or_else(|_| OPENAI_API_URL.to_string());
 
-        // Add structured output format if specified
-        if let Some(response_format) = &params.response_format {
-            match &response_format.format {
-                crate::llm::types::OutputFormat::Json => {
-                    request_body["text"] = serde_json::json!({
-                        "format": {
-                            "type": "json_object"
-                        }
-                    });
-                }
-                crate::llm::types::OutputFormat::JsonSchema => {
-                    if let Some(schema) = &response_format.schema {
-                        // Strict structured outputs need additionalProperties:false on
-                        // every nested object (no-op unless mode is Strict).
-                        let schema = crate::llm::utils::normalize_strict_schema(
-                            schema,
-                            response_format.mode,
-                        );
+		let response = execute_openai_request(
+			auth_headers,
+			api_url,
+			request_body,
+			params.max_retries,
+			params.retry_timeout,
+			params.request_timeout,
+			params.stream_timeout,
+			params.cancellation_token.as_ref(),
+			params.extra_headers.clone(),
+			params.api_key.as_ref(),
+			params.retry_observer.as_ref(),
+			params.tools.as_deref(),
+		)
+		.await?;
 
-                        let mut format_obj = serde_json::json!({
-                            "type": "json_schema",
-                            "name": "response_schema",
-                            "schema": schema
-                        });
-
-                        // Add strict mode if specified
-                        if matches!(
-                            response_format.mode,
-                            crate::llm::types::ResponseMode::Strict
-                        ) {
-                            format_obj["strict"] = serde_json::json!(true);
-                        }
-
-                        request_body["text"] = serde_json::json!({
-                            "format": format_obj
-                        });
-                    }
-                }
-            }
-        }
-
-        // GPT-5.6 replaced the old maximum-retention field with
-        // prompt_cache_options.ttl. Its sole supported TTL is already the 30m
-        // default, so do not send the deprecated 24h field for this family.
-        if params.use_long_cache && !normalize_model_name(&params.model).starts_with("gpt-5.6") {
-            request_body["prompt_cache_retention"] = serde_json::json!("24h");
-        }
-
-        // Explicit cache routing key: pins requests with a shared long prefix to the
-        // same cache for better hit rates (automatic prefix-hash routing still applies).
-        if let Some(ref cache_key) = params.prompt_cache_key {
-            request_body["prompt_cache_key"] = serde_json::json!(cache_key);
-        }
-
-        // Execute the request with retry logic
-        let account_id_header = oauth_account_id.as_ref().map(|(_, id)| id.clone());
-        let api_url = env::var(OPENAI_API_URL_ENV).unwrap_or_else(|_| OPENAI_API_URL.to_string());
-
-        let response = execute_openai_request(
-            auth_token,
-            account_id_header,
-            api_url,
-            request_body,
-            params.max_retries,
-            params.retry_timeout,
-            params.request_timeout,
-            params.cancellation_token.as_ref(),
-            params.extra_headers.clone(),
-        )
-        .await?;
-
-        Ok(response)
-    }
+		Ok(response)
+	}
 }
 
 // Responses API structures
 #[derive(Deserialize, Debug)]
 struct ResponsesApiResponse {
-    #[serde(default)]
-    id: Option<String>,
-    output: Vec<ResponseOutput>,
-    usage: ResponseUsage,
+	#[serde(default)]
+	id: Option<String>,
+	output: Vec<ResponseOutput>,
+	usage: ResponseUsage,
 }
 #[derive(Deserialize, Debug)]
 struct ResponseOutput {
-    #[serde(rename = "type")]
-    output_type: String, // "message", "function_call", "reasoning"
-    #[serde(default)]
-    #[allow(dead_code)]
-    // id field exists in API response but we use call_id for function calls
-    id: Option<String>,
+	#[serde(rename = "type")]
+	output_type: String,
+	#[serde(default)]
+	#[allow(dead_code)]
+	// id field exists in API response but we use call_id for function calls
+	id: Option<String>,
 
-    #[serde(default)]
-    call_id: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    arguments: Option<serde_json::Value>,
-    #[serde(default)]
-    content: Option<Vec<ResponseContent>>,
+	#[serde(default)]
+	call_id: Option<String>,
+	#[serde(default)]
+	name: Option<String>,
+	#[serde(default)]
+	arguments: Option<serde_json::Value>,
+	#[serde(default)]
+	input: Option<serde_json::Value>,
+	#[serde(default)]
+	content: Option<Vec<ResponseContent>>,
 }
 
 #[derive(Deserialize, Debug)]
 struct ResponseContent {
-    #[serde(rename = "type")]
-    content_type: String, // "output_text"
-    #[serde(default)]
-    text: Option<String>,
+	#[serde(rename = "type")]
+	content_type: String, // "output_text"
+	#[serde(default)]
+	text: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
 struct ResponseUsage {
-    input_tokens: u64,
-    output_tokens: u64,
-    total_tokens: u64,
-    #[serde(default)]
-    input_tokens_details: Option<InputTokensDetails>,
-    #[serde(default)]
-    output_tokens_details: Option<OutputTokensDetails>,
+	input_tokens: u64,
+	output_tokens: u64,
+	total_tokens: u64,
+	#[serde(default)]
+	input_tokens_details: Option<InputTokensDetails>,
+	#[serde(default)]
+	output_tokens_details: Option<OutputTokensDetails>,
 }
 
 #[derive(Deserialize, Debug)]
 struct InputTokensDetails {
-    #[serde(default)]
-    cached_tokens: u64,
-    #[serde(default)]
-    cache_write_tokens: u64,
+	#[serde(default)]
+	cached_tokens: u64,
+	#[serde(default)]
+	cache_write_tokens: u64,
 }
 
 #[derive(Deserialize, Debug)]
 struct OutputTokensDetails {
-    #[serde(default)]
-    reasoning_tokens: u64,
+	#[serde(default)]
+	reasoning_tokens: u64,
 }
 
 // Execute OpenAI HTTP request
 #[allow(clippy::too_many_arguments)]
 async fn execute_openai_request(
-    auth_token: String,
-    account_id: Option<String>,
-    api_url: String,
-    request_body: serde_json::Value,
-    max_retries: u32,
-    base_timeout: std::time::Duration,
-    request_timeout: Option<std::time::Duration>,
-    cancellation_token: Option<&tokio::sync::watch::Receiver<bool>>,
-    extra_headers: Option<std::collections::HashMap<String, String>>,
+	auth_headers: reqwest::header::HeaderMap,
+	api_url: String,
+	request_body: serde_json::Value,
+	max_retries: u32,
+	base_timeout: std::time::Duration,
+	request_timeout: Option<std::time::Duration>,
+	stream_timeout: Option<std::time::Duration>,
+	cancellation_token: Option<&tokio::sync::watch::Receiver<bool>>,
+	extra_headers: Option<std::collections::HashMap<String, String>>,
+	per_call_api_key: Option<&crate::llm::types::PerCallApiKey>,
+	retry_observer: Option<&crate::llm::retry::RetryObserver>,
+	tools: Option<&[FunctionDefinition]>,
 ) -> Result<ProviderResponse> {
-    let start_time = std::time::Instant::now();
+	let start_time = std::time::Instant::now();
 
-    let response = retry::retry_with_exponential_backoff(
-        || {
-            let client = shared::http_client();
-            let extra_headers = extra_headers.clone();
-            let auth_token = auth_token.clone();
-            let account_id = account_id.clone();
-            let api_url = api_url.clone();
-            let request_body = request_body.clone();
-            Box::pin(async move {
-                let mut req = client
-                    .post(&api_url)
-                    .header("Content-Type", "application/json")
-                    .header("Authorization", format!("Bearer {}", auth_token));
+	let response = retry::retry_provider_request(
+		|| {
+			let client = shared::http_client();
+			let extra_headers = extra_headers.clone();
+			let auth_headers = auth_headers.clone();
+			let api_url = api_url.clone();
+			let request_body = request_body.clone();
+			Box::pin(async move {
+				let req = client
+					.post(&api_url)
+					.header("Content-Type", "application/json")
+					.headers(auth_headers);
 
-                // Add ChatGPT-Account-ID header if using OAuth
-                if let Some(id) = account_id {
-                    req = req.header("ChatGPT-Account-ID", id);
-                }
+				let captured = super::streaming::send_and_read(
+					req.json(&request_body),
+					request_timeout,
+					stream_timeout,
+					extra_headers.as_ref(),
+					super::streaming::Format::Responses,
+				)
+				.await?;
 
-                let captured = shared::send_and_read(
-                    req.json(&request_body),
-                    request_timeout,
-                    extra_headers.as_ref(),
-                )
-                .await?;
+				// Return Err for retryable HTTP errors so the retry loop catches them
+				if retry::is_retryable_status(captured.status.as_u16()) {
+					return Err(retry::retryable_status_error(
+						&captured,
+						format!("OpenAI API error {}: {}", captured.status, captured.body),
+					));
+				}
 
-                // Return Err for retryable HTTP errors so the retry loop catches them
-                if retry::is_retryable_status(captured.status.as_u16()) {
-                    return Err(anyhow::anyhow!(
-                        "OpenAI API error {}: {}",
-                        captured.status,
-                        captured.body
-                    ));
-                }
+				Ok(captured)
+			})
+		},
+		max_retries,
+		base_timeout,
+		cancellation_token,
+		per_call_api_key,
+		retry_observer,
+	)
+	.await?;
 
-                Ok(captured)
-            })
-        },
-        max_retries,
-        base_timeout,
-        cancellation_token,
-        || ProviderError::Cancelled.into(),
-        |e| {
-            matches!(
-                e.downcast_ref::<ProviderError>(),
-                Some(ProviderError::Cancelled)
-            )
-        },
-        |e: &anyhow::Error| shared::is_connection_error(e),
-    )
-    .await?;
+	let request_time_ms = start_time.elapsed().as_millis() as u64;
 
-    let request_time_ms = start_time.elapsed().as_millis() as u64;
+	// Extract rate limit headers before consuming response
+	let mut rate_limit_headers = std::collections::HashMap::new();
+	let headers = &response.headers;
 
-    // Extract rate limit headers before consuming response
-    let mut rate_limit_headers = std::collections::HashMap::new();
-    let headers = &response.headers;
+	// Check for cache hit headers first (fallback for older API versions)
+	let _cache_creation_input_tokens = headers
+		.get("x-cache-creation-input-tokens")
+		.and_then(|h| h.to_str().ok())
+		.and_then(|s| s.parse::<u32>().ok())
+		.unwrap_or(0);
 
-    // Check for cache hit headers first (fallback for older API versions)
-    let _cache_creation_input_tokens = headers
-        .get("x-cache-creation-input-tokens")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
+	let _cache_read_input_tokens = headers
+		.get("x-cache-read-input-tokens")
+		.and_then(|h| h.to_str().ok())
+		.and_then(|s| s.parse::<u32>().ok())
+		.unwrap_or(0);
 
-    let _cache_read_input_tokens = headers
-        .get("x-cache-read-input-tokens")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
+	// OpenAI rate limit headers
+	if let Some(requests_limit) = headers.get("x-ratelimit-limit-requests").and_then(|h| h.to_str().ok()) {
+		rate_limit_headers.insert("requests_limit".to_string(), requests_limit.to_string());
+	}
+	if let Some(requests_remaining) = headers
+		.get("x-ratelimit-remaining-requests")
+		.and_then(|h| h.to_str().ok())
+	{
+		rate_limit_headers.insert("requests_remaining".to_string(), requests_remaining.to_string());
+	}
+	if let Some(tokens_limit) = headers.get("x-ratelimit-limit-tokens").and_then(|h| h.to_str().ok()) {
+		rate_limit_headers.insert("tokens_limit".to_string(), tokens_limit.to_string());
+	}
+	if let Some(tokens_remaining) = headers
+		.get("x-ratelimit-remaining-tokens")
+		.and_then(|h| h.to_str().ok())
+	{
+		rate_limit_headers.insert("tokens_remaining".to_string(), tokens_remaining.to_string());
+	}
+	if let Some(request_reset) = headers.get("x-ratelimit-reset-requests").and_then(|h| h.to_str().ok()) {
+		rate_limit_headers.insert("request_reset".to_string(), request_reset.to_string());
+	}
 
-    // OpenAI rate limit headers
-    if let Some(requests_limit) = headers
-        .get("x-ratelimit-limit-requests")
-        .and_then(|h| h.to_str().ok())
-    {
-        rate_limit_headers.insert("requests_limit".to_string(), requests_limit.to_string());
-    }
-    if let Some(requests_remaining) = headers
-        .get("x-ratelimit-remaining-requests")
-        .and_then(|h| h.to_str().ok())
-    {
-        rate_limit_headers.insert(
-            "requests_remaining".to_string(),
-            requests_remaining.to_string(),
-        );
-    }
-    if let Some(tokens_limit) = headers
-        .get("x-ratelimit-limit-tokens")
-        .and_then(|h| h.to_str().ok())
-    {
-        rate_limit_headers.insert("tokens_limit".to_string(), tokens_limit.to_string());
-    }
-    if let Some(tokens_remaining) = headers
-        .get("x-ratelimit-remaining-tokens")
-        .and_then(|h| h.to_str().ok())
-    {
-        rate_limit_headers.insert("tokens_remaining".to_string(), tokens_remaining.to_string());
-    }
-    if let Some(request_reset) = headers
-        .get("x-ratelimit-reset-requests")
-        .and_then(|h| h.to_str().ok())
-    {
-        rate_limit_headers.insert("request_reset".to_string(), request_reset.to_string());
-    }
+	if !response.status.is_success() {
+		return Err(anyhow::anyhow!(
+			"OpenAI API error {}: {}",
+			response.status,
+			response.body
+		));
+	}
 
-    if !response.status.is_success() {
-        return Err(anyhow::anyhow!(
-            "OpenAI API error {}: {}",
-            response.status,
-            response.body
-        ));
-    }
+	let response_json: serde_json::Value = shared::parse_response(&response.body, per_call_api_key)?;
+	parse_responses_api_response(
+		request_body,
+		response_json,
+		"openai",
+		request_time_ms,
+		rate_limit_headers,
+		tools,
+	)
+	.map_err(|error| shared::redact_error(error, per_call_api_key))
+}
 
-    let response_text = response.body;
-    let api_response: ResponsesApiResponse = serde_json::from_str(&response_text)?;
+/// Replay a message's captured output items verbatim, in their original order,
+/// as the Responses API asks of callers that keep history themselves. The items
+/// only stand for the message while they come from this provider (encrypted
+/// reasoning is bound to the account that produced it) and their tool calls
+/// are exactly its tool calls; otherwise the caller falls back to its stored fields.
+fn replay_provider_items<'a>(message: &'a Message, provider: &str) -> Option<&'a [serde_json::Value]> {
+	let captured = message.provider_items.as_ref()?;
+	if captured["provider"] != provider {
+		return None;
+	}
+	let items = captured["items"].as_array()?;
+	let calls = match message.tool_calls.as_ref() {
+		Some(tool_calls) => shared::parse_generic_tool_calls_strict(tool_calls, provider).ok()?,
+		None => Vec::new(),
+	};
+	let mut message_call_ids: Vec<&str> = calls.iter().map(|call| call.id.as_str()).collect();
+	let mut item_call_ids: Vec<&str> = items
+		.iter()
+		.filter(|item| item["type"] == "function_call" || item["type"] == "custom_tool_call")
+		.map(|item| item["call_id"].as_str().unwrap_or_default())
+		.collect();
+	message_call_ids.sort_unstable();
+	item_call_ids.sort_unstable();
 
-    // Extract content from output array
-    let mut content = String::new();
-    let mut tool_calls: Option<Vec<ToolCall>> = None;
-    let mut reasoning_content: Option<String> = None;
+	(item_call_ids == message_call_ids).then_some(items.as_slice())
+}
 
-    for output in &api_response.output {
-        match output.output_type.as_str() {
-            "message" => {
-                if let Some(content_array) = &output.content {
-                    for content_item in content_array {
-                        if content_item.content_type == "output_text" {
-                            if let Some(text) = &content_item.text {
-                                if !content.is_empty() {
-                                    content.push('\n');
-                                }
-                                content.push_str(text);
-                            }
-                        }
-                    }
-                }
-            }
-            "function_call" => {
-                // Extract tool call from function_call output
-                // Parse arguments to avoid double-escaping when serializing back
-                if let (Some(name), Some(args), Some(call_id)) =
-                    (&output.name, &output.arguments, &output.call_id)
-                {
-                    let arguments: serde_json::Value = if args.is_string() {
-                        serde_json::from_str(args.as_str().unwrap_or("{}"))
-                            .unwrap_or(serde_json::json!({}))
-                    } else {
-                        args.clone()
-                    };
+/// Build a [`ProviderResponse`] from a complete Responses API response object.
+pub(super) fn parse_responses_api_response(
+	request_body: serde_json::Value,
+	mut response_json: serde_json::Value,
+	provider_name: &str,
+	request_time_ms: u64,
+	rate_limit_headers: std::collections::HashMap<String, String>,
+	tools: Option<&[FunctionDefinition]>,
+) -> Result<ProviderResponse> {
+	let api_response: ResponsesApiResponse = serde_json::from_value(response_json.clone())?;
 
-                    // CRITICAL: APPEND to tool_calls vector for parallel tool call support
-                    let new_tool_call = ToolCall {
-                        id: call_id.clone(),
-                        name: name.clone(),
-                        arguments,
-                    };
+	// Extract content from output array
+	let mut content = String::new();
+	let mut tool_calls: Option<Vec<ToolCall>> = None;
+	let mut reasoning_content: Option<String> = None;
 
-                    if let Some(ref mut calls) = tool_calls {
-                        calls.push(new_tool_call);
-                    } else {
-                        tool_calls = Some(vec![new_tool_call]);
-                    }
-                }
-            }
+	for output in &api_response.output {
+		match output.output_type.as_str() {
+			"message" => {
+				if let Some(content_array) = &output.content {
+					for content_item in content_array {
+						if content_item.content_type == "output_text" {
+							if let Some(text) = &content_item.text {
+								if !content.is_empty() {
+									content.push('\n');
+								}
+								content.push_str(text);
+							}
+						}
+					}
+				}
+			}
+			"function_call" => {
+				// Extract tool call from function_call output
+				// Parse arguments to avoid double-escaping when serializing back
+				if let (Some(name), Some(args), Some(call_id)) = (&output.name, &output.arguments, &output.call_id) {
+					let arguments: serde_json::Value = if args.is_string() {
+						serde_json::from_str(args.as_str().unwrap_or("{}")).unwrap_or(serde_json::json!({}))
+					} else {
+						args.clone()
+					};
 
-            "reasoning" => {
-                if let Some(content_array) = &output.content {
-                    for content_item in content_array {
-                        if content_item.content_type == "output_text" {
-                            if let Some(text) = &content_item.text {
-                                reasoning_content = Some(text.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+					// CRITICAL: APPEND to tool_calls vector for parallel tool call support
+					let new_tool_call = ToolCall {
+						id: call_id.clone(),
+						name: name.clone(),
+						arguments,
+					};
 
-    // Extract reasoning tokens
-    let reasoning_tokens = api_response
-        .usage
-        .output_tokens_details
-        .as_ref()
-        .map(|d| d.reasoning_tokens)
-        .unwrap_or(0);
+					if let Some(ref mut calls) = tool_calls {
+						calls.push(new_tool_call);
+					} else {
+						tool_calls = Some(vec![new_tool_call]);
+					}
+				}
+			}
+			"custom_tool_call" => {
+				let name = output
+					.name
+					.as_deref()
+					.context("Responses custom_tool_call is missing name")?;
+				let parameter = freeform_parameter(tools, name).with_context(|| {
+					format!("Responses custom_tool_call references undeclared freeform tool '{name}'")
+				})?;
+				let call_id = output
+					.call_id
+					.as_deref()
+					.with_context(|| format!("Responses custom_tool_call for '{name}' is missing call_id"))?;
+				let input = output
+					.input
+					.as_ref()
+					.and_then(serde_json::Value::as_str)
+					.with_context(|| format!("Responses custom_tool_call for '{name}' requires a string input"))?;
+				tool_calls.get_or_insert_with(Vec::new).push(ToolCall {
+					id: call_id.to_owned(),
+					name: name.to_owned(),
+					arguments: serde_json::json!({ (parameter): input }),
+				});
+			}
 
-    let thinking = reasoning_content.map(|rc| ThinkingBlock {
-        content: rc,
-        tokens: reasoning_tokens,
-    });
+			"reasoning" => {
+				if let Some(content_array) = &output.content {
+					for content_item in content_array {
+						if content_item.content_type == "output_text" {
+							if let Some(text) = &content_item.text {
+								reasoning_content = Some(text.clone());
+							}
+						}
+					}
+				}
+			}
+			_ => {}
+		}
+	}
 
-    // Calculate cost
-    let cost = request_body
-        .get("model")
-        .and_then(|m| m.as_str())
-        .and_then(|model| {
-            let cached_tokens = api_response
-                .usage
-                .input_tokens_details
-                .as_ref()
-                .map(|d| d.cached_tokens)
-                .unwrap_or(0);
-            let cache_write_tokens = api_response
-                .usage
-                .input_tokens_details
-                .as_ref()
-                .map(|d| d.cache_write_tokens)
-                .unwrap_or(0);
-            if cached_tokens > 0 || cache_write_tokens > 0 {
-                let regular_input_tokens = api_response
-                    .usage
-                    .input_tokens
-                    .saturating_sub(cached_tokens)
-                    .saturating_sub(cache_write_tokens);
-                calculate_cost_with_cache(
-                    model,
-                    regular_input_tokens,
-                    cache_write_tokens,
-                    cached_tokens,
-                    api_response.usage.output_tokens,
-                )
-            } else {
-                calculate_cost(
-                    model,
-                    api_response.usage.input_tokens,
-                    api_response.usage.output_tokens,
-                )
-            }
-        });
+	// Extract reasoning tokens
+	let reasoning_tokens = api_response
+		.usage
+		.output_tokens_details
+		.as_ref()
+		.map(|d| d.reasoning_tokens)
+		.unwrap_or(0);
 
-    // input_tokens includes regular input, cache reads, and cache writes.
-    let cache_read_tokens = api_response
-        .usage
-        .input_tokens_details
-        .as_ref()
-        .map(|d| d.cached_tokens)
-        .unwrap_or(0);
+	let thinking = reasoning_content.map(|rc| ThinkingBlock {
+		content: rc,
+		tokens: reasoning_tokens,
+	});
 
-    let cache_write_tokens = api_response
-        .usage
-        .input_tokens_details
-        .as_ref()
-        .map(|d| d.cache_write_tokens)
-        .unwrap_or(0);
+	// Calculate cost
+	let cost = request_body.get("model").and_then(|m| m.as_str()).and_then(|model| {
+		let cached_tokens = api_response
+			.usage
+			.input_tokens_details
+			.as_ref()
+			.map(|d| d.cached_tokens)
+			.unwrap_or(0);
+		let cache_write_tokens = api_response
+			.usage
+			.input_tokens_details
+			.as_ref()
+			.map(|d| d.cache_write_tokens)
+			.unwrap_or(0);
+		if cached_tokens > 0 || cache_write_tokens > 0 {
+			let regular_input_tokens = api_response
+				.usage
+				.input_tokens
+				.saturating_sub(cached_tokens)
+				.saturating_sub(cache_write_tokens);
+			calculate_cost_with_cache(
+				model,
+				regular_input_tokens,
+				cache_write_tokens,
+				cached_tokens,
+				api_response.usage.output_tokens,
+			)
+		} else {
+			calculate_cost(model, api_response.usage.input_tokens, api_response.usage.output_tokens)
+		}
+	});
 
-    // Calculate CLEAN input tokens (no cache)
-    let input_tokens_clean = api_response
-        .usage
-        .input_tokens
-        .saturating_sub(cache_read_tokens)
-        .saturating_sub(cache_write_tokens);
+	// input_tokens includes regular input, cache reads, and cache writes.
+	let cache_read_tokens = api_response
+		.usage
+		.input_tokens_details
+		.as_ref()
+		.map(|d| d.cached_tokens)
+		.unwrap_or(0);
 
-    let (output_tokens, reasoning_tokens) =
-        TokenUsage::split_output(api_response.usage.output_tokens, reasoning_tokens);
+	let cache_write_tokens = api_response
+		.usage
+		.input_tokens_details
+		.as_ref()
+		.map(|d| d.cache_write_tokens)
+		.unwrap_or(0);
 
-    let usage = TokenUsage {
-        input_tokens: input_tokens_clean, // CLEAN input (no cache)
-        cache_read_tokens,                // Tokens read from cache
-        cache_write_tokens,
-        output_tokens,
-        reasoning_tokens,
-        total_tokens: api_response.usage.total_tokens,
-        cost,
-        request_time_ms: Some(request_time_ms),
-    };
+	// Calculate CLEAN input tokens (no cache)
+	let input_tokens_clean = api_response
+		.usage
+		.input_tokens
+		.saturating_sub(cache_read_tokens)
+		.saturating_sub(cache_write_tokens);
 
-    // Create response JSON and store tool_calls in unified format
-    let mut response_json: serde_json::Value = serde_json::from_str(&response_text)?;
+	let (output_tokens, reasoning_tokens) =
+		TokenUsage::split_output(api_response.usage.output_tokens, reasoning_tokens);
 
-    // Store tool_calls in unified GenericToolCall format for conversation history
-    if let Some(ref tc) = tool_calls {
-        shared::set_response_tool_calls(&mut response_json, tc, None);
-    }
+	let usage = TokenUsage {
+		input_tokens: input_tokens_clean, // CLEAN input (no cache)
+		cache_read_tokens,                // Tokens read from cache
+		cache_write_tokens,
+		output_tokens,
+		reasoning_tokens,
+		total_tokens: api_response.usage.total_tokens,
+		cost,
+		request_time_ms: Some(request_time_ms),
+	};
 
-    let exchange = if rate_limit_headers.is_empty() {
-        ProviderExchange::new(request_body, response_json, Some(usage), "openai")
-    } else {
-        ProviderExchange::with_rate_limit_headers(
-            request_body,
-            response_json,
-            Some(usage),
-            "openai",
-            rate_limit_headers,
-        )
-    };
+	// Store tool_calls in unified GenericToolCall format for conversation history.
+	if let Some(ref tc) = tool_calls {
+		shared::set_response_tool_calls(&mut response_json, tc, None);
+	}
+	// Stateless callers replay these items. Stateful callers also need custom
+	// call metadata to type continuation results after the tool list changes.
+	let has_custom_call = api_response
+		.output
+		.iter()
+		.any(|item| item.output_type == "custom_tool_call");
+	if request_body["store"] == false || has_custom_call {
+		response_json["output_items"] = serde_json::json!({
+			"provider": provider_name,
+			"items": response_json["output"].clone(),
+		});
+	}
 
-    // Try to parse structured output if it was requested
-    let structured_output = shared::parse_structured_output_from_text(&content);
+	let exchange = if rate_limit_headers.is_empty() {
+		ProviderExchange::new(request_body, response_json, Some(usage), provider_name)
+	} else {
+		ProviderExchange::with_rate_limit_headers(
+			request_body,
+			response_json,
+			Some(usage),
+			provider_name,
+			rate_limit_headers,
+		)
+	};
 
-    Ok(ProviderResponse {
-        content,
-        thinking,
-        exchange,
-        tool_calls,
-        finish_reason: None, // Responses API doesn't have finish_reason
-        structured_output,
-        id: api_response.id,
-    })
+	// Try to parse structured output if it was requested
+	let structured_output = shared::parse_structured_output_from_text(&content);
+
+	Ok(ProviderResponse {
+		content,
+		thinking,
+		exchange,
+		tool_calls,
+		finish_reason: None, // Responses API doesn't have finish_reason
+		structured_output,
+		id: api_response.id,
+	})
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serial_test::serial;
-
-    #[test]
-    fn test_supported_sampling_params() {
-        let provider = OpenAiProvider::new();
-
-        // Models that should support temperature/top_p (but never top_k)
-        let sp = provider.supported_sampling_params("gpt-4");
-        assert!(sp.temperature);
-        assert!(sp.top_p);
-        assert!(!sp.top_k); // OpenAI never supports top_k
-
-        let sp = provider.supported_sampling_params("gpt-4o");
-        assert!(sp.temperature);
-        assert!(sp.top_p);
-
-        let sp = provider.supported_sampling_params("gpt-4o-mini");
-        assert!(sp.temperature);
-
-        let sp = provider.supported_sampling_params("chatgpt-4o-latest");
-        assert!(sp.temperature);
-
-        // Reasoning models should NOT support temperature/top_p
-        let sp = provider.supported_sampling_params("o1");
-        assert!(!sp.temperature);
-        assert!(!sp.top_p);
-        assert!(!sp.top_k);
-
-        let sp = provider.supported_sampling_params("o1-preview");
-        assert!(!sp.temperature);
-
-        let sp = provider.supported_sampling_params("o3");
-        assert!(!sp.temperature);
-
-        let sp = provider.supported_sampling_params("o4");
-        assert!(!sp.temperature);
-
-        let sp = provider.supported_sampling_params("gpt-5");
-        assert!(!sp.temperature);
-        assert!(!sp.top_p);
-
-        let sp = provider.supported_sampling_params("gpt-5-mini");
-        assert!(!sp.temperature);
-
-        let sp = provider.supported_sampling_params("gpt-5-nano");
-        assert!(!sp.temperature);
-    }
-
-    #[test]
-    fn test_supports_model_gpt5() {
-        let provider = OpenAiProvider::new();
-
-        // GPT-5 models should be supported
-        assert!(provider.supports_model("gpt-5"));
-        assert!(provider.supports_model("gpt-5-2025-08-07"));
-        assert!(provider.supports_model("gpt-5-mini"));
-        assert!(provider.supports_model("gpt-5-mini-2025-08-07"));
-        assert!(provider.supports_model("gpt-5-nano"));
-        assert!(provider.supports_model("gpt-5-nano-2025-08-07"));
-        assert!(provider.supports_model("gpt-5.5"));
-        assert!(provider.supports_model("gpt-5.5-pro"));
-        assert!(provider.supports_model("gpt-5.6"));
-        assert!(provider.supports_model("gpt-5.6-sol"));
-        assert!(provider.supports_model("gpt-5.6-terra"));
-        assert!(provider.supports_model("gpt-5.6-luna"));
-        assert!(provider.supports_model("gpt-5.2-codex"));
-        assert!(provider.supports_model("gpt-5.3-codex"));
-        assert!(provider.supports_model("gpt-5.2-chat-latest"));
-        assert!(provider.supports_model("codex-mini-latest"));
-
-        // Other models should still be supported
-        assert!(provider.supports_model("gpt-4o"));
-        assert!(provider.supports_model("gpt-audio-mini"));
-        assert!(provider.supports_model("gpt-4"));
-        assert!(provider.supports_model("gpt-3.5-turbo"));
-        assert!(provider.supports_model("o1"));
-
-        // Unsupported models
-        assert!(!provider.supports_model("claude-3"));
-        assert!(!provider.supports_model("llama-2"));
-    }
-
-    #[test]
-    fn test_supports_model_case_insensitive() {
-        let provider = OpenAiProvider::new();
-
-        // Test uppercase
-        assert!(provider.supports_model("GPT-5"));
-        assert!(provider.supports_model("GPT-4O"));
-        assert!(provider.supports_model("GPT-4"));
-        // Test mixed case
-        assert!(provider.supports_model("Gpt-5"));
-        assert!(provider.supports_model("gPT-4o"));
-        assert!(provider.supports_model("O1"));
-        assert!(provider.supports_model("o3-mini"));
-    }
-
-    #[test]
-    fn test_get_max_input_tokens_gpt5() {
-        let provider = OpenAiProvider::new();
-
-        // GPT-5.6 models have a 1.05M context window.
-        assert_eq!(provider.get_max_input_tokens("gpt-5.6"), 1_050_000);
-        assert_eq!(provider.get_max_input_tokens("gpt-5.6-sol"), 1_050_000);
-        assert_eq!(provider.get_max_input_tokens("gpt-5.6-terra"), 1_050_000);
-        assert_eq!(provider.get_max_input_tokens("gpt-5.6-luna"), 1_050_000);
-
-        // GPT-5.5 models have a 1.05M context window.
-        assert_eq!(provider.get_max_input_tokens("gpt-5.5"), 1_050_000);
-        assert_eq!(provider.get_max_input_tokens("gpt-5.5-pro"), 1_050_000);
-        assert_eq!(provider.get_max_input_tokens("gpt-5.6-cyber"), 400_000);
-
-        // GPT-5 models should have 400K context window
-        assert_eq!(provider.get_max_input_tokens("gpt-5"), 400_000);
-        assert_eq!(provider.get_max_input_tokens("gpt-5-2025-08-07"), 400_000);
-        assert_eq!(provider.get_max_input_tokens("gpt-5-mini"), 400_000);
-        assert_eq!(provider.get_max_input_tokens("gpt-5-nano"), 400_000);
-        assert_eq!(provider.get_max_input_tokens("gpt-5.2-codex"), 400_000);
-        assert_eq!(provider.get_max_input_tokens("gpt-5.3-codex"), 400_000);
-        assert_eq!(provider.get_max_input_tokens("codex-mini-latest"), 200_000);
-
-        // Other models should maintain their existing limits
-        assert_eq!(provider.get_max_input_tokens("gpt-4o"), 128_000);
-        assert_eq!(provider.get_max_input_tokens("gpt-4"), 8_192);
-        assert_eq!(provider.get_max_input_tokens("gpt-3.5-turbo"), 16_384);
-    }
-
-    #[test]
-    fn test_supports_vision() {
-        let provider = OpenAiProvider::new();
-
-        // Models that should support vision
-        assert!(provider.supports_vision("gpt-4o"));
-        assert!(provider.supports_vision("gpt-4o-mini"));
-        assert!(provider.supports_vision("gpt-4o-2024-05-13"));
-        assert!(provider.supports_vision("gpt-4-turbo"));
-        assert!(provider.supports_vision("gpt-4-vision-preview"));
-        assert!(provider.supports_vision("gpt-4.1"));
-        assert!(provider.supports_vision("gpt-5-mini"));
-        assert!(provider.supports_vision("gpt-5.2-codex"));
-        assert!(provider.supports_vision("gpt-5.3-codex"));
-        assert!(provider.supports_vision("codex-mini-latest"));
-        assert!(provider.supports_vision("gpt-realtime"));
-
-        // Models that should NOT support vision
-        assert!(!provider.supports_vision("gpt-3.5-turbo"));
-        assert!(!provider.supports_vision("gpt-4"));
-        assert!(!provider.supports_vision("o1-preview"));
-        assert!(!provider.supports_vision("o1-mini"));
-        assert!(!provider.supports_vision("text-davinci-003"));
-    }
-
-    #[test]
-    #[serial]
-    fn test_oauth_token_priority() {
-        let provider = OpenAiProvider::new();
-
-        // Set OAuth tokens
-        env::set_var(OPENAI_OAUTH_ACCESS_TOKEN_ENV, "test-oauth-token");
-        env::set_var(OPENAI_OAUTH_ACCOUNT_ID_ENV, "test-account-id");
-
-        // get_api_key should return error when OAuth is set
-        let result = provider.get_api_key();
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("OAuth authentication"));
-
-        // Clean up
-        env::remove_var(OPENAI_OAUTH_ACCESS_TOKEN_ENV);
-        env::remove_var(OPENAI_OAUTH_ACCOUNT_ID_ENV);
-    }
-
-    #[test]
-    #[serial]
-    fn test_api_key_fallback() {
-        let provider = OpenAiProvider::new();
-
-        // Remove OAuth tokens if set
-        env::remove_var(OPENAI_OAUTH_ACCESS_TOKEN_ENV);
-        env::remove_var(OPENAI_OAUTH_ACCOUNT_ID_ENV);
-
-        // Set API key
-        env::set_var(OPENAI_API_KEY_ENV, "test-api-key");
-
-        // get_api_key should return the API key
-        let result = provider.get_api_key();
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "test-api-key");
-
-        // Clean up
-        env::remove_var(OPENAI_API_KEY_ENV);
-    }
-
-    #[test]
-    #[serial]
-    fn test_no_auth_error() {
-        let provider = OpenAiProvider::new();
-
-        // Remove all auth env vars
-        env::remove_var(OPENAI_OAUTH_ACCESS_TOKEN_ENV);
-        env::remove_var(OPENAI_OAUTH_ACCOUNT_ID_ENV);
-        env::remove_var(OPENAI_API_KEY_ENV);
-
-        // get_api_key should return error
-        let result = provider.get_api_key();
-        assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
-        assert!(error_msg.contains("OPENAI_API_KEY") || error_msg.contains("OPENAI_OAUTH"));
-    }
-
-    #[test]
-    fn test_messages_to_input() {
-        let messages = vec![
-            Message {
-                role: "system".to_string(),
-                content: "You are a helpful assistant.".to_string(),
-                timestamp: 0,
-                images: None,
-                videos: None,
-                cached: false,
-                cache_ttl: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-                thinking: None,
-                id: None,
-            },
-            Message {
-                role: "user".to_string(),
-                content: "Hello!".to_string(),
-                timestamp: 0,
-                images: None,
-                videos: None,
-                cached: false,
-                cache_ttl: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-                thinking: None,
-                id: None,
-            },
-        ];
-
-        let input = messages_to_input(&messages, None, false);
-        assert_eq!(input.len(), 2);
-
-        // First message - content is plain string
-        let first = &input[0];
-        assert_eq!(first["role"], "system");
-        assert_eq!(first["content"], "You are a helpful assistant.");
-
-        // Second message - content is plain string
-        let second = &input[1];
-        assert_eq!(second["role"], "user");
-        assert_eq!(second["content"], "Hello!");
-    }
-
-    #[test]
-    fn test_messages_to_input_with_images() {
-        let image_attachment = crate::llm::types::ImageAttachment {
-            data: ImageData::Base64("fakebase64data".to_string()),
-            media_type: "image/png".to_string(),
-            source_type: crate::llm::types::SourceType::File(std::path::PathBuf::from("test.png")),
-            dimensions: None,
-            size_bytes: None,
-        };
-
-        let messages = vec![
-            Message::system("You are a helpful assistant."),
-            Message::user("What is in this image?").with_images(vec![image_attachment]),
-        ];
-
-        let input = messages_to_input(&messages, None, false);
-        assert_eq!(input.len(), 2);
-
-        // System message remains a plain string.
-        assert_eq!(input[0]["role"], "system");
-        assert_eq!(input[0]["content"], "You are a helpful assistant.");
-
-        // User message with an image is an array of typed parts.
-        assert_eq!(input[1]["role"], "user");
-        let content = &input[1]["content"];
-        assert!(content.is_array());
-        assert_eq!(content.as_array().unwrap().len(), 2);
-        assert_eq!(content[0]["type"], "input_text");
-        assert_eq!(content[0]["text"], "What is in this image?");
-        assert_eq!(content[1]["type"], "input_image");
-        assert_eq!(
-            content[1]["image_url"],
-            "data:image/png;base64,fakebase64data"
-        );
-    }
-
-    #[test]
-    fn test_messages_to_input_with_image_url_and_cache() {
-        let image_attachment = crate::llm::types::ImageAttachment {
-            data: ImageData::Url("https://example.com/image.png".to_string()),
-            media_type: "image/png".to_string(),
-            source_type: crate::llm::types::SourceType::Url,
-            dimensions: None,
-            size_bytes: None,
-        };
-
-        let messages = vec![Message::user("Describe this")
-            .with_images(vec![image_attachment])
-            .with_cache_marker()];
-
-        let input = messages_to_input(&messages, None, true);
-        assert_eq!(input.len(), 1);
-
-        let content = &input[0]["content"];
-        assert_eq!(content.as_array().unwrap().len(), 2);
-        assert_eq!(content[0]["type"], "input_text");
-        assert_eq!(content[0]["prompt_cache_breakpoint"]["mode"], "explicit");
-        assert_eq!(content[1]["type"], "input_image");
-        assert_eq!(content[1]["image_url"], "https://example.com/image.png");
-    }
-
-    #[test]
-    fn test_ollama_compaction_tail_rebases_and_keeps_summary() {
-        let mut old_openai = Message::assistant("Older OpenAI answer");
-        old_openai.id = Some("resp_old".to_string());
-
-        let mut summary = Message::assistant("Compacted Ollama conversation");
-        summary.name = Some("plan_compression".to_string());
-        summary.id = Some("chatcmpl-18".to_string());
-
-        let messages = vec![
-            Message::system("System instructions"),
-            old_openai,
-            summary,
-            Message::user("Please finalize the task"),
-        ];
-
-        let previous_id = resolve_previous_response_id(&messages, None);
-        assert_eq!(
-            previous_id, None,
-            "Ollama ids must start a fresh OpenAI chain"
-        );
-
-        let input = messages_to_input(&messages, previous_id.as_deref(), false);
-        assert_eq!(input.len(), 4);
-        assert_eq!(input[2]["role"], "assistant");
-        assert_eq!(input[2]["content"], "Compacted Ollama conversation");
-        assert_eq!(input[3]["role"], "user");
-        assert_eq!(input[3]["content"], "Please finalize the task");
-    }
-
-    #[test]
-    fn test_latest_openai_response_id_continues_exact_turn() {
-        let mut assistant = Message::assistant("OpenAI answer");
-        assistant.id = Some("resp_latest".to_string());
-        let messages = vec![assistant, Message::user("Follow-up")];
-
-        let previous_id = resolve_previous_response_id(&messages, None);
-        assert_eq!(previous_id.as_deref(), Some("resp_latest"));
-
-        let input = messages_to_input(&messages, previous_id.as_deref(), false);
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[0]["content"], "Follow-up");
-    }
-
-    #[test]
-    fn test_invalid_explicit_previous_id_forces_rebase() {
-        let messages = vec![Message::user("Fresh input")];
-        let previous_id = resolve_previous_response_id(&messages, Some("chatcmpl-18".to_string()));
-
-        assert_eq!(previous_id, None);
-        let input = messages_to_input(&messages, previous_id.as_deref(), false);
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["content"], "Fresh input");
-    }
-
-    #[test]
-    fn test_gpt_5_6_explicit_cache_breakpoint_wire_shape() {
-        let messages = vec![
-            Message::system("Stable instructions").with_cache_marker(),
-            Message::user("Variable request"),
-        ];
-
-        let input = messages_to_input(&messages, None, true);
-        assert_eq!(count_explicit_cache_breakpoints(&input), 1);
-        assert_eq!(input[0]["content"][0]["type"], "input_text");
-        assert_eq!(input[0]["content"][0]["text"], "Stable instructions");
-        assert_eq!(
-            input[0]["content"][0]["prompt_cache_breakpoint"]["mode"],
-            "explicit"
-        );
-        assert_eq!(input[1]["content"], "Variable request");
-
-        let mut request_body = serde_json::json!({"input": input});
-        apply_explicit_cache_options(&mut request_body, 1).unwrap();
-        assert_eq!(request_body["prompt_cache_options"]["mode"], "explicit");
-        assert_eq!(request_body["prompt_cache_options"]["ttl"], "30m");
-    }
-
-    #[test]
-    fn test_gpt_5_6_cached_assistant_uses_output_text() {
-        let mut summary = Message::assistant("Compressed task summary");
-        summary.name = Some("plan_compression".to_string());
-        summary.cached = true;
-
-        let input = messages_to_input(&[summary], None, true);
-
-        assert_eq!(input[0]["role"], "assistant");
-        assert_eq!(input[0]["content"][0]["type"], "output_text");
-        assert_eq!(
-            input[0]["content"][0]["prompt_cache_breakpoint"]["mode"],
-            "explicit"
-        );
-    }
-
-    #[test]
-    fn test_explicit_cache_breakpoint_limit() {
-        let mut request_body = serde_json::json!({});
-        let error = apply_explicit_cache_options(&mut request_body, 5).unwrap_err();
-        assert!(error.to_string().contains("at most 4"));
-    }
-
-    #[test]
-    fn test_pre_gpt_5_6_keeps_cached_messages_in_legacy_shape() {
-        let messages = vec![Message::system("Stable instructions").with_cache_marker()];
-        let input = messages_to_input(&messages, None, false);
-
-        assert_eq!(input[0]["content"], "Stable instructions");
-        assert_eq!(count_explicit_cache_breakpoints(&input), 0);
-    }
-
-    #[test]
-    fn test_messages_to_input_with_tool_response() {
-        // Scenario: Assistant made a tool call, we're sending the tool result back
-        let messages = vec![
-            Message {
-                role: "user".to_string(),
-                content: "What is the weather?".to_string(),
-                timestamp: 0,
-                images: None,
-                videos: None,
-                cached: false,
-                cache_ttl: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-                thinking: None,
-                id: None,
-            },
-            Message {
-                role: "assistant".to_string(),
-                content: "".to_string(),
-                timestamp: 0,
-                images: None,
-                videos: None,
-                cached: false,
-                cache_ttl: None,
-                tool_calls: Some(serde_json::json!([{
-                    "id": "call_12345",
-                    "type": "function",
-                    "function": {
-                        "name": "get_weather",
-                        "arguments": "{}"
-                    }
-                }])),
-                tool_call_id: None,
-                name: None,
-                thinking: None,
-                id: Some("resp_abc123".to_string()),
-            },
-            Message {
-                role: "tool".to_string(),
-                content: "{\"temperature\": \"22C\", \"condition\": \"sunny\"}".to_string(),
-                timestamp: 0,
-                images: None,
-                videos: None,
-                cached: false,
-                cache_ttl: None,
-                tool_calls: None,
-                tool_call_id: Some("call_12345".to_string()),
-                name: Some("get_weather".to_string()),
-                thinking: None,
-                id: None,
-            },
-        ];
-
-        // When there are NEW tool responses after assistant, send only those tool outputs
-        let input = messages_to_input(&messages, Some("resp_abc123"), false);
-        assert_eq!(input.len(), 1); // Only the NEW tool response
-
-        // Tool response uses function_call_output format
-        let tool_output = &input[0];
-        assert_eq!(tool_output["type"], "function_call_output");
-        assert_eq!(tool_output["call_id"], "call_12345");
-        assert_eq!(
-            tool_output["output"],
-            "{\"temperature\": \"22C\", \"condition\": \"sunny\"}"
-        );
-    }
-
-    #[test]
-    fn test_messages_to_input_continuation_without_tools() {
-        // Scenario: Continuing conversation without tool calls (like "what else you can do?")
-        let messages = vec![
-            Message {
-                role: "user".to_string(),
-                content: "run date in shell".to_string(),
-                timestamp: 0,
-                images: None,
-                videos: None,
-                cached: false,
-                cache_ttl: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-                thinking: None,
-                id: None,
-            },
-            Message {
-                role: "assistant".to_string(),
-                content: "".to_string(),
-                timestamp: 0,
-                images: None,
-                videos: None,
-                cached: false,
-                cache_ttl: None,
-                tool_calls: Some(serde_json::json!([{
-                    "id": "call_old",
-                    "type": "function",
-                    "function": {
-                        "name": "shell",
-                        "arguments": "{\"command\": \"date\"}"
-                    }
-                }])),
-                tool_call_id: None,
-                name: None,
-                thinking: None,
-                id: Some("resp_first".to_string()),
-            },
-            Message {
-                role: "tool".to_string(),
-                content: "Mon Jan 19 22:12:18 +07 2026".to_string(),
-                timestamp: 0,
-                images: None,
-                videos: None,
-                cached: false,
-                cache_ttl: None,
-                tool_calls: None,
-                tool_call_id: Some("call_old".to_string()),
-                name: Some("shell".to_string()),
-                thinking: None,
-                id: None,
-            },
-            Message {
-                role: "assistant".to_string(),
-                content: "The current date is Mon Jan 19 22:12:18 +07 2026".to_string(),
-                timestamp: 0,
-                images: None,
-                videos: None,
-                cached: false,
-                cache_ttl: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-                thinking: None,
-                id: Some("resp_second".to_string()),
-            },
-            Message {
-                role: "user".to_string(),
-                content: "what else you can do?".to_string(),
-                timestamp: 0,
-                images: None,
-                videos: None,
-                cached: false,
-                cache_ttl: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-                thinking: None,
-                id: None,
-            },
-        ];
-
-        // Should send only the NEW user message, NOT the old tool result
-        let input = messages_to_input(&messages, Some("resp_second"), false);
-        assert_eq!(input.len(), 1);
-
-        // Should be the new user message
-        let user_msg = &input[0];
-        assert_eq!(user_msg["role"], "user");
-        assert_eq!(user_msg["content"], "what else you can do?");
-    }
-
-    /// Regression: after a multi-turn cancel that leaves a tool_result without
-    /// a follow-up assistant, the next user prompt must be sent alongside the
-    /// tool_result. Previously the function returned only the tool_result and
-    /// dropped the user message, causing the model to "drift" off-track.
-    #[test]
-    fn test_messages_to_input_tool_result_then_user_after_cancel() {
-        let messages = vec![
-            Message {
-                role: "user".to_string(),
-                content: "What is the weather?".to_string(),
-                timestamp: 0,
-                images: None,
-                videos: None,
-                cached: false,
-                cache_ttl: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-                thinking: None,
-                id: None,
-            },
-            Message {
-                role: "assistant".to_string(),
-                content: "".to_string(),
-                timestamp: 0,
-                images: None,
-                videos: None,
-                cached: false,
-                cache_ttl: None,
-                tool_calls: Some(serde_json::json!([{
-                    "id": "call_w",
-                    "type": "function",
-                    "function": {"name": "get_weather", "arguments": "{}"}
-                }])),
-                tool_call_id: None,
-                name: None,
-                thinking: None,
-                id: Some("resp_x".to_string()),
-            },
-            Message {
-                role: "tool".to_string(),
-                content: "72°F sunny".to_string(),
-                timestamp: 0,
-                images: None,
-                videos: None,
-                cached: false,
-                cache_ttl: None,
-                tool_calls: None,
-                tool_call_id: Some("call_w".to_string()),
-                name: Some("get_weather".to_string()),
-                thinking: None,
-                id: None,
-            },
-            // User retried after cancelling the follow-up assistant.
-            Message {
-                role: "user".to_string(),
-                content: "Now write me a poem about it.".to_string(),
-                timestamp: 0,
-                images: None,
-                videos: None,
-                cached: false,
-                cache_ttl: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-                thinking: None,
-                id: None,
-            },
-        ];
-
-        let input = messages_to_input(&messages, Some("resp_x"), false);
-        assert_eq!(
-            input.len(),
-            2,
-            "tool_result and follow-up user must both be sent"
-        );
-        assert_eq!(input[0]["type"], "function_call_output");
-        assert_eq!(input[0]["call_id"], "call_w");
-        assert_eq!(input[1]["role"], "user");
-        assert_eq!(input[1]["content"], "Now write me a poem about it.");
-    }
-
-    #[test]
-    fn test_codex_pricing() {
-        // Test that codex models have pricing defined
-        let cost = calculate_cost("gpt-5-codex", 1000, 500);
-        assert!(cost.is_some());
-        let cost_value = cost.unwrap();
-        // Expected: (1000/1M * 1.25) + (500/1M * 10.0) = 0.00125 + 0.005 = 0.00625
-        assert!((cost_value - 0.00625).abs() < 0.0000001);
-
-        // Verify gpt-5.2-codex pricing path exists
-        let cost_52 = calculate_cost("gpt-5.2-codex", 1000, 500);
-        assert!(cost_52.is_some());
-        let cost_52_value = cost_52.unwrap();
-        // Expected: (1000/1M * 1.75) + (500/1M * 14.0) = 0.00175 + 0.007 = 0.00875
-        assert!((cost_52_value - 0.00875).abs() < 0.0000001);
-
-        // Verify gpt-5.3-codex pricing path exists
-        let cost_53 = calculate_cost("gpt-5.3-codex", 1000, 500);
-        assert!(cost_53.is_some());
-        let cost_53_value = cost_53.unwrap();
-        assert!((cost_53_value - 0.00875).abs() < 0.0000001);
-    }
-
-    #[test]
-    fn test_cache_pricing_for_gpt_5_2_codex() {
-        // (regular 1000 * 1.75 + cached 1000 * 0.175 + output 500 * 14) / 1M
-        let cost = calculate_cost_with_cache("gpt-5.2-codex", 1000, 0, 1000, 500).unwrap();
-        assert!((cost - 0.008925).abs() < 0.0000001);
-    }
-
-    #[test]
-    fn test_gpt_5_6_pricing_and_alias() {
-        let provider = OpenAiProvider::new();
-        let cases = [
-            ("gpt-5.6", 4.00, 20.00, 5.00, 0.40),
-            ("gpt-5.6-sol", 4.00, 20.00, 5.00, 0.40),
-            ("gpt-5.6-terra", 2.00, 12.00, 2.50, 0.20),
-            ("gpt-5.6-luna", 0.20, 1.20, 0.25, 0.02),
-        ];
-
-        for (model, input, output, cache_write, cache_read) in cases {
-            let pricing = provider.get_model_pricing(model).unwrap();
-            assert_eq!(pricing.input_price_per_1m, input);
-            assert_eq!(pricing.output_price_per_1m, output);
-            assert_eq!(pricing.cache_write_price_per_1m, cache_write);
-            assert_eq!(pricing.cache_read_price_per_1m, cache_read);
-
-            let reference = crate::llm::reference_models::get_reference_pricing(model).unwrap();
-            assert_eq!(reference.input_price_per_1m, pricing.input_price_per_1m);
-            assert_eq!(reference.output_price_per_1m, pricing.output_price_per_1m);
-            assert_eq!(
-                reference.cache_write_price_per_1m,
-                pricing.cache_write_price_per_1m
-            );
-            assert_eq!(
-                reference.cache_read_price_per_1m,
-                pricing.cache_read_price_per_1m
-            );
-        }
-    }
-
-    #[test]
-    fn test_gpt_5_6_long_context_and_cache_write_pricing() {
-        // Standard tier: regular input + cache write + cache read + output.
-        let standard =
-            calculate_cost_with_cache("gpt-5.6-terra", 100_000, 50_000, 50_000, 10_000).unwrap();
-        assert!((standard - 0.455).abs() < 0.0000001);
-
-        // Above 272K total input: 2x every input/cache rate and 1.5x output.
-        let long =
-            calculate_cost_with_cache("gpt-5.6-terra", 200_000, 50_000, 50_001, 10_000).unwrap();
-        assert!((long - 1.2500004).abs() < 0.0000001);
-    }
-
-    #[test]
-    fn test_gpt_5_6_usage_deserializes_cache_writes() {
-        let usage: ResponseUsage = serde_json::from_value(serde_json::json!({
-            "input_tokens": 3_000,
-            "output_tokens": 500,
-            "total_tokens": 3_500,
-            "input_tokens_details": {
-                "cached_tokens": 1_000,
-                "cache_write_tokens": 500
-            }
-        }))
-        .unwrap();
-
-        let details = usage.input_tokens_details.unwrap();
-        assert_eq!(details.cached_tokens, 1_000);
-        assert_eq!(details.cache_write_tokens, 500);
-    }
-}
+#[path = "openai_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "openai_responses_parser_tests.rs"]
+mod responses_parser_tests;

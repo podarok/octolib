@@ -1,5 +1,1310 @@
 # Changelog
 
+## [0.56.0] - 2026-11-24
+
+### 📋 Release Summary
+
+Terminal prompts and setup metadata are now supported. The Responses API now supports freeform tools.
+
+### ✨ New Features & Enhancements
+
+- add terminal prompts and setup metadata `fd9ca6e6`
+- **llm**: support freeform tools in Responses API `60d1ae39`
+
+## [0.55.3] - 2026-11-23
+
+### 📋 Release Summary
+
+GLM-5.4 is now supported across model catalogs.
+
+### ✨ New Features & Enhancements
+
+- **llm**: support GLM-5.4 across model catalogs `d0a3c996`
+
+## [0.55.2] - 2026-11-23
+
+### 📋 Release Summary
+
+Formatted line identifiers can now be parsed.
+
+### ✨ New Features & Enhancements
+
+- **line-hash**: parse formatted line identifiers `b271653d`
+
+## [0.55.1] - 2026-11-23
+
+### 📋 Release Summary
+
+Line IDs are now separated from content with a space. Pricing is available for InclusionAI Ling 3.0 Tiny.
+
+### 🚨 Breaking Changes
+
+- **line-hash**: separate line ids from content with a space `1a3d22b5`
+
+### ✨ New Features & Enhancements
+
+- **llm**: price InclusionAI Ling 3.0 Tiny `95c6ce3e`
+
+## [0.55.0] - 2026-11-21
+
+### 📋 Release Summary
+
+Sampling controls have been removed from chat completions.
+
+### 🚨 Breaking Changes
+
+- **llm**: remove sampling controls from chat completions `0d04a2c1`
+
+## [0.54.2] - 2026-11-21
+
+### 📋 Release Summary
+
+HTTP handling now accounts for resolver build failures.
+
+### 🐛 Bug Fixes & Stability
+
+- **http**: handle resolver build failures `086e23e8`
+
+## [0.54.1] - 2026-11-18
+
+### 📋 Release Summary
+
+Pricing information is now available for GPT-6.2 models.
+
+### ✨ New Features & Enhancements
+
+- **llm**: price GPT-6.2 models `f232e38e`
+
+## [0.54.0] - 2026-11-17
+
+### 📋 Release Summary
+
+HTTP diagnostics now include DNS and connection timings, and LLM model capabilities, pricing, and routing have been updated. DNS resolution now uses platform-appropriate behavior, and ONNX session prepacking is disabled for Hindsight.
+
+### ✨ New Features & Enhancements
+
+- **http**: add timed DNS and connection diagnostics `fcc37308`
+- **llm**: update model capabilities, pricing, and routing `c0283727`
+
+### 🔧 Improvements & Optimizations
+
+- **hindsight**: disable ONNX session prepacking `2b0a9062`
+
+### 🐛 Bug Fixes & Stability
+
+- **dns**: use platform-appropriate DNS resolution `c9d4ab93`
+
+## [0.53.2] - 2026-11-15
+
+### 📋 Release Summary
+
+Qwen4-Max-Preview is now supported. Model pricing data has been corrected, and ONNX embedding execution now prefers the CPU.
+
+### ✨ New Features & Enhancements
+
+- **llm**: support qwen4-max-preview model `3549244f`
+
+### 🔧 Improvements & Optimizations
+
+- **onnx**: prefer CPU for ONNX embedding execution `93c4887a`
+- **ollama**: format pricing URL as an autolink `3c9969ea`
+
+### 🐛 Bug Fixes & Stability
+
+- **llm**: correct model pricing data `88e148d0`
+
+## [0.53.1] - 2026-11-15
+
+### 📋 Release Summary
+
+ONNX models can now use pinned revisions.
+
+### ✨ New Features & Enhancements
+
+- **onnx**: support pinned revisions for ONNX models `7f8fb980`
+
+## [0.53.0] - 2026-11-15
+
+### 📋 Release Summary
+
+Evaluation now supports Ollama models, and CoreML is restricted to static input shapes. Inception providers are deprecated effective 2026-12-28.
+
+### ✨ New Features & Enhancements
+
+- **evaluation**: support Ollama evaluation models `418f675b`
+
+### 🔧 Improvements & Optimizations
+
+- **llm,evaluation**: deprecate Inception providers for 2026-12-28 `a7182ece`
+
+### 🐛 Bug Fixes & Stability
+
+- **coreml**: restrict CoreML to static input shapes `fc06fcd7`
+
+### 🔄 Other Changes
+
+2 maintenance, dependency, and tooling updates not listed individually.
+
+## [0.52.3] - 2026-11-10
+
+### 📋 Release Summary
+
+Claude 5.2 and Muse Ember models are now supported.
+
+### ✨ New Features & Enhancements
+
+- **llm**: support Claude 5.2 and Muse Ember models `b4c0ed2e`
+
+## [0.52.2] - 2026-11-09
+
+### 📋 Release Summary
+
+Provider values now preserve decimal precision.
+
+### 🐛 Bug Fixes & Stability
+
+- preserve decimal precision in provider values `5ad31c83`
+
+## [0.52.1] - 2026-11-08
+
+### 📋 Release Summary
+
+OpenCode model catalog URLs are now set correctly.
+
+### 🔧 Improvements & Optimizations
+
+- **websocket**: reformat websocket code and assertions `ee5ddf08`
+
+### 🐛 Bug Fixes & Stability
+
+- **llm**: set OpenCode model catalog URLs `8aacf8b5`
+
+## [0.52.0] - 2026-11-07
+
+### 📋 Release Summary
+
+LLM providers now expose model-list endpoints and offline setup metadata.
+
+### ✨ New Features & Enhancements
+
+- **llm**: expose provider model-list endpoints `ba9401bc`
+- **llm**: expose offline provider setup metadata `14999163`
+
+## [0.51.1] - 2026-11-07
+
+### 📋 Release Summary
+
+Provider cache lifetimes are now measured and reported, with examples probing retention across models and stopping after repeated cache misses. Inkling-2-Small metadata is supported. Nemotron effort mapping, Tinker caching, and Alibaba cache lifetimes—including Qwen3.8-Max’s 30-minute lifetime and DeepSeek’s corrected lifetime—are updated.
+
+### ✨ New Features & Enhancements
+
+- **llm**: report measured provider cache lifetimes `5b15abc5`
+- **llm**: support Inkling-2-Small metadata `faf3b060`
+- **examples**: probe mercury-3 cache lifetime `0435d5d0`
+- **examples**: signal stop after repeated cache misses `57b7892f`
+- **examples**: probe prompt-cache retention across models `cddb477c`
+
+### 🐛 Bug Fixes & Stability
+
+- **llm**: map Nemotron effort and expose Tinker caching `2fea1cfd`
+- **alibaba**: set qwen3.8-max cache lifetime to 30m `c5344c86`
+- **alibaba**: correct DeepSeek cache lifetime `6c8877f8`
+- **llm**: use measured cache lifetimes for providers `b13f3c57`
+
+### 📚 Documentation & Examples
+
+- document live cache-lifetime measurement `fca3e6db`
+
+## [0.51.0] - 2026-11-07
+
+### 📋 Release Summary
+
+OctoHub cache lifetime now derives from marker TTL, and provider cache lifetimes are reported. Ollama caching and TTL keepalive are supported, and Reflection AI and Isoquant are supported as providers. HTTP requests now trust system root certificates alongside bundled roots.
+
+### 🚨 Breaking Changes
+
+- **llm**: derive OctoHub cache lifetime from marker TTL `ed464647`
+
+### ✨ New Features & Enhancements
+
+- **llm**: report provider cache lifetimes `64c2750c`
+- **ollama**: enable Ollama caching and TTL keepalive `e81d2dcd`
+- **llm**: support Reflection AI as a provider `172fc84f`
+- **llm**: add Isoquant provider support `c2460ecf`
+
+### 🔧 Improvements & Optimizations
+
+- **llm/providers**: format provider URLs as Markdown links `f017df59`
+- **openai**: clarify GPT-5.6 cache lifetime evidence `5d5d05f0`
+- **providers**: document observed prompt cache retention `9a84f7f0`
+
+### 🐛 Bug Fixes & Stability
+
+- **http**: trust system root certificates alongside bundled roots `7bdce1fc`
+
+## [0.50.1] - 2026-11-06
+
+### 📋 Release Summary
+
+Reasoning metadata is preserved across provider conversions, and WebSocket sockets wait for a close reply before expiring.
+
+### 🐛 Bug Fixes & Stability
+
+- **llm**: preserve reasoning metadata across provider conversions `fce10e94`
+- **websocket**: wait for close reply before expiring socket `dfe724c0`
+
+## [0.50.0] - 2026-11-03
+
+### 📋 Release Summary
+
+Anthropic message threads can continue across messages, with cache beta headers kept fixed for threads. Model pricing entries were corrected for Bolt and Mercury Voice, unverified Fireworks rates were removed, and the model catalog was updated for Inception, NVIDIA, Fireworks, and OpenCode.
+
+### ✨ New Features & Enhancements
+
+- **anthropic**: support message thread continuation `faaaa053`
+
+### 🔧 Improvements & Optimizations
+
+- **typesafe**: refresh model alias version notes `81859264`
+
+### 🐛 Bug Fixes & Stability
+
+- **models**: drop unverified Fireworks rates, correct Bolt and Mercury Voice rows `d7c984e5`
+- **anthropic**: keep cache beta headers fixed for threads `19f4e543`
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
+## [0.49.0] - 2026-11-02
+
+### 📋 Release Summary
+
+OpenRouter now reports listed pricing for known models, and evaluations support Inception, Cloudflare, OpenAI, and OpenRouter. CoreML execution no longer uses the GPU.
+
+### ✨ New Features & Enhancements
+
+- **openrouter**: report listed pricing for known models `3870b082`
+- **evaluation**: support Inception and Cloudflare evaluation models `727289fa`
+- **evaluation**: support OpenAI and OpenRouter evaluation `0db6f12d`
+
+### 🐛 Bug Fixes & Stability
+
+- **coreml**: exclude GPU from CoreML execution `4f92550e`
+
+## [0.48.6] - 2026-10-31
+
+### 📋 Release Summary
+
+Dotted Claude model versions are now priced correctly.
+
+### 🐛 Bug Fixes & Stability
+
+- **llm**: price dotted Claude versions correctly `4fbedd33`
+
+## [0.48.5] - 2026-10-31
+
+### 📋 Release Summary
+
+OctoHub and LLM requests now support cache prewarming. The refused-connection retry test was stabilized.
+
+### ✨ New Features & Enhancements
+
+- **octohub**: support OctoHub cache prewarming `29867fd3`
+- **llm**: support cache pre-warm requests `2cf79874`
+
+### 🔧 Improvements & Optimizations
+
+- **octohub**: stabilize refused connection retry test `32cea9b2`
+
+## [0.48.4] - 2026-10-31
+
+### 📋 Release Summary
+
+Anthropic requests can now preserve thinking blocks across requests. Image-to-video requests are routed correctly, and inline media is uploaded through MiniMax storage.
+
+### ✨ New Features & Enhancements
+
+- **anthropic**: preserve thinking blocks across requests `1e32d6f7`
+
+### 🐛 Bug Fixes & Stability
+
+- **media**: route image-to-video requests correctly `36e3afa4`
+- **minimax**: upload inline media through MiniMax storage `e522c710`
+
+## [0.48.3] - 2026-10-31
+
+### 📋 Release Summary
+
+Fal media uploads now use a more secure process, and requests are validated before processing.
+
+### 🐛 Bug Fixes & Stability
+
+- **fal**: secure fal media uploads and validate requests first `b8811b83`
+
+## [0.48.2] - 2026-10-31
+
+### 🔧 Improvements & Optimizations
+
+- **github-actions**: pin workflow actions to commit SHAs `9a43d185`
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
+## [0.48.1] - 2026-10-31
+
+### 📋 Release Summary
+
+Provider edge cases and feature gating are fixed. WebSocket transport lifecycle handling is centralized.
+
+### 🔧 Improvements & Optimizations
+
+- **websocket**: centralize WebSocket transport lifecycle `2a486ad2`
+
+### 🐛 Bug Fixes & Stability
+
+- fix provider edge cases and feature gating `692584ae`
+
+## [0.48.0] - 2026-10-30
+
+### 📋 Release Summary
+
+ChatGPT now uses HTTP streaming by default and supports persistent WebSocket sessions. LLM responses can stream with separate request and stream timeouts, and OctoHub WebSocket transport is integrated, selectable, and reconciled with stream timeouts. WebSocket receive limits now match the hub, ChatGPT handles WebSocket inactivity timeouts, FastEmbed reuses execution provider configuration, and ONNX reuses cached CoreML compiled models.
+
+### 🚨 Breaking Changes
+
+- **chatgpt**: use HTTP streaming transport by default `2b7a7084`
+
+### ✨ New Features & Enhancements
+
+- **octohub**: reconcile websocket transport with stream timeouts `755f0cfc`
+- **octohub**: integrate websocket transport `093b7f78`
+- **llm**: separate request and stream timeouts `18e75511`
+- **llm**: support streaming LLM responses `e282f237`
+- **llm**: add selectable OctoHub WebSocket transport `e182a25d`
+- **chatgpt**: use persistent WebSocket sessions for ChatGPT `75146736`
+
+### 🔧 Improvements & Optimizations
+
+- **chatgpt**: remove auth import and error comment `68ca393c`
+- **fastembed**: reuse execution provider configuration `4007045f`
+- **onnx**: reuse cached CoreML compiled models `f9a69c22`
+
+### 🐛 Bug Fixes & Stability
+
+- **octohub**: match native websocket receive limits to hub `a8c89b85`
+- **chatgpt**: handle ChatGPT WebSocket inactivity timeouts `3432030e`
+
+## [0.47.3] - 2026-10-30
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
+## [0.47.2] - 2026-10-29
+
+### 📋 Release Summary
+
+Transport failures are now classified without refreshing clients.
+
+### 🐛 Bug Fixes & Stability
+
+- **transport**: classify transport failures without refreshing clients `82464dcf`
+
+## [0.47.1] - 2026-10-29
+
+### 📋 Release Summary
+
+OpenRouter now respects the capabilities specified by the selected model.
+
+### 🐛 Bug Fixes & Stability
+
+- **openrouter**: respect model parameter capabilities `bbcd4c2b`
+
+## [0.47.0] - 2026-10-28
+
+### 📋 Release Summary
+
+Content-based line identifiers are now available.
+
+### ✨ New Features & Enhancements
+
+- **utils**: add content-based line identifiers `36e7857c`
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: update fastembed and transitive dependencies `674fa165`
+
+## [0.46.4] - 2026-10-27
+
+### 📋 Release Summary
+
+New LLM models from the 2026-10-27 model watch have been added and corrected.
+
+### ✨ New Features & Enhancements
+
+- **llm**: add new models from model watch 2026-10-27 `54cafc21`
+
+### 🐛 Bug Fixes & Stability
+
+- **llm**: correct model watch 2026-10-27 additions `84fc5bbd`
+
+## [0.46.3] - 2026-10-27
+
+### 📋 Release Summary
+
+Minimax requests no longer send response format parameters. Documentation now explains how to verify structured output.
+
+### 🐛 Bug Fixes & Stability
+
+- **llm**: stop sending Minimax response formats `8a2ff5ca`
+
+### 📚 Documentation & Examples
+
+- **agents**: document structured output verification `943ba56e`
+
+## [0.46.2] - 2026-10-27
+
+### 📋 Release Summary
+
+Media pricing now supports request-dependent rates, with clearer pricing assumptions.
+
+### ✨ New Features & Enhancements
+
+- **media-pricing**: support request-dependent media pricing `f5a39d0a`
+
+### 🔧 Improvements & Optimizations
+
+- **media**: clarify pricing assumptions `3b029ad2`
+
+## [0.46.1] - 2026-10-26
+
+### 📋 Release Summary
+
+Structured-output enforcement is now aligned across providers.
+
+### 🐛 Bug Fixes & Stability
+
+- **providers**: align structured-output enforcement by provider `8d76a8b1`
+
+## [0.46.0] - 2026-10-26
+
+### 📋 Release Summary
+
+MiniMax media generation is now supported. Ordered provider output items are preserved.
+
+### ✨ New Features & Enhancements
+
+- **media**: support MiniMax media generation `2ea09cff`
+
+### 🐛 Bug Fixes & Stability
+
+- **llm**: preserve ordered provider output items `5cfd1a1c`
+
+## [0.45.6] - 2026-10-26
+
+### 📋 Release Summary
+
+Replayed ChatGPT inputs now preserve assistant phases. The Rust toolchain used by GitHub Actions has been updated to 1.99.1.
+
+### 🔧 Improvements & Optimizations
+
+- **github-actions**: update Rust toolchain to 1.99.1 `52bf4be5`
+
+### 🐛 Bug Fixes & Stability
+
+- **chatgpt**: preserve assistant phases in replayed input `fe13d246`
+
+## [0.45.5] - 2026-10-25
+
+### 📋 Release Summary
+
+Unsupported OpenRouter model families are now priced using reference rates. Contributor documentation now documents router pricing requirements.
+
+### 🐛 Bug Fixes & Stability
+
+- **openrouter**: price unsupported model families from reference rates `39316e36`
+
+### 📚 Documentation & Examples
+
+- **contributing**: document router pricing requirements `8b1f52d4`
+
+## [0.45.4] - 2026-10-25
+
+### 📋 Release Summary
+
+Anthropic model support and sampling have been updated, with potential compatibility implications. Xiaomi MiMo chat completions are now supported.
+
+### 🚨 Breaking Changes
+
+- **anthropic**: update Anthropic model support and sampling `e1267089`
+
+### ✨ New Features & Enhancements
+
+- **llm**: support Xiaomi MiMo chat completions `160f5b36`
+
+## [0.45.3] - 2026-10-24
+
+### 📋 Release Summary
+
+Media operations now treat unreadable outputs as failures, and catalog requests are authorized. Fal integration handles nested schemas, caches schema discovery, validates tasks, and encodes video durations.
+
+### 🐛 Bug Fixes & Stability
+
+- **media**: treat unreadable outputs as failed operations `bbbf5807`
+- **fal**: handle nested schemas and cache discovery `1847dd93`
+- **media**: authorize catalog requests `3ab3845f`
+- **fal**: validate fal tasks and encode video durations `46569998`
+
+## [0.45.2] - 2026-10-24
+
+### 📋 Release Summary
+
+Pricing is now available for Kimi K3.1 Pro, GLM-5.3-FlashX-Legal, Qwen3.5-Omni-Flash, and Qwen3.8-Max-0902.
+
+### ✨ New Features & Enhancements
+
+- **llm**: price kimi-k3.1-pro, glm-5.3-flashx-legal, qwen3.5-omni-flash and qwen3.8-max-0902 `34c6a5a5`
+
+### 🔧 Improvements & Optimizations
+
+- **providers**: pin K3.1 Pro test expectations `08b469fd`
+
+## [0.45.1] - 2026-10-23
+
+### 📋 Release Summary
+
+ONNX Runtime now reuses the shared runtime environment. Test support was centralized and coverage expanded across provider HTTP paths, media operations, embeddings, pricing, model behavior, CLI backends, evaluation routing, and caching.
+
+### 🔧 Improvements & Optimizations
+
+- **test-support**: centralize test HTTP mocks and env cleanup `d3ddaa5a`
+- **llm,embedding**: cover local/nvidia/ollama proxy HTTP paths and embedding usage pricing `58788861`
+- **llm**: cover xAI and OctoHub HTTP paths via MockHttp seam `ab62f9b9`
+- **llm**: cover OpenAI Responses API parser branches `4fd68685`
+- **media**: cover cloudflare image HTTP path via MockHttp seam `9684f7fa`
+- **media**: cover elevenlabs speech/transcription HTTP paths via MockHttp seam `908bf7b7`
+- **media**: cover openrouter image/speech HTTP paths via MockHttp seam `aa50f3bb`
+- **media**: cover higgsfield submit/poll/cancel HTTP paths via MockHttp seam `43947a13`
+- **media**: cover runway task submit/poll/cancel HTTP paths via MockHttp seam `3ec93fa5`
+- **media**: cover fal queue submit/poll/cancel HTTP paths via MockHttp seam `ef5fe356`
+- **media**: cover replicate submit/poll/cancel HTTP paths via MockHttp seam `f19010e4`
+- **cli**: drop .exe suffix from PATH-search fixture `fcb097c3`
+- **cli**: make PATH-search test platform-agnostic via temp executable `d9292a18`
+- **evaluation**: cover evaluate() routing via MockHttp seam `8e955769`
+- **together**: cover pricing, context windows, reasoning families `78ce3c3d`
+- **anthropic**: cover cache-aware cost calc, effort mapping, thinking-off `c8bcfd13`
+- **embedding**: add google provider unit tests `2072e96a`
+- **llm**: expand strategies and tool_calls coverage `57150250`
+- **cli**: add unit tests for codex, claude, cursor, gemini backends `63dcf879`
+- **dependencies**: update Tokio to 1.54.1 `9fbe5acb`
+
+### 🐛 Bug Fixes & Stability
+
+- **media**: silence unused `mock` variable in higgsfield poll test `4053eb3a`
+- bump rustls-webpki to 0.103.16 and webpki-roots to 1.0.10 (RUSTSEC-2026-0382) `04a585f9`
+- **onnx**: reuse the shared ONNX Runtime environment `230edab1`
+
+### 🔄 Other Changes
+
+4 maintenance, dependency, and tooling updates not listed individually.
+
+## [0.45.0] - 2026-10-22
+
+### 📋 Release Summary
+
+LLM retry handling and observability have been enhanced.
+
+### ✨ New Features & Enhancements
+
+- **llm**: enhance retry handling and observability `345199c8`
+
+## [0.44.0] - 2026-10-22
+
+### 📋 Release Summary
+
+LLM calls now support per-call API keys. Authentication errors for per-call keys in OctoHub have been fixed.
+
+### ✨ New Features & Enhancements
+
+- **llm**: support per-call API keys `b9ceab34`
+
+### 🐛 Bug Fixes & Stability
+
+- **octohub**: fix per-call key authentication errors `cee3d675`
+
+## [0.43.2] - 2026-10-20
+
+### 📋 Release Summary
+
+LLM model pricing now supports expanded pricing information.
+
+### ✨ New Features & Enhancements
+
+- **llm**: support expanded LLM model pricing `5398340d`
+
+### 🔧 Improvements & Optimizations
+
+- format Rust code at 120 columns `5109b80f`
+
+## [0.43.1] - 2026-10-17
+
+### 📋 Release Summary
+
+Providers now configure parallel tool calls, and Webwright uses reported response costs when available.
+
+### 🐛 Bug Fixes & Stability
+
+- **providers**: configure provider parallel tool calls `919f14ae`
+- **webwright**: use reported response costs when available `356bdcf1`
+
+## [0.43.0] - 2026-10-17
+
+### 📋 Release Summary
+
+Added the WebWright provider. Provider handling now supports zero max_tokens values, and missing API key errors are standardized.
+
+### ✨ New Features & Enhancements
+
+- **llm**: add WebWright provider `d25291ec`
+
+### 🔧 Improvements & Optimizations
+
+- **deepseek**: fix Message type resolution in test `83793453`
+- **cargo**: register the webwright_chat example `02ebdf9b`
+
+### 🐛 Bug Fixes & Stability
+
+- **llm-providers**: handle zero max_tokens per provider `e1b08c23`
+- **errors**: standardize missing API key errors `b532db37`
+
+## [0.42.2] - 2026-10-16
+
+### 📋 Release Summary
+
+Additional Meta and reference models are now supported.
+
+### ✨ New Features & Enhancements
+
+- **llm**: support additional Meta and reference models `e422ef62`
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: upgrade dependencies and pin Candle revision `db8afcd3`
+
+### 🐛 Bug Fixes & Stability
+
+- **cargo**: pin Candle dependencies to the ZIP 9 fix `9853aedd`
+
+## [0.42.1] - 2026-10-15
+
+### 📋 Release Summary
+
+Google providers now support Gemini 4 models.
+
+### ✨ New Features & Enhancements
+
+- **llm**: support Gemini 4 models in Google providers `2a58bfb9`
+
+## [0.42.0] - 2026-10-15
+
+### 📋 Release Summary
+
+Evaluation now supports image assets and bounding-box questions. Provider reasoning efforts are normalized, and Ollama GLM-5.3 effort levels are floored.
+
+### ✨ New Features & Enhancements
+
+- **evaluation**: support image assets and bounding-box questions `3cfc65e9`
+
+### 🐛 Bug Fixes & Stability
+
+- **providers**: normalize provider reasoning efforts `a6acf0a3`
+- **providers**: floor Ollama GLM-5.3 effort levels `11e8915a`
+
+## [0.41.16] - 2026-10-14
+
+### 📋 Release Summary
+
+ChatGPT turn state is now preserved across requests, with stable request prefixes verified across turns.
+
+### 🔧 Improvements & Optimizations
+
+- **chatgpt**: verify stable request prefixes across turns `70b505fb`
+- **dependencies**: refresh locked dependency versions `51eb9f79`
+
+### 🐛 Bug Fixes & Stability
+
+- **chatgpt**: preserve ChatGPT turn state across requests `9b6542f1`
+
+## [0.41.15] - 2026-10-14
+
+### 📋 Release Summary
+
+OpenRouter now uses catalog-aware reasoning settings, and Higgsfield media generation is supported.
+
+### ✨ New Features & Enhancements
+
+- **openrouter**: use catalog-aware reasoning settings `deb506c4`
+- **media**: support Higgsfield media generation `cca3e87f`
+
+## [0.41.14] - 2026-10-12
+
+### 📋 Release Summary
+
+ChatGPT requests now use the correct session header name.
+
+### 🐛 Bug Fixes & Stability
+
+- **chatgpt**: use the correct session header name `8cc4c911`
+
+## [0.41.13] - 2026-10-12
+
+### 📋 Release Summary
+
+ChatGPT requests now use cache-aware headers.
+
+### 🐛 Bug Fixes & Stability
+
+- **chatgpt**: route requests through cache-aware headers `ca3fb9eb`
+
+## [0.41.12] - 2026-10-11
+
+### 📋 Release Summary
+
+Project scopes can now be derived in a readable format.
+
+### ✨ New Features & Enhancements
+
+- **utils**: add readable project scope derivation `3f982d0c`
+
+## [0.41.11] - 2026-10-10
+
+### 📋 Release Summary
+
+Mistral Large 4 model references are now supported.
+
+### ✨ New Features & Enhancements
+
+- **llm**: support Mistral Large 4 model references `eb4b6512`
+
+## [0.41.10] - 2026-10-10
+
+### 📋 Release Summary
+
+ChatGPT plan usage errors now provide clearer messages.
+
+### 🐛 Bug Fixes & Stability
+
+- **chatgpt**: clarify ChatGPT plan usage errors `05921cba`
+
+## [0.41.9] - 2026-10-09
+
+### 📋 Release Summary
+
+Authentication refresh for ChatGPT now works correctly.
+
+### 🐛 Bug Fixes & Stability
+
+- **chatgpt**: fix authentication refresh flow `2093ac0b`
+
+## [0.41.8] - 2026-10-08
+
+### 📋 Release Summary
+
+Images in tool results are now preserved consistently across providers.
+
+### 🐛 Bug Fixes & Stability
+
+- **llm/providers**: preserve images in tool results across providers `8b5fc6ab`
+
+## [0.41.7] - 2026-10-08
+
+### 📋 Release Summary
+
+Claude Haiku 5.5 is now supported, including its pricing tiers.
+
+### ✨ New Features & Enhancements
+
+- **llm**: support Haiku 5.5 pricing tiers `edbfc99b`
+- **anthropic**: support Claude Haiku 5.5 model `73d242bb`
+
+### 🔧 Improvements & Optimizations
+
+- **llm**: test Haiku 5.5 reference pricing `3f2301e5`
+
+## [0.41.6] - 2026-10-08
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: inline target-specific Metal dependencies `e1886bc8`
+- **ci**: upgrade Rust toolchain to 1.99.0 `d233f5b5`
+
+## [0.41.5] - 2026-10-08
+
+### 📋 Release Summary
+
+ChatGPT streaming now retries transient failures, and Metal dependencies are gated to supported platforms. OpenAI-compatible tool-call tests now set tool calls after reasoning is added.
+
+### 🔧 Improvements & Optimizations
+
+- **openai-compat**: set tool calls after adding reasoning `353c4180`
+
+### 🐛 Bug Fixes & Stability
+
+- **chatgpt**: retry transient stream failures `a123b64b`
+- **metal**: gate Metal dependencies by platform `d792c9d4`
+
+## [0.41.4] - 2026-10-08
+
+### 📋 Release Summary
+
+GLM reasoning is now preserved when messages are converted between provider formats.
+
+### 🐛 Bug Fixes & Stability
+
+- **providers**: preserve GLM reasoning across message conversion `55017388`
+
+## [0.41.3] - 2026-10-08
+
+### 📋 Release Summary
+
+Response failures are now classified within the retry logic, and OpenAI model references have been updated.
+
+### 🐛 Bug Fixes & Stability
+
+- **chatgpt**: classify response failures in retry closure `79a22ecc`
+- **llm**: update OpenAI model references `b1a5a1f1`
+
+## [0.41.2] - 2026-10-06
+
+### 📋 Release Summary
+
+Model IDs can now be resolved, and Kimi video models are included in the catalog.
+
+### ✨ New Features & Enhancements
+
+- **llm**: resolve model IDs and catalog Kimi video `1901d69b`
+
+## [0.41.1] - 2026-10-06
+
+### 📋 Release Summary
+
+OpenRouter requests now forward application categories.
+
+### ✨ New Features & Enhancements
+
+- **providers**: forward OpenRouter app categories `fa33b47d`
+
+## [0.41.0] - 2026-10-06
+
+### 📋 Release Summary
+
+The library now supports the ChatGPT Responses API, Hindsight session scoring, and MiniMax-M3.1-Flash-Preview. Provider model pricing and capabilities, along with supported embedding and reranker models, have been updated; ChatGPT token usage costs are calculated, and Hindsight downloads retry and wait for cache locks.
+
+### 🚨 Breaking Changes
+
+- **providers**: refresh supported embedding and reranker models `f400273c`
+
+### ✨ New Features & Enhancements
+
+- **llm**: support ChatGPT Responses API `253cdcc2`
+- **hindsight**: add hindsight session scoring `4bef759d`
+- **minimax**: support MiniMax-M3.1-Flash-Preview `c72743f4`
+- **llm**: update provider model pricing and capabilities `335989d3`
+
+### 🔧 Improvements & Optimizations
+
+- simplify git command whitespace scanning `0a90a2b9`
+
+### 🐛 Bug Fixes & Stability
+
+- **llm**: calculate ChatGPT token usage costs `59f78342`
+- **hindsight**: retry downloads and wait for cache locks `c73962e8`
+- **llm**: update model pricing and provider capabilities `ccc9e5cf`
+
+## [0.40.3] - 2026-09-30
+
+### 📋 Release Summary
+
+Pricing support is available for OpenAI’s gpt-6.1-sol model. Model pricing and capability metadata have been corrected.
+
+### ✨ New Features & Enhancements
+
+- **openai**: support gpt-6.1-sol pricing `911120f6`
+
+### 🐛 Bug Fixes & Stability
+
+- **llm**: correct model pricing and capability metadata `8aa0b0e7`
+
+## [0.40.2] - 2026-09-29
+
+### 📋 Release Summary
+
+Pricing support now covers newly priced model variants, including Claude Sonnet 5.5. GLM-5.3 reasoning effort is normalized.
+
+### ✨ New Features & Enhancements
+
+- **llm**: support newly priced model variants `ff1a971a`
+
+### 🐛 Bug Fixes & Stability
+
+- **anthropic**: support Claude Sonnet 5.5 pricing `b924f19f`
+- **llm**: normalize GLM-5.3 reasoning effort `cfe6daff`
+
+## [0.40.1] - 2026-09-23
+
+### 📋 Release Summary
+
+GPT-6 Sol and Luna models are now supported.
+
+### ✨ New Features & Enhancements
+
+- **llm**: support GPT-6 Sol and Luna models `aa7a01fe`
+
+## [0.40.0] - 2026-09-23
+
+### 📋 Release Summary
+
+LLM requests can explicitly disable reasoning, and Claude Opus 5.5 and Grok-4.7 models are supported. Provider model catalogs and pricing have been refreshed, and the library documentation has been clarified.
+
+### ✨ New Features & Enhancements
+
+- **llm**: support explicit reasoning disablement `fa330b1c`
+- **llm**: support claude opus 5.5 model metadata `e954aae0`
+- **xai**: support grok-4.7 models `50a7b142`
+
+### 🐛 Bug Fixes & Stability
+
+- **llm**: refresh provider model catalogs and pricing `fa96f747`
+
+### 📚 Documentation & Examples
+
+- **readme**: clarify library documentation `12bbf6cf`
+
+## [0.39.1] - 2026-09-18
+
+### 📋 Release Summary
+
+Improved evaluation reliability by rejecting blank provider API keys, helping prevent invalid configuration from proceeding (62473af6).
+
+
+### 🐛 Bug Fixes & Stability
+
+- **evaluation**: reject blank provider API keys `62473af6`
+
+## [0.39.0] - 2026-09-18
+
+### 📋 Release Summary
+
+This release adds OctoHub as a provider and introduces provider evaluation support, expanding model evaluation capabilities (63c98076, a6c9cda8). Cloudflare Workers AI now supports media, with improved handling of catalog model capabilities (1752a912, d225c578).
+
+
+### ✨ New Features & Enhancements
+
+- **evaluation**: add OctoHub provider `63c98076`
+- **evaluation**: add provider evaluation support `a6c9cda8`
+- **cloudflare**: support Workers AI media `1752a912`
+
+### 🐛 Bug Fixes & Stability
+
+- **cloudflare**: honor catalog model capabilities `d225c578`
+
+## [0.38.3] - 2026-09-18
+
+### 📋 Release Summary
+
+Structured output handling was improved with consistent validation and safer behavior when schema guidance is ignored (6aa59929, 3cbd42d3, 97e48350). Provider compatibility was refined through aligned Cloudflare model metadata and improved mapping of reasoning effort tiers (3590d3fa, e3ab5526).
+
+
+### 🔧 Improvements & Optimizations
+
+- **llm**: validate structured outputs once `6aa59929`
+
+### 🐛 Bug Fixes & Stability
+
+- **ollama**: mark response schemas unenforced `97e48350`
+- **cloudflare**: align model metadata `3590d3fa`
+- **llm**: map provider reasoning effort tiers `e3ab5526`
+- **openai**: fail closed on ignored schema guidance `3cbd42d3`
+
+## [0.38.2] - 2026-09-15
+
+### 📋 Release Summary
+
+Updated the rustls dependency to version 0.23.45 for improved compatibility and maintenance.
+
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
+## [0.38.1] - 2026-09-15
+
+### 📋 Release Summary
+
+Embedding support was improved by ensuring OctoHub embedding dimensions are detected correctly (17397153).
+
+
+### 🐛 Bug Fixes & Stability
+
+- **embedding**: probe OctoHub embedding dimensions `17397153`
+
+## [0.38.0] - 2026-09-14
+
+### 📋 Release Summary
+
+This release adds ONNX provider support for embedding models and updates the Cerebras model catalog and capabilities (98e4ed23, 0a4539a1, 172ce9c8). It also improves model configuration accuracy by correcting DeepSeek V4.1 Flash pricing and refining ONNX model examples (54451cf8, 98b0e8c4).
+
+
+### ✨ New Features & Enhancements
+
+- **cerebras**: update model catalog and capabilities `172ce9c8`
+- **embedding**: add ONNX provider support `98e4ed23`
+
+### 🔧 Improvements & Optimizations
+
+- **onnx**: format model examples `98b0e8c4`
+
+### 🐛 Bug Fixes & Stability
+
+- **llm**: correct DeepSeek V4.1 Flash pricing `54451cf8`
+- **embeddings**: align ONNX feature gating `0a4539a1`
+
+## [0.37.1] - 2026-09-13
+
+### 📋 Release Summary
+
+Improved model validation by refining alias handling and fallback behavior, providing more reliable model selection and configuration (2d3681dd).
+
+
+### 🐛 Bug Fixes & Stability
+
+- **models**: validate aliases and fallback handling `2d3681dd`
+
+## [0.37.0] - 2026-09-12
+
+### 📋 Release Summary
+
+This release adds Tinker and Inception provider support, including short model name resolution and expanded model selection examples (0e0155f2, 236c0aff, d26bf901, 0107ce37). Reasoning examples now provide increased token headroom for improved execution (030b65c0).
+
+
+### ✨ New Features & Enhancements
+
+- **examples**: extend model selection `0107ce37`
+- **tinker**: resolve short model names `d26bf901`
+- **llm**: add Tinker provider `0e0155f2`
+- **llm**: add Inception provider `236c0aff`
+
+### 🐛 Bug Fixes & Stability
+
+- **example**: increase reasoning token headroom `030b65c0`
+
+## [0.36.4] - 2026-09-10
+
+### 📋 Release Summary
+
+Improved model routing and refreshed pricing information across supported providers for more accurate model selection and cost tracking (ef3ce929, c1bb6185).
+
+
+### 🐛 Bug Fixes & Stability
+
+- **deepseek**: update live model routing `ef3ce929`
+- **llm**: refresh model pricing and routes `c1bb6185`
+
+## [0.36.3] - 2026-09-06
+
+### 📋 Release Summary
+
+Provider compatibility was improved with corrected audio format handling for Fal and support for preserved-thinking messages in Zai (69f8e298, a3aaaa22). Message content handling was refined, including clearer treatment of empty content (f7b15884, aa16c27a).
+
+
+### 🔧 Improvements & Optimizations
+
+- **messages**: allow empty message content `aa16c27a`
+
+### 🐛 Bug Fixes & Stability
+
+- **fal**: map audio formats to valid output values `69f8e298`
+- **messages**: reject empty message content `f7b15884`
+- **zai**: allow preserved-thinking messages `a3aaaa22`
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
+## [0.36.2] - 2026-09-06
+
+### 📋 Release Summary
+
+Improved ZAI response handling so assistant turns containing only thinking content are preserved rather than lost (09e6e8bf).
+
+
+### 🐛 Bug Fixes & Stability
+
+- **zai**: preserve thinking-only assistant turns `09e6e8bf`
+
+## [0.36.1] - 2026-09-06
+
+### 📋 Release Summary
+
+This release introduces a multimodal generation framework with Fal, ElevenLabs, and Runway support, reference pricing estimates, and media usage examples (fbb0ee1a, 2038029d, b685a5a3, 4a56def1, c122be73). It improves HTTP and feature availability consistency, media usage warnings and pricing, provider API-key configuration, and ZAI media handling (1c175436, 5abcd53b, a7bc54eb, a84f104b).
+
+
+### ✨ New Features & Enhancements
+
+- **core**: centralize HTTP and feature gating `1c175436`
+- **examples**: add multimodal media examples `c122be73`
+- **media**: add reference pricing estimates `4a56def1`
+- **media**: add ElevenLabs and Runway support `b685a5a3`
+- **media**: add Fal provider integration `2038029d`
+- **media**: implement multimodal generation framework `fbb0ee1a`
+
+### 🔧 Improvements & Optimizations
+
+- **zai**: simplify empty media checks `a84f104b`
+- **media**: stabilize Windows provider tests `4cd98e55`
+
+### 🐛 Bug Fixes & Stability
+
+- **media**: correct usage warnings and pricing `5abcd53b`
+- **auth**: standardize provider API key variables `a7bc54eb`
+
+## [0.36.0] - 2026-09-06
+
+### 📋 Release Summary
+
+This release adds configurable user-agent support for LLM and HTTP interactions (21abd6fd, 56a561f8). OpenCode request handling was improved to include the session header and user agent, while the session ID environment override was removed (ecb12d88, dc885cf3).
+
+
+### ✨ New Features & Enhancements
+
+- **llm**: allow configuring the user agent `21abd6fd`
+
+### 🔧 Improvements & Optimizations
+
+- **opencode**: remove session ID environment override `dc885cf3`
+
+### 🐛 Bug Fixes & Stability
+
+- **http**: allow configurable user agent `56a561f8`
+- **opencode**: send session header and user agent `ecb12d88`
+
+## [0.35.4] - 2026-09-05
+
+### 📋 Release Summary
+
+This release fixes an issue in the ZAI provider to ensure images are preserved in chat messages (47b167e8).
+
+
+### 🐛 Bug Fixes & Stability
+
+- **zai**: preserve images in chat messages `47b167e8`
+
+## [0.35.3] - 2026-09-04
+
+### 📋 Release Summary
+
+This release adds support for Gemini 3.8 Flash models (79ce03fa). Dependency updates and improved CI run management enhance overall maintenance and reliability (f0f4edf5, 1e18ba63).
+
+
+### ✨ New Features & Enhancements
+
+- **llm**: support Gemini 3.8 Flash models `79ce03fa`
+
+### 🔧 Improvements & Optimizations
+
+- **workflow**: cancel superseded CI runs `1e18ba63`
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
+## [0.35.2] - 2026-09-04
+
+### 📋 Release Summary
+
+This release adds support for GPT-6 models in the OpenAI provider (40a99f1f).
+
+
+### ✨ New Features & Enhancements
+
+- **openai**: support GPT-6 models `40a99f1f`
+
+## [0.35.1] - 2026-09-03
+
+### 📋 Release Summary
+
+This release adds support for Meta’s Model API provider, expanding octolib’s multi-provider capabilities (c4bed667). Embedding tests are now more resilient when Hugging Face model downloads are unavailable (80ea7e95).
+
+
+### ✨ New Features & Enhancements
+
+- **llm**: add Meta Model API provider `c4bed667`
+
+### 🔧 Improvements & Optimizations
+
+- **embedding**: skip unavailable HuggingFace downloads `80ea7e95`
+
+## [0.35.0] - 2026-09-02
+
+### 📋 Release Summary
+
+Hugging Face model state handling has been reorganized, which may require compatibility updates (61eddf07). Support for Claude 5.1 models has been added through Anthropic (f3137847). Model caching and app attribution have been improved across providers, and Octolib product URLs have been updated (26dddd32, 3dff660c, 5c152b14, 85e464ae).
+
+
+### 🚨 Breaking Changes
+
+⚠️ **Important**: This release contains breaking changes that may require code updates.
+
+- **huggingface**: centralize model state `61eddf07`
+
+### ✨ New Features & Enhancements
+
+- **anthropic**: support Claude 5.1 models `f3137847`
+
+### 🔧 Improvements & Optimizations
+
+- **links**: update Octolib product URLs `85e464ae`
+
+### 🐛 Bug Fixes & Stability
+
+- **storage**: share model cache across providers `26dddd32`
+- **storage**: share HuggingFace model cache directory `3dff660c`
+- **octohub**: forward app attribution headers `5c152b14`
+
+## [0.34.8] - 2026-08-31
+
+### 📋 Release Summary
+
+This release expands model metadata coverage and adds response schema enforcement for more reliable structured outputs (d49aceb7, 013d4322). Provider and DeepSeek compatibility, schema validation diagnostics and usage reporting, and embedding runtime stability have been improved (cc16ef63, 31896474, 508f4f51, 90a9d450, 2d451fb5, 235fda22, 76da6adb).
+
+
+### ✨ New Features & Enhancements
+
+- **llm**: expand model metadata coverage `d49aceb7`
+- **llm**: enforce response schemas `013d4322`
+
+### 🔧 Improvements & Optimizations
+
+- **coverage**: configure llvm-cov coverage reporting `7d773ac8`
+- **tests**: extract tests into modules `2cbd3e96`
+- **llm**: unify schema enforcement `3ce46f0a`
+
+### 🐛 Bug Fixes & Stability
+
+- **llm**: align provider model handling `cc16ef63`
+- **deepseek**: align thinking request format `31896474`
+- **llm**: handle Alibaba DeepSeek schemas `508f4f51`
+- **llm**: log failed schema validation output `90a9d450`
+- **llm**: aggregate usage across schema attempts `2d451fb5`
+- **embedding**: refresh HTTP client runtimes `235fda22`
+- **llm**: fail closed on structured output `76da6adb`
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.34.7] - 2026-08-29
 
 ### 📋 Release Summary

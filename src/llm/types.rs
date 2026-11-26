@@ -27,379 +27,379 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// - **id**: Provider's response ID (for assistant messages, used for conversation continuation)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Message {
-    pub role: String,
-    pub content: String,
-    pub timestamp: u64,
-    #[serde(default = "default_cache_marker")]
-    pub cached: bool, // Marks if this message is a cache breakpoint
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_ttl: Option<String>, // Cache TTL override (e.g. "1h") — only Anthropic supports this
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>, // For tool messages: the ID of the tool call
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>, // For tool messages: the name of the tool
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<serde_json::Value>, // For assistant messages: original tool calls from API response
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub images: Option<Vec<ImageAttachment>>, // For messages with image attachments
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub videos: Option<Vec<VideoAttachment>>, // For messages with video attachments
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub thinking: Option<ThinkingBlock>, // Internal reasoning (separate from content)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>, // Provider's response ID (for assistant messages with tool calls)
+	pub role: String,
+	pub content: String,
+	pub timestamp: u64,
+	#[serde(default = "default_cache_marker")]
+	pub cached: bool, // Marks if this message is a cache breakpoint
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cache_ttl: Option<String>, // Cache TTL override (e.g. "1h") — only Anthropic supports this
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub tool_call_id: Option<String>, // For tool messages: the ID of the tool call
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub name: Option<String>, // For tool messages: the name of the tool
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub tool_calls: Option<serde_json::Value>, // For assistant messages: original tool calls from API response
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub provider_items: Option<serde_json::Value>, // Provider-native ordered output items for exact replay
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub images: Option<Vec<ImageAttachment>>, // For messages with image attachments
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub videos: Option<Vec<VideoAttachment>>, // For messages with video attachments
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub thinking: Option<ThinkingBlock>, // Internal reasoning (separate from content)
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub id: Option<String>, // Provider's response ID (for assistant messages with tool calls)
 }
 
 fn default_cache_marker() -> bool {
-    false
+	false
 }
 
 impl Message {
-    /// Create a new user message
-    pub fn user(content: &str) -> Self {
-        Self {
-            role: "user".to_string(),
-            content: content.to_string(),
-            timestamp: current_timestamp(),
-            cached: false,
-            cache_ttl: None,
-            tool_call_id: None,
-            name: None,
-            tool_calls: None,
-            images: None,
-            videos: None,
-            thinking: None,
-            id: None,
-        }
-    }
+	/// Create a new user message
+	pub fn user(content: &str) -> Self {
+		Self {
+			role: "user".to_string(),
+			content: content.to_string(),
+			timestamp: current_timestamp(),
+			cached: false,
+			cache_ttl: None,
+			tool_call_id: None,
+			name: None,
+			tool_calls: None,
+			provider_items: None,
+			images: None,
+			videos: None,
+			thinking: None,
+			id: None,
+		}
+	}
 
-    /// Create a new assistant message
-    pub fn assistant(content: &str) -> Self {
-        Self {
-            role: "assistant".to_string(),
-            content: content.to_string(),
-            timestamp: current_timestamp(),
-            cached: false,
-            cache_ttl: None,
-            tool_call_id: None,
-            name: None,
-            tool_calls: None,
-            images: None,
-            videos: None,
-            thinking: None,
-            id: None,
-        }
-    }
+	/// Create a new assistant message
+	pub fn assistant(content: &str) -> Self {
+		Self {
+			role: "assistant".to_string(),
+			content: content.to_string(),
+			timestamp: current_timestamp(),
+			cached: false,
+			cache_ttl: None,
+			tool_call_id: None,
+			name: None,
+			tool_calls: None,
+			provider_items: None,
+			images: None,
+			videos: None,
+			thinking: None,
+			id: None,
+		}
+	}
 
-    /// Create a new system message
-    pub fn system(content: &str) -> Self {
-        Self {
-            role: "system".to_string(),
-            content: content.to_string(),
-            timestamp: current_timestamp(),
-            cached: false,
-            cache_ttl: None,
-            tool_call_id: None,
-            name: None,
-            tool_calls: None,
-            images: None,
-            videos: None,
-            thinking: None,
-            id: None,
-        }
-    }
+	/// Create a new system message
+	pub fn system(content: &str) -> Self {
+		Self {
+			role: "system".to_string(),
+			content: content.to_string(),
+			timestamp: current_timestamp(),
+			cached: false,
+			cache_ttl: None,
+			tool_call_id: None,
+			name: None,
+			tool_calls: None,
+			provider_items: None,
+			images: None,
+			videos: None,
+			thinking: None,
+			id: None,
+		}
+	}
 
-    /// Create a new tool message
-    pub fn tool(content: &str, tool_call_id: &str, name: &str) -> Self {
-        Self {
-            role: "tool".to_string(),
-            content: content.to_string(),
-            timestamp: current_timestamp(),
-            cached: false,
-            cache_ttl: None,
-            tool_call_id: Some(tool_call_id.to_string()),
-            name: Some(name.to_string()),
-            tool_calls: None,
-            images: None,
-            videos: None,
-            thinking: None,
-            id: None,
-        }
-    }
+	/// Create a new tool message
+	pub fn tool(content: &str, tool_call_id: &str, name: &str) -> Self {
+		Self {
+			role: "tool".to_string(),
+			content: content.to_string(),
+			timestamp: current_timestamp(),
+			cached: false,
+			cache_ttl: None,
+			tool_call_id: Some(tool_call_id.to_string()),
+			name: Some(name.to_string()),
+			tool_calls: None,
+			provider_items: None,
+			images: None,
+			videos: None,
+			thinking: None,
+			id: None,
+		}
+	}
 
-    /// Add thinking block to message (for assistant responses with reasoning)
-    pub fn with_thinking(mut self, thinking: ThinkingBlock) -> Self {
-        self.thinking = Some(thinking);
-        self
-    }
+	/// Add thinking block to message (for assistant responses with reasoning)
+	pub fn with_thinking(mut self, thinking: ThinkingBlock) -> Self {
+		self.thinking = Some(thinking);
+		self
+	}
 
-    /// Add image attachment to message
-    pub fn with_images(mut self, images: Vec<ImageAttachment>) -> Self {
-        self.images = Some(images);
-        self
-    }
+	/// Add image attachment to message
+	pub fn with_images(mut self, images: Vec<ImageAttachment>) -> Self {
+		self.images = Some(images);
+		self
+	}
 
-    /// Add video attachment to message
-    pub fn with_videos(mut self, videos: Vec<VideoAttachment>) -> Self {
-        self.videos = Some(videos);
-        self
-    }
+	/// Add video attachment to message
+	pub fn with_videos(mut self, videos: Vec<VideoAttachment>) -> Self {
+		self.videos = Some(videos);
+		self
+	}
 
-    /// Mark message as cached
-    pub fn with_cache_marker(mut self) -> Self {
-        self.cached = true;
-        self
-    }
+	/// Mark message as cached
+	pub fn with_cache_marker(mut self) -> Self {
+		self.cached = true;
+		self
+	}
 
-    /// Create a new message builder
-    pub fn builder() -> MessageBuilder {
-        MessageBuilder::new()
-    }
+	/// Create a new message builder
+	pub fn builder() -> MessageBuilder {
+		MessageBuilder::new()
+	}
 }
 
 /// Builder pattern for creating messages with validation
 #[derive(Debug, Default)]
 pub struct MessageBuilder {
-    role: Option<String>,
-    content: Option<String>,
-    timestamp: Option<u64>,
-    cached: bool,
-    cache_ttl: Option<String>,
-    tool_call_id: Option<String>,
-    name: Option<String>,
-    tool_calls: Option<serde_json::Value>,
-    images: Option<Vec<ImageAttachment>>,
-    videos: Option<Vec<VideoAttachment>>,
-    thinking: Option<ThinkingBlock>,
-    id: Option<String>, // Provider's response ID (for assistant messages)
+	role: Option<String>,
+	content: Option<String>,
+	timestamp: Option<u64>,
+	cached: bool,
+	cache_ttl: Option<String>,
+	tool_call_id: Option<String>,
+	name: Option<String>,
+	tool_calls: Option<serde_json::Value>,
+	images: Option<Vec<ImageAttachment>>,
+	videos: Option<Vec<VideoAttachment>>,
+	thinking: Option<ThinkingBlock>,
+	id: Option<String>, // Provider's response ID (for assistant messages)
 }
 
 impl MessageBuilder {
-    /// Create a new message builder
-    pub fn new() -> Self {
-        Self {
-            timestamp: Some(current_timestamp()),
-            ..Default::default()
-        }
-    }
+	/// Create a new message builder
+	pub fn new() -> Self {
+		Self {
+			timestamp: Some(current_timestamp()),
+			..Default::default()
+		}
+	}
 
-    /// Set the role
-    pub fn role<S: Into<String>>(mut self, role: S) -> Self {
-        self.role = Some(role.into());
-        self
-    }
+	/// Set the role
+	pub fn role<S: Into<String>>(mut self, role: S) -> Self {
+		self.role = Some(role.into());
+		self
+	}
 
-    /// Set the content
-    pub fn content<S: Into<String>>(mut self, content: S) -> Self {
-        self.content = Some(content.into());
-        self
-    }
+	/// Set the content
+	pub fn content<S: Into<String>>(mut self, content: S) -> Self {
+		self.content = Some(content.into());
+		self
+	}
 
-    /// Set the timestamp
-    pub fn timestamp(mut self, timestamp: u64) -> Self {
-        self.timestamp = Some(timestamp);
-        self
-    }
+	/// Set the timestamp
+	pub fn timestamp(mut self, timestamp: u64) -> Self {
+		self.timestamp = Some(timestamp);
+		self
+	}
 
-    /// Mark as cached
-    pub fn cached(mut self) -> Self {
-        self.cached = true;
-        self
-    }
+	/// Mark as cached
+	pub fn cached(mut self) -> Self {
+		self.cached = true;
+		self
+	}
 
-    /// Set cache TTL (e.g. "1h" for long-lived, only Anthropic supports this)
-    pub fn cache_ttl<S: Into<String>>(mut self, ttl: S) -> Self {
-        self.cache_ttl = Some(ttl.into());
-        self
-    }
+	/// Set cache TTL (e.g. "1h" for long-lived, only Anthropic supports this)
+	pub fn cache_ttl<S: Into<String>>(mut self, ttl: S) -> Self {
+		self.cache_ttl = Some(ttl.into());
+		self
+	}
 
-    /// Set tool call ID (for tool messages)
-    pub fn tool_call_id<S: Into<String>>(mut self, id: S) -> Self {
-        self.tool_call_id = Some(id.into());
-        self
-    }
+	/// Set tool call ID (for tool messages)
+	pub fn tool_call_id<S: Into<String>>(mut self, id: S) -> Self {
+		self.tool_call_id = Some(id.into());
+		self
+	}
 
-    /// Set name (for tool messages)
-    pub fn name<S: Into<String>>(mut self, name: S) -> Self {
-        self.name = Some(name.into());
-        self
-    }
+	/// Set name (for tool messages)
+	pub fn name<S: Into<String>>(mut self, name: S) -> Self {
+		self.name = Some(name.into());
+		self
+	}
 
-    /// Set tool calls (for assistant messages) using unified GenericToolCall format
-    pub fn with_tool_calls(
-        mut self,
-        tool_calls: Vec<crate::llm::tool_calls::GenericToolCall>,
-    ) -> Self {
-        // Convert to JSON for storage - providers will convert back to their specific formats
-        let tool_calls_json = serde_json::to_value(&tool_calls).unwrap_or_default();
-        self.tool_calls = Some(tool_calls_json);
-        self
-    }
+	/// Set tool calls (for assistant messages) using unified GenericToolCall format
+	pub fn with_tool_calls(mut self, tool_calls: Vec<crate::llm::tool_calls::GenericToolCall>) -> Self {
+		// Convert to JSON for storage - providers will convert back to their specific formats
+		let tool_calls_json = serde_json::to_value(&tool_calls).unwrap_or_default();
+		self.tool_calls = Some(tool_calls_json);
+		self
+	}
 
-    /// Add images
-    pub fn with_images(mut self, images: Vec<ImageAttachment>) -> Self {
-        self.images = Some(images);
-        self
-    }
+	/// Add images
+	pub fn with_images(mut self, images: Vec<ImageAttachment>) -> Self {
+		self.images = Some(images);
+		self
+	}
 
-    /// Add a single image
-    pub fn with_image(mut self, image: ImageAttachment) -> Self {
-        match self.images {
-            Some(ref mut images) => images.push(image),
-            None => self.images = Some(vec![image]),
-        }
-        self
-    }
+	/// Add a single image
+	pub fn with_image(mut self, image: ImageAttachment) -> Self {
+		match self.images {
+			Some(ref mut images) => images.push(image),
+			None => self.images = Some(vec![image]),
+		}
+		self
+	}
 
-    /// Add videos
-    pub fn with_videos(mut self, videos: Vec<VideoAttachment>) -> Self {
-        self.videos = Some(videos);
-        self
-    }
+	/// Add videos
+	pub fn with_videos(mut self, videos: Vec<VideoAttachment>) -> Self {
+		self.videos = Some(videos);
+		self
+	}
 
-    /// Add a single video
-    pub fn with_video(mut self, video: VideoAttachment) -> Self {
-        match self.videos {
-            Some(ref mut videos) => videos.push(video),
-            None => self.videos = Some(vec![video]),
-        }
-        self
-    }
+	/// Add a single video
+	pub fn with_video(mut self, video: VideoAttachment) -> Self {
+		match self.videos {
+			Some(ref mut videos) => videos.push(video),
+			None => self.videos = Some(vec![video]),
+		}
+		self
+	}
 
-    /// Set thinking block (for assistant messages with reasoning)
-    pub fn thinking(mut self, thinking: ThinkingBlock) -> Self {
-        self.thinking = Some(thinking);
-        self
-    }
+	/// Set thinking block (for assistant messages with reasoning)
+	pub fn thinking(mut self, thinking: ThinkingBlock) -> Self {
+		self.thinking = Some(thinking);
+		self
+	}
 
-    /// Set message ID (for assistant messages with tool calls)
-    pub fn id<S: Into<String>>(mut self, id: S) -> Self {
-        self.id = Some(id.into());
-        self
-    }
+	/// Set message ID (for assistant messages with tool calls)
+	pub fn id<S: Into<String>>(mut self, id: S) -> Self {
+		self.id = Some(id.into());
+		self
+	}
 
-    /// Build the message with validation
-    pub fn build(self) -> Result<Message, crate::errors::MessageError> {
-        let role = self
-            .role
-            .ok_or(crate::errors::MessageError::MissingToolField {
-                field: "role".to_string(),
-            })?;
+	/// Build the message with validation
+	pub fn build(self) -> Result<Message, crate::errors::MessageError> {
+		let role = self.role.ok_or(crate::errors::MessageError::MissingToolField {
+			field: "role".to_string(),
+		})?;
 
-        let content = self
-            .content
-            .ok_or(crate::errors::MessageError::MissingContent)?;
+		let content = self.content.ok_or(crate::errors::MessageError::MissingContent)?;
 
-        // Validate role
-        match role.as_str() {
-            "user" | "assistant" | "system" | "tool" => {}
-            _ => return Err(crate::errors::MessageError::InvalidRole { role }),
-        }
+		// Validate role
+		match role.as_str() {
+			"user" | "assistant" | "system" | "tool" => {}
+			_ => return Err(crate::errors::MessageError::InvalidRole { role }),
+		}
 
-        // Validate tool messages have required fields
-        if role == "tool" {
-            if self.tool_call_id.is_none() {
-                return Err(crate::errors::MessageError::MissingToolField {
-                    field: "tool_call_id".to_string(),
-                });
-            }
-            if self.name.is_none() {
-                return Err(crate::errors::MessageError::MissingToolField {
-                    field: "name".to_string(),
-                });
-            }
-        }
+		// Validate tool messages have required fields
+		if role == "tool" {
+			if self.tool_call_id.is_none() {
+				return Err(crate::errors::MessageError::MissingToolField {
+					field: "tool_call_id".to_string(),
+				});
+			}
+			if self.name.is_none() {
+				return Err(crate::errors::MessageError::MissingToolField {
+					field: "name".to_string(),
+				});
+			}
+		}
 
-        Ok(Message {
-            role,
-            content,
-            timestamp: self.timestamp.unwrap_or_else(current_timestamp),
-            cached: self.cached,
-            cache_ttl: self.cache_ttl,
-            tool_call_id: self.tool_call_id,
-            name: self.name,
-            tool_calls: self.tool_calls,
-            images: self.images,
-            videos: self.videos,
-            thinking: self.thinking,
-            id: self.id,
-        })
-    }
+		Ok(Message {
+			role,
+			content,
+			timestamp: self.timestamp.unwrap_or_else(current_timestamp),
+			cached: self.cached,
+			cache_ttl: self.cache_ttl,
+			tool_call_id: self.tool_call_id,
+			name: self.name,
+			tool_calls: self.tool_calls,
+			provider_items: None,
+			images: self.images,
+			videos: self.videos,
+			thinking: self.thinking,
+			id: self.id,
+		})
+	}
 
-    /// Convenience method to build a user message
-    pub fn user<S: Into<String>>(content: S) -> Self {
-        Self::new().role("user").content(content)
-    }
+	/// Convenience method to build a user message
+	pub fn user<S: Into<String>>(content: S) -> Self {
+		Self::new().role("user").content(content)
+	}
 
-    /// Convenience method to build an assistant message
-    pub fn assistant<S: Into<String>>(content: S) -> Self {
-        Self::new().role("assistant").content(content)
-    }
+	/// Convenience method to build an assistant message
+	pub fn assistant<S: Into<String>>(content: S) -> Self {
+		Self::new().role("assistant").content(content)
+	}
 
-    /// Convenience method to build a system message
-    pub fn system<S: Into<String>>(content: S) -> Self {
-        Self::new().role("system").content(content)
-    }
+	/// Convenience method to build a system message
+	pub fn system<S: Into<String>>(content: S) -> Self {
+		Self::new().role("system").content(content)
+	}
 
-    /// Convenience method to build a tool message
-    pub fn tool<S: Into<String>>(content: S, tool_call_id: S, name: S) -> Self {
-        Self::new()
-            .role("tool")
-            .content(content)
-            .tool_call_id(tool_call_id)
-            .name(name)
-    }
+	/// Convenience method to build a tool message
+	pub fn tool<S: Into<String>>(content: S, tool_call_id: S, name: S) -> Self {
+		Self::new()
+			.role("tool")
+			.content(content)
+			.tool_call_id(tool_call_id)
+			.name(name)
+	}
 }
 
 fn current_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_secs()
 }
 
 /// Image attachment for messages
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ImageAttachment {
-    pub data: ImageData,
-    pub media_type: String,
-    pub source_type: SourceType,
-    pub dimensions: Option<(u32, u32)>,
-    pub size_bytes: Option<u64>,
+	pub data: ImageData,
+	pub media_type: String,
+	pub source_type: SourceType,
+	pub dimensions: Option<(u32, u32)>,
+	pub size_bytes: Option<u64>,
 }
 
 /// Image data storage format
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ImageData {
-    Base64(String),
-    Url(String),
+	Base64(String),
+	Url(String),
 }
 
 /// Video attachment for messages
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VideoAttachment {
-    pub data: VideoData,
-    pub media_type: String,
-    pub source_type: SourceType,
-    pub dimensions: Option<(u32, u32)>,
-    pub size_bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration_secs: Option<f64>,
+	pub data: VideoData,
+	pub media_type: String,
+	pub source_type: SourceType,
+	pub dimensions: Option<(u32, u32)>,
+	pub size_bytes: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub duration_secs: Option<f64>,
 }
 
 /// Video data storage format
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum VideoData {
-    Base64(String),
-    Url(String),
+	Base64(String),
+	Url(String),
 }
 
 /// Source of the image or video
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SourceType {
-    File(PathBuf),
-    Clipboard,
-    Url,
+	File(PathBuf),
+	Clipboard,
+	Url,
 }
 
 /// Thinking/reasoning block from models that support extended reasoning
@@ -416,29 +416,29 @@ pub enum SourceType {
 /// ```
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ThinkingBlock {
-    /// The thinking/reasoning text content
-    pub content: String,
-    /// Token count for cost tracking (may not be available from all providers)
-    #[serde(default)]
-    pub tokens: u64,
+	/// The thinking/reasoning text content
+	pub content: String,
+	/// Token count for cost tracking (may not be available from all providers)
+	#[serde(default)]
+	pub tokens: u64,
 }
 
 impl ThinkingBlock {
-    /// Create a new thinking block with the given content
-    pub fn new(content: &str) -> Self {
-        Self {
-            content: content.to_string(),
-            tokens: 0,
-        }
-    }
+	/// Create a new thinking block with the given content
+	pub fn new(content: &str) -> Self {
+		Self {
+			content: content.to_string(),
+			tokens: 0,
+		}
+	}
 
-    /// Create a thinking block with token count
-    pub fn with_tokens(content: &str, tokens: u64) -> Self {
-        Self {
-            content: content.to_string(),
-            tokens,
-        }
-    }
+	/// Create a thinking block with token count
+	pub fn with_tokens(content: &str, tokens: u64) -> Self {
+		Self {
+			content: content.to_string(),
+			tokens,
+		}
+	}
 }
 
 /// Common token usage structure across all providers
@@ -466,335 +466,276 @@ impl ThinkingBlock {
 /// - **OpenRouter**: NO cache info provided
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TokenUsage {
-    /// CLEAN input tokens - NEVER includes any cache tokens (read or write)
-    /// These are "fresh" tokens being sent to the API for the first time
-    pub input_tokens: u64,
+	/// CLEAN input tokens - NEVER includes any cache tokens (read or write)
+	/// These are "fresh" tokens being sent to the API for the first time
+	pub input_tokens: u64,
 
-    /// Tokens read from cache (cache hit) - cheaper pricing tier
-    /// These were previously cached and are being retrieved
-    pub cache_read_tokens: u64,
+	/// Tokens read from cache (cache hit) - cheaper pricing tier
+	/// These were previously cached and are being retrieved
+	pub cache_read_tokens: u64,
 
-    /// Tokens written to cache (cache creation/write) - premium pricing tier
-    /// These are being stored in cache for future use
-    pub cache_write_tokens: u64,
+	/// Tokens written to cache (cache creation/write) - premium pricing tier
+	/// These are being stored in cache for future use
+	pub cache_write_tokens: u64,
 
-    /// AI-generated response tokens (completion/output)
-    pub output_tokens: u64,
+	/// AI-generated response tokens (completion/output)
+	pub output_tokens: u64,
 
-    /// Tokens used for thinking/reasoning (DeepSeek R1, Claude thinking, etc.)
-    /// These are separate from output_tokens — construct via
-    /// [`TokenUsage::split_output`], never straight from the API counter.
-    pub reasoning_tokens: u64,
+	/// Tokens used for thinking/reasoning (DeepSeek R1, Claude thinking, etc.)
+	/// These are separate from output_tokens — construct via
+	/// [`TokenUsage::split_output`], never straight from the API counter.
+	pub reasoning_tokens: u64,
 
-    /// Total tokens as reported by provider (should equal input + cache_read + cache_write + output + reasoning)
-    pub total_tokens: u64,
+	/// Total tokens as reported by provider (should equal input + cache_read + cache_write + output + reasoning)
+	pub total_tokens: u64,
 
-    /// Pre-calculated total cost in USD (provider handles cache pricing)
-    #[serde(default)]
-    pub cost: Option<f64>,
+	/// Pre-calculated total cost in USD (provider handles cache pricing)
+	#[serde(default)]
+	pub cost: Option<f64>,
 
-    /// Time spent on this API request in milliseconds
-    #[serde(default)]
-    pub request_time_ms: Option<u64>,
+	/// Time spent on this API request in milliseconds
+	#[serde(default)]
+	pub request_time_ms: Option<u64>,
 }
 
 impl TokenUsage {
-    /// Split a provider's completion counter into visible output and reasoning.
-    ///
-    /// Every OpenAI-shaped API counts thinking INSIDE its completion counter and
-    /// reports the reasoning slice as a detail of that same number
-    /// (`completion_tokens_details.reasoning_tokens`, `output_tokens_details`);
-    /// Anthropic-shaped APIs do the same with `output_tokens`. Providers that
-    /// expose no reasoning field at all (z.ai, Together, MiniMax) estimate it
-    /// from the emitted thinking text, which the provider also billed inside the
-    /// completion counter. Either way the two overlap, while `reasoning_tokens`
-    /// is documented as separate, so a consumer summing the parts pays for
-    /// thinking twice. Subtract once here instead of in every provider.
-    ///
-    /// Reasoning is clamped to the completion counter: an estimate can exceed
-    /// the tokens it was cut from, and reporting more reasoning than the
-    /// provider generated would recreate the overcount this exists to remove.
-    ///
-    /// Returns `(visible_output, reasoning)`.
-    pub fn split_output(completion_tokens: u64, reasoning_tokens: u64) -> (u64, u64) {
-        let reasoning = reasoning_tokens.min(completion_tokens);
-        (completion_tokens - reasoning, reasoning)
-    }
+	/// Split a provider's completion counter into visible output and reasoning.
+	///
+	/// Every OpenAI-shaped API counts thinking INSIDE its completion counter and
+	/// reports the reasoning slice as a detail of that same number
+	/// (`completion_tokens_details.reasoning_tokens`, `output_tokens_details`);
+	/// Anthropic-shaped APIs do the same with `output_tokens`. Providers that
+	/// expose no reasoning field at all (z.ai, Together, MiniMax) estimate it
+	/// from the emitted thinking text, which the provider also billed inside the
+	/// completion counter. Either way the two overlap, while `reasoning_tokens`
+	/// is documented as separate, so a consumer summing the parts pays for
+	/// thinking twice. Subtract once here instead of in every provider.
+	///
+	/// Reasoning is clamped to the completion counter: an estimate can exceed
+	/// the tokens it was cut from, and reporting more reasoning than the
+	/// provider generated would recreate the overcount this exists to remove.
+	///
+	/// Returns `(visible_output, reasoning)`.
+	pub fn split_output(completion_tokens: u64, reasoning_tokens: u64) -> (u64, u64) {
+		let reasoning = reasoning_tokens.min(completion_tokens);
+		(completion_tokens - reasoning, reasoning)
+	}
 
-    /// The output counter a provider bills — the inverse of [`Self::split_output`].
-    ///
-    /// Thinking is charged at the output rate, so pricing must run on the
-    /// completion counter the API reported, not on the visible remainder left
-    /// after the split. Pass this to any cost calculation instead of
-    /// `output_tokens`; a reasoning-heavy call is otherwise billed at a
-    /// fraction of its real cost.
-    pub fn billable_output_tokens(&self) -> u64 {
-        self.output_tokens + self.reasoning_tokens
-    }
+	/// The output counter a provider bills — the inverse of [`Self::split_output`].
+	///
+	/// Thinking is charged at the output rate, so pricing must run on the
+	/// completion counter the API reported, not on the visible remainder left
+	/// after the split. Pass this to any cost calculation instead of
+	/// `output_tokens`; a reasoning-heavy call is otherwise billed at a
+	/// fraction of its real cost.
+	pub fn billable_output_tokens(&self) -> u64 {
+		self.output_tokens + self.reasoning_tokens
+	}
 }
 
 #[cfg(test)]
-mod token_usage_split_tests {
-    use super::{ModelPricing, TokenUsage};
-
-    #[test]
-    fn reasoning_is_not_billed_twice() {
-        // A z.ai-shaped response: prompt 1000 (200 cached), completion 500 of
-        // which 300 was thinking; the provider's own total is 1500.
-        let (output_tokens, reasoning_tokens) = TokenUsage::split_output(500, 300);
-        let usage = TokenUsage {
-            input_tokens: 800,
-            cache_read_tokens: 200,
-            cache_write_tokens: 0,
-            output_tokens,
-            reasoning_tokens,
-            total_tokens: 1500,
-            cost: None,
-            request_time_ms: None,
-        };
-        assert_eq!(usage.output_tokens, 200);
-        // The parts a consumer sums must reproduce the provider's own total.
-        assert_eq!(
-            usage.input_tokens
-                + usage.cache_read_tokens
-                + usage.cache_write_tokens
-                + usage.output_tokens
-                + usage.reasoning_tokens,
-            usage.total_tokens
-        );
-    }
-
-    #[test]
-    fn cost_bills_reasoning_at_the_output_rate() {
-        // A real DashScope qwen3.6-flash response: prompt 22, completion 502 of
-        // which 485 was thinking. Alibaba charges all 502 at the output rate,
-        // so pricing must run on the billable counter, not the 17 left visible.
-        let (output_tokens, reasoning_tokens) = TokenUsage::split_output(502, 485);
-        let usage = TokenUsage {
-            input_tokens: 22,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            output_tokens,
-            reasoning_tokens,
-            total_tokens: 524,
-            cost: None,
-            request_time_ms: None,
-        };
-        assert_eq!(usage.output_tokens, 17);
-        assert_eq!(usage.billable_output_tokens(), 502);
-
-        let pricing = ModelPricing::new(0.25, 1.50, 0.25, 0.025);
-        let billed = pricing.calculate_cost(
-            usage.input_tokens,
-            usage.cache_write_tokens,
-            usage.cache_read_tokens,
-            usage.billable_output_tokens(),
-        );
-        let expected = 22.0 / 1_000_000.0 * 0.25 + 502.0 / 1_000_000.0 * 1.50;
-        assert!((billed - expected).abs() < 1e-12);
-
-        // Pricing the visible remainder instead is the regression this guards:
-        // a thinking-heavy call would cost a fraction of what the provider charged.
-        let visible_only = pricing.calculate_cost(
-            usage.input_tokens,
-            usage.cache_write_tokens,
-            usage.cache_read_tokens,
-            usage.output_tokens,
-        );
-        assert!(billed > visible_only * 10.0);
-    }
-
-    #[test]
-    fn estimated_reasoning_over_completion_clamps_both_sides() {
-        // Estimated reasoning can exceed the completion count it was cut from.
-        // Clamping only the output would leave the parts summing above the
-        // provider's total again.
-        assert_eq!(TokenUsage::split_output(120, 400), (0, 120));
-    }
-}
+#[path = "types_token_usage_split_tests.rs"]
+mod token_usage_split_tests;
 
 /// Common exchange record for logging across all providers
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProviderExchange {
-    pub request: serde_json::Value,
-    pub response: serde_json::Value,
-    pub timestamp: u64,
-    pub usage: Option<TokenUsage>,
-    pub provider: String, // Which provider was used
-    pub rate_limit_headers: Option<std::collections::HashMap<String, String>>, // Rate limit headers from API response
+	pub request: serde_json::Value,
+	pub response: serde_json::Value,
+	pub timestamp: u64,
+	pub usage: Option<TokenUsage>,
+	pub provider: String, // Which provider was used
+	pub rate_limit_headers: Option<std::collections::HashMap<String, String>>, // Rate limit headers from API response
 }
 
 impl ProviderExchange {
-    pub fn new(
-        request: serde_json::Value,
-        response: serde_json::Value,
-        usage: Option<TokenUsage>,
-        provider: &str,
-    ) -> Self {
-        Self {
-            request,
-            response,
-            timestamp: current_timestamp(),
-            usage,
-            provider: provider.to_string(),
-            rate_limit_headers: None,
-        }
-    }
+	pub fn new(
+		request: serde_json::Value,
+		response: serde_json::Value,
+		usage: Option<TokenUsage>,
+		provider: &str,
+	) -> Self {
+		Self {
+			request,
+			response,
+			timestamp: current_timestamp(),
+			usage,
+			provider: provider.to_string(),
+			rate_limit_headers: None,
+		}
+	}
 
-    /// Create a new ProviderExchange with rate limit headers
-    pub fn with_rate_limit_headers(
-        request: serde_json::Value,
-        response: serde_json::Value,
-        usage: Option<TokenUsage>,
-        provider: &str,
-        rate_limit_headers: std::collections::HashMap<String, String>,
-    ) -> Self {
-        Self {
-            request,
-            response,
-            timestamp: current_timestamp(),
-            usage,
-            provider: provider.to_string(),
-            rate_limit_headers: Some(rate_limit_headers),
-        }
-    }
+	/// Create a new ProviderExchange with rate limit headers
+	pub fn with_rate_limit_headers(
+		request: serde_json::Value,
+		response: serde_json::Value,
+		usage: Option<TokenUsage>,
+		provider: &str,
+		rate_limit_headers: std::collections::HashMap<String, String>,
+	) -> Self {
+		Self {
+			request,
+			response,
+			timestamp: current_timestamp(),
+			usage,
+			provider: provider.to_string(),
+			rate_limit_headers: Some(rate_limit_headers),
+		}
+	}
 }
 
 /// Generic tool call structure (independent of MCP)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments: serde_json::Value,
+	pub id: String,
+	pub name: String,
+	pub arguments: serde_json::Value,
 }
 
 /// Function definition for tool calling
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FunctionDefinition {
-    pub name: String,
-    pub description: String,
-    pub parameters: serde_json::Value,
-    /// Cache control marker for Anthropic (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_control: Option<serde_json::Value>,
+	pub name: String,
+	pub description: String,
+	pub parameters: serde_json::Value,
+	/// Cache control marker for Anthropic (optional)
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub cache_control: Option<serde_json::Value>,
+	/// Name of the string parameter that carries the tool's whole input as raw text.
+	/// Providers that support freeform tools send the tool as freeform text and pass
+	/// the text in this parameter. Other providers send the JSON function unchanged.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub freeform: Option<String>,
+}
+
+/// Provider-agnostic tool selection policy.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ToolChoice {
+	/// Let the model decide whether to call a tool.
+	Auto,
+	/// Require at least one tool call.
+	Required,
+	/// Prevent tool calls.
+	None,
+	/// Require a specific named function.
+	Function(String),
 }
 
 /// Output format for structured responses
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum OutputFormat {
-    /// Standard JSON output
-    Json,
-    /// JSON with schema validation
-    JsonSchema,
+	/// Standard JSON output
+	Json,
+	/// JSON with schema validation
+	JsonSchema,
 }
 
 /// Response mode for structured output
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub enum ResponseMode {
-    /// Automatic mode (provider decides)
-    Auto,
-    /// Strict schema adherence
-    Strict,
+	/// Automatic mode (provider decides)
+	Auto,
+	/// Strict schema adherence
+	Strict,
 }
 
 /// Pricing information for a model
 /// All prices are per 1M tokens in USD
 #[derive(Debug, Clone, Copy)]
 pub struct ModelPricing {
-    /// Regular input price per 1M tokens (USD) - for uncached input
-    pub input_price_per_1m: f64,
-    /// Output price per 1M tokens (USD)
-    pub output_price_per_1m: f64,
-    /// Cache write price per 1M tokens (USD) - cost to write to cache
-    /// For providers without cache write differentiation, same as input_price_per_1m
-    pub cache_write_price_per_1m: f64,
-    /// Cache read price per 1M tokens (USD) - cost to read from cache
-    /// For providers without caching, same as input_price_per_1m
-    pub cache_read_price_per_1m: f64,
+	/// Regular input price per 1M tokens (USD) - for uncached input
+	pub input_price_per_1m: f64,
+	/// Output price per 1M tokens (USD)
+	pub output_price_per_1m: f64,
+	/// Cache write price per 1M tokens (USD) - cost to write to cache
+	/// For providers without cache write differentiation, same as input_price_per_1m
+	pub cache_write_price_per_1m: f64,
+	/// Cache read price per 1M tokens (USD) - cost to read from cache
+	/// For providers without caching, same as input_price_per_1m
+	pub cache_read_price_per_1m: f64,
 }
 
 impl ModelPricing {
-    /// Create new pricing with explicit cache prices
-    pub fn new(
-        input_price_per_1m: f64,
-        output_price_per_1m: f64,
-        cache_write_price_per_1m: f64,
-        cache_read_price_per_1m: f64,
-    ) -> Self {
-        Self {
-            input_price_per_1m,
-            output_price_per_1m,
-            cache_write_price_per_1m,
-            cache_read_price_per_1m,
-        }
-    }
+	/// Create new pricing with explicit cache prices
+	pub fn new(
+		input_price_per_1m: f64,
+		output_price_per_1m: f64,
+		cache_write_price_per_1m: f64,
+		cache_read_price_per_1m: f64,
+	) -> Self {
+		Self {
+			input_price_per_1m,
+			output_price_per_1m,
+			cache_write_price_per_1m,
+			cache_read_price_per_1m,
+		}
+	}
 
-    /// Create pricing without cache support (all cache prices = input price)
-    pub fn without_cache(input_price_per_1m: f64, output_price_per_1m: f64) -> Self {
-        Self {
-            input_price_per_1m,
-            output_price_per_1m,
-            cache_write_price_per_1m: input_price_per_1m,
-            cache_read_price_per_1m: input_price_per_1m,
-        }
-    }
+	/// Create pricing without cache support (all cache prices = input price)
+	pub fn without_cache(input_price_per_1m: f64, output_price_per_1m: f64) -> Self {
+		Self {
+			input_price_per_1m,
+			output_price_per_1m,
+			cache_write_price_per_1m: input_price_per_1m,
+			cache_read_price_per_1m: input_price_per_1m,
+		}
+	}
 
-    /// Calculate cost for given token counts
-    /// Returns cost in USD
-    pub fn calculate_cost(
-        &self,
-        regular_input_tokens: u64,
-        cache_write_tokens: u64,
-        cache_read_tokens: u64,
-        output_tokens: u64,
-    ) -> f64 {
-        let regular_input_cost =
-            (regular_input_tokens as f64 / 1_000_000.0) * self.input_price_per_1m;
-        let cache_write_cost =
-            (cache_write_tokens as f64 / 1_000_000.0) * self.cache_write_price_per_1m;
-        let cache_read_cost =
-            (cache_read_tokens as f64 / 1_000_000.0) * self.cache_read_price_per_1m;
-        let output_cost = (output_tokens as f64 / 1_000_000.0) * self.output_price_per_1m;
+	/// Calculate cost for given token counts
+	/// Returns cost in USD
+	pub fn calculate_cost(
+		&self,
+		regular_input_tokens: u64,
+		cache_write_tokens: u64,
+		cache_read_tokens: u64,
+		output_tokens: u64,
+	) -> f64 {
+		let regular_input_cost = (regular_input_tokens as f64 / 1_000_000.0) * self.input_price_per_1m;
+		let cache_write_cost = (cache_write_tokens as f64 / 1_000_000.0) * self.cache_write_price_per_1m;
+		let cache_read_cost = (cache_read_tokens as f64 / 1_000_000.0) * self.cache_read_price_per_1m;
+		let output_cost = (output_tokens as f64 / 1_000_000.0) * self.output_price_per_1m;
 
-        regular_input_cost + cache_write_cost + cache_read_cost + output_cost
-    }
+		regular_input_cost + cache_write_cost + cache_read_cost + output_cost
+	}
 }
 
 /// Structured output request configuration
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StructuredOutputRequest {
-    /// Output format type
-    pub format: OutputFormat,
-    /// Response mode
-    pub mode: ResponseMode,
-    /// JSON schema for validation (when using JsonSchema format)
-    pub schema: Option<serde_json::Value>,
+	/// Output format type
+	pub format: OutputFormat,
+	/// Response mode
+	pub mode: ResponseMode,
+	/// JSON schema for validation (when using JsonSchema format)
+	pub schema: Option<serde_json::Value>,
 }
 
 impl StructuredOutputRequest {
-    /// Create a new structured output request with JSON format
-    pub fn json() -> Self {
-        Self {
-            format: OutputFormat::Json,
-            mode: ResponseMode::Auto,
-            schema: None,
-        }
-    }
+	/// Create a new structured output request with JSON format
+	pub fn json() -> Self {
+		Self {
+			format: OutputFormat::Json,
+			mode: ResponseMode::Auto,
+			schema: None,
+		}
+	}
 
-    /// Create a new structured output request with JSON schema
-    pub fn json_schema(schema: serde_json::Value) -> Self {
-        Self {
-            format: OutputFormat::JsonSchema,
-            mode: ResponseMode::Auto,
-            schema: Some(schema),
-        }
-    }
+	/// Create a new structured output request with JSON schema
+	pub fn json_schema(schema: serde_json::Value) -> Self {
+		Self {
+			format: OutputFormat::JsonSchema,
+			mode: ResponseMode::Auto,
+			schema: Some(schema),
+		}
+	}
 
-    /// Set response mode to strict
-    pub fn with_strict_mode(mut self) -> Self {
-        self.mode = ResponseMode::Strict;
-        self
-    }
+	/// Set response mode to strict
+	pub fn with_strict_mode(mut self) -> Self {
+		self.mode = ResponseMode::Strict;
+		self
+	}
 }
 
 /// Provider response containing the AI completion
@@ -805,104 +746,17 @@ impl StructuredOutputRequest {
 /// - **tool_calls**: Any function calls made
 #[derive(Debug, Clone)]
 pub struct ProviderResponse {
-    pub content: String,
-    /// Thinking/reasoning content extracted from provider response
-    /// This is separate from content, similar to how tool_calls are separate
-    pub thinking: Option<ThinkingBlock>,
-    pub exchange: ProviderExchange,
-    pub tool_calls: Option<Vec<ToolCall>>,
-    pub finish_reason: Option<String>,
-    /// Parsed structured output (if requested)
-    pub structured_output: Option<serde_json::Value>,
-    /// Response ID from provider (required for multi-turn conversations with OpenAI Responses API)
-    pub id: Option<String>,
-}
-
-/// Parameters for chat completion requests
-///
-/// This struct groups all parameters needed for AI provider chat completion calls,
-/// following best practices for parameter passing and future extensibility.
-/// Declares which sampling parameters a model supports.
-///
-/// Providers return this from `supported_sampling_params()` to declare what a model accepts.
-/// Each field is a simple boolean — `true` means the parameter is supported, `false` means
-/// it must be omitted from API requests.
-///
-/// This is intentionally separate from the values themselves: support is a property of the
-/// model, while values come from user configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SamplingSupport {
-    /// Whether the model accepts the temperature parameter.
-    pub temperature: bool,
-    /// Whether the model accepts the top_p parameter.
-    pub top_p: bool,
-    /// Whether the model accepts the top_k parameter.
-    pub top_k: bool,
-}
-
-impl SamplingSupport {
-    /// All sampling parameters supported.
-    pub const ALL: Self = Self {
-        temperature: true,
-        top_p: true,
-        top_k: true,
-    };
-
-    /// No sampling parameters supported (e.g., reasoning models).
-    pub const NONE: Self = Self {
-        temperature: false,
-        top_p: false,
-        top_k: false,
-    };
-
-    /// Only temperature supported (no top_p, no top_k).
-    pub const TEMPERATURE_ONLY: Self = Self {
-        temperature: true,
-        top_p: false,
-        top_k: false,
-    };
-
-    /// Temperature and top_p supported, but not top_k (common for OpenAI-compatible APIs).
-    pub const TEMPERATURE_AND_TOP_P: Self = Self {
-        temperature: true,
-        top_p: true,
-        top_k: false,
-    };
-
-    /// Merge user-requested values with this support mask.
-    ///
-    /// Returns `EffectiveSamplingParams` where supported parameters carry the user's value
-    /// and unsupported parameters are `None` (to be omitted from API requests).
-    pub fn effective(self, temperature: f32, top_p: f32, top_k: u32) -> EffectiveSamplingParams {
-        EffectiveSamplingParams {
-            temperature: self.temperature.then_some(temperature),
-            top_p: self.top_p.then_some(top_p),
-            top_k: self.top_k.then_some(top_k),
-        }
-    }
-}
-
-impl Default for SamplingSupport {
-    /// Default: all parameters supported.
-    fn default() -> Self {
-        Self::ALL
-    }
-}
-
-/// The result of merging user-requested sampling values with model support.
-///
-/// Each field is `Option` — `Some(value)` means the parameter should be sent with that value,
-/// `None` means it must be omitted from the API request entirely.
-///
-/// Construct this via `SamplingSupport::effective()` or `AiProvider::effective_sampling_params()`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct EffectiveSamplingParams {
-    /// Temperature to send, or None to omit.
-    pub temperature: Option<f32>,
-    /// Top-p to send, or None to omit.
-    pub top_p: Option<f32>,
-    /// Top-k to send, or None to omit.
-    pub top_k: Option<u32>,
+	pub content: String,
+	/// Thinking/reasoning content extracted from provider response
+	/// This is separate from content, similar to how tool_calls are separate
+	pub thinking: Option<ThinkingBlock>,
+	pub exchange: ProviderExchange,
+	pub tool_calls: Option<Vec<ToolCall>>,
+	pub finish_reason: Option<String>,
+	/// Parsed structured output (if requested)
+	pub structured_output: Option<serde_json::Value>,
+	/// Response ID from provider (required for multi-turn conversations with OpenAI Responses API)
+	pub id: Option<String>,
 }
 
 /// Generic reasoning effort level for thinking-capable models.
@@ -912,457 +766,298 @@ pub struct EffectiveSamplingParams {
 /// thinking flag, etc.) inside its `chat_completion()` implementation.
 ///
 /// To leave thinking at provider default, keep `ChatCompletionParams::reasoning_effort` as `None`.
+/// `ReasoningEffort::None` is the explicit opposite: no reasoning requested, and
+/// thinking switched off wherever the provider has a switch (Alibaba
+/// `enable_thinking=false`, DeepSeek/Z.AI `thinking.type=disabled`, OpenRouter
+/// `reasoning.enabled=false`, OpenAI `reasoning.effort=none`); a model that
+/// cannot stop thinking (GLM-5.3 on Alibaba and Z.AI) runs at its lowest level,
+/// and providers with no switch send nothing, as for an unset effort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
-    Low,
-    Medium,
-    High,
-    XHigh,
-    Max,
+	None,
+	Low,
+	Medium,
+	High,
+	XHigh,
+	Max,
 }
 
 #[derive(Clone)]
+pub(crate) struct PerCallApiKey(String);
+
+impl PerCallApiKey {
+	pub(crate) fn as_str(&self) -> &str {
+		&self.0
+	}
+}
+
+impl std::fmt::Debug for PerCallApiKey {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("[REDACTED]")
+	}
+}
+
+/// Transport for the `chatgpt:` provider. Both modes use the Responses API.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChatGptTransport {
+	/// HTTP POST with an SSE response stream.
+	#[default]
+	Http,
+	/// Persistent WebSocket with connection-local continuation state.
+	#[cfg(feature = "websockets")]
+	WebSocket,
+}
+
+/// Transport for the `octohub:` provider. Both modes use OctoHub's `/v1/completions` protocol.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OctoHubTransport {
+	/// HTTP POST with a JSON completion response.
+	#[default]
+	Http,
+	/// Persistent WebSocket using OctoHub's completion envelope.
+	#[cfg(feature = "websockets")]
+	WebSocket,
+}
+
+/// Parameters for chat completion requests.
+///
+/// This struct groups all parameters needed for AI provider chat completion calls.
+#[derive(Debug, Clone)]
 pub struct ChatCompletionParams {
-    /// Array of conversation messages
-    pub messages: Vec<Message>,
-    /// Model identifier (e.g., "claude-3-5-sonnet", "gpt-4")
-    pub model: String,
-    /// Sampling temperature (0.0 to 2.0)
-    pub temperature: f32,
-    /// Top-p nucleus sampling (0.0 to 1.0)
-    pub top_p: f32,
-    /// Top-k sampling (1 to infinity)
-    pub top_k: u32,
-    /// Maximum tokens to generate (0 = no limit)
-    pub max_tokens: u32,
-    /// Maximum retry attempts on failure
-    pub max_retries: u32,
-    /// Base timeout for exponential backoff retry logic
-    pub retry_timeout: std::time::Duration,
-    /// Per-request HTTP timeout. `None` = no timeout (LLM may take minutes);
-    /// `Some(d)` = abort the HTTP request if it exceeds `d`.
-    pub request_timeout: Option<std::time::Duration>,
-    /// Cancellation token for request abortion
-    pub cancellation_token: Option<tokio::sync::watch::Receiver<bool>>,
-    /// Available tools for function calling
-    pub tools: Option<Vec<FunctionDefinition>>,
-    /// Structured output configuration
-    pub response_format: Option<StructuredOutputRequest>,
-    /// Previous response ID for multi-turn conversations (OpenAI Responses API)
-    pub previous_id: Option<String>,
-    /// Enable long-lived cache (provider-specific: pre-GPT-5.6 OpenAI "24h"
-    /// retention, Anthropic 1h TTL). GPT-5.6 has only a fixed 30m minimum TTL.
-    pub use_long_cache: bool,
-    /// Explicit prompt-cache routing key (OpenAI `prompt_cache_key`). Optional hint
-    /// that pins requests sharing a long common prefix to the same cache, improving
-    /// hit rates. `None` = rely on automatic prefix-hash routing. OpenAI-only.
-    pub prompt_cache_key: Option<String>,
-    /// Reasoning effort hint for thinking-capable models. `None` = provider default
-    /// (most providers omit the field; hybrid models stay non-thinking).
-    pub reasoning_effort: Option<ReasoningEffort>,
-    /// Extra HTTP headers for the upstream request, applied LAST with upsert
-    /// semantics: a passed header replaces the provider's value for that name,
-    /// everything else the provider set stays. The library attaches no meaning
-    /// to them — callers use this to talk to proxies (e.g. octohub's
-    /// `X-Model-Purpose`). `None`/empty = no change to the request.
-    pub extra_headers: Option<std::collections::HashMap<String, String>>,
+	/// ChatGPT transport. Defaults to HTTP/SSE, even when WebSocket support is compiled.
+	/// Other providers do not use this setting.
+	pub chatgpt_transport: ChatGptTransport,
+	/// OctoHub transport. Defaults to HTTP, even when WebSocket support is compiled.
+	/// Other providers do not use this setting.
+	pub octohub_transport: OctoHubTransport,
+	/// Array of conversation messages
+	pub messages: Vec<Message>,
+	/// Model identifier (e.g., "claude-3-5-sonnet", "gpt-4")
+	pub model: String,
+	/// Maximum tokens to generate (0 = no limit)
+	pub max_tokens: u32,
+	/// Maximum retry attempts on failure
+	pub max_retries: u32,
+	/// Base timeout for exponential backoff retry logic
+	pub retry_timeout: std::time::Duration,
+	/// HTTP and ChatGPT WebSocket: total deadline per attempt, including connection
+	/// setup, sending and receiving the complete response. Excludes retry backoff
+	/// and shared WebSocket session waits; `None` disables this deadline.
+	/// OctoHub WebSocket: total operation budget including session waits, setup,
+	/// replies and retry backoff; `None` uses 600 seconds.
+	/// WebSocket connection setup is also bounded separately.
+	pub request_timeout: Option<std::time::Duration>,
+	/// Maximum wait for response data on SSE paths or ChatGPT WebSocket. Resets on
+	/// SSE chunks or ChatGPT response messages, not WebSocket ping/pong frames.
+	/// Does not apply to OctoHub's buffered HTTP or WebSocket envelope.
+	/// `None` disables this limit (default). Does not extend `request_timeout`.
+	pub stream_timeout: Option<std::time::Duration>,
+	/// Cancellation token for request abortion
+	pub cancellation_token: Option<tokio::sync::watch::Receiver<bool>>,
+	/// Told before every backoff sleep so the caller can show that the call is
+	/// waiting on a failing provider. `None` = retries stay silent.
+	pub retry_observer: Option<crate::llm::retry::RetryObserver>,
+	/// Available tools for function calling
+	pub tools: Option<Vec<FunctionDefinition>>,
+	/// Structured output configuration
+	pub response_format: Option<StructuredOutputRequest>,
+	/// Previous response ID for multi-turn conversations (OpenAI Responses API)
+	pub previous_id: Option<String>,
+	/// Enable long-lived cache (provider-specific: pre-GPT-5.6 OpenAI "24h"
+	/// retention, Anthropic 1h TTL). GPT-5.6 has only a fixed 30m minimum TTL.
+	pub use_long_cache: bool,
+	/// Cache pre-warm request: refresh the provider's prompt-cache TTL without
+	/// generating output. Anthropic gets `max_tokens: 0` (non-streaming); OpenRouter
+	/// and Ollama get `max_tokens: 1`; OctoHub forwards it as `cache_prewarm: true`.
+	/// Other providers ignore it.
+	pub cache_prewarm: bool,
+	/// Explicit prompt-cache routing key (OpenAI `prompt_cache_key`). Optional hint
+	/// that pins requests sharing a long common prefix to the same cache, improving
+	/// hit rates. ChatGPT and OctoHub WebSocket modes also use this key to reuse a session's socket across
+	/// provider instances. `None` = automatic cache routing and, in WebSocket mode, a fresh socket.
+	pub prompt_cache_key: Option<String>,
+	/// Reasoning effort hint for thinking-capable models. `None` = provider default
+	/// (most providers omit the field; hybrid models stay non-thinking).
+	pub reasoning_effort: Option<ReasoningEffort>,
+	/// Extra HTTP headers for the upstream request, applied LAST with upsert
+	/// semantics: a passed header replaces the provider's value for that name,
+	/// everything else the provider set stays. The library attaches no meaning
+	/// to them — callers use this to talk to proxies (e.g. octohub's
+	/// `X-Model-Purpose`). `None`/empty = no change to the request.
+	pub extra_headers: Option<std::collections::HashMap<String, String>>,
+	/// Request-scoped credential; deliberately has no serialization implementation.
+	pub(crate) api_key: Option<PerCallApiKey>,
 }
 
 impl ChatCompletionParams {
-    /// Create new chat completion parameters
-    pub fn new(
-        messages: &[Message],
-        model: &str,
-        temperature: f32,
-        top_p: f32,
-        top_k: u32,
-        max_tokens: u32,
-    ) -> Self {
-        Self {
-            messages: messages.to_vec(),
-            model: model.to_string(),
-            temperature,
-            top_p,
-            top_k,
-            max_tokens,
-            max_retries: 3,                                   // Default retry attempts
-            retry_timeout: std::time::Duration::from_secs(1), // Default 1 second base timeout
-            request_timeout: None,                            // No per-request timeout by default
-            cancellation_token: None,
-            tools: None,
-            response_format: None,
-            previous_id: None,
-            use_long_cache: false,
-            prompt_cache_key: None,
-            reasoning_effort: None,
-            extra_headers: None,
-        }
-    }
+	/// Create new chat completion parameters
+	pub fn new(messages: &[Message], model: &str, max_tokens: u32) -> Self {
+		Self {
+			chatgpt_transport: ChatGptTransport::Http,
+			octohub_transport: OctoHubTransport::Http,
+			messages: messages.to_vec(),
+			model: model.to_string(),
+			max_tokens,
+			max_retries: 3,                                   // Default retry attempts
+			retry_timeout: std::time::Duration::from_secs(1), // Default 1 second base timeout
+			request_timeout: None,                            // No per-request timeout by default
+			stream_timeout: None,
+			cancellation_token: None,
+			retry_observer: None,
+			tools: None,
+			response_format: None,
+			previous_id: None,
+			use_long_cache: false,
+			cache_prewarm: false,
+			prompt_cache_key: None,
+			reasoning_effort: None,
+			extra_headers: None,
+			api_key: None,
+		}
+	}
 
-    /// Enable long-lived cache for this request
-    pub fn with_long_cache(mut self, enabled: bool) -> Self {
-        self.use_long_cache = enabled;
-        self
-    }
+	/// Select the transport for the `chatgpt:` provider.
+	pub fn with_chatgpt_transport(mut self, transport: ChatGptTransport) -> Self {
+		self.chatgpt_transport = transport;
+		self
+	}
 
-    /// Set an explicit prompt-cache routing key (OpenAI `prompt_cache_key`).
-    pub fn with_prompt_cache_key(mut self, key: impl Into<String>) -> Self {
-        self.prompt_cache_key = Some(key.into());
-        self
-    }
+	/// Select the transport for the `octohub:` provider. HTTP is the default.
+	///
+	/// ```
+	/// use octolib::{ChatCompletionParams, OctoHubTransport};
+	///
+	/// let params = ChatCompletionParams::new(&[], "auto", 100);
+	/// assert_eq!(params.octohub_transport, OctoHubTransport::Http);
+	///
+	/// #[cfg(feature = "websockets")]
+	/// let params = params
+	///     .with_octohub_transport(OctoHubTransport::WebSocket)
+	///     .with_prompt_cache_key("conversation-id");
+	///
+	/// let params = params.with_octohub_transport(OctoHubTransport::Http);
+	/// assert_eq!(params.octohub_transport, OctoHubTransport::Http);
+	/// ```
+	pub fn with_octohub_transport(mut self, transport: OctoHubTransport) -> Self {
+		self.octohub_transport = transport;
+		self
+	}
 
-    /// Set extra HTTP headers for the upstream request (upsert semantics —
-    /// see [`ChatCompletionParams::extra_headers`]).
-    pub fn with_extra_headers(
-        mut self,
-        headers: std::collections::HashMap<String, String>,
-    ) -> Self {
-        self.extra_headers = Some(headers);
-        self
-    }
+	/// Use this API key instead of environment or OAuth credentials for this call.
+	/// Providers requiring multiple credentials or managed sign-in reject it.
+	/// The key is not serializable and is redacted in `Debug` output.
+	///
+	/// ```
+	/// use octolib::ChatCompletionParams;
+	///
+	/// let params = ChatCompletionParams::new(&[], "gpt-4o", 100)
+	///     .with_max_retries(0)
+	///     .with_api_key("request-key".to_owned());
+	/// ```
+	pub fn with_api_key(mut self, api_key: String) -> Self {
+		self.api_key = Some(PerCallApiKey(api_key));
+		self
+	}
 
-    /// Set maximum retry attempts
-    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
-        self.max_retries = max_retries;
-        self
-    }
+	/// Enable long-lived cache for this request
+	pub fn with_long_cache(mut self, enabled: bool) -> Self {
+		self.use_long_cache = enabled;
+		self
+	}
 
-    /// Set retry timeout
-    pub fn with_retry_timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.retry_timeout = timeout;
-        self
-    }
+	/// Mark this request as a cache pre-warm (keepalive) that generates no output
+	pub fn with_cache_prewarm(mut self, enabled: bool) -> Self {
+		self.cache_prewarm = enabled;
+		self
+	}
 
-    /// Set per-request HTTP timeout. `None` disables (LLM may take minutes);
-    /// `Some(d)` aborts the HTTP request if it exceeds `d`.
-    pub fn with_request_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
-        self.request_timeout = timeout;
-        self
-    }
+	/// Set an explicit prompt-cache routing key (OpenAI `prompt_cache_key`).
+	pub fn with_prompt_cache_key(mut self, key: impl Into<String>) -> Self {
+		self.prompt_cache_key = Some(key.into());
+		self
+	}
 
-    /// Set cancellation token
-    pub fn with_cancellation_token(mut self, token: tokio::sync::watch::Receiver<bool>) -> Self {
-        self.cancellation_token = Some(token);
-        self
-    }
+	/// Set extra HTTP headers for the upstream request (upsert semantics —
+	/// see [`ChatCompletionParams::extra_headers`]).
+	pub fn with_extra_headers(mut self, headers: std::collections::HashMap<String, String>) -> Self {
+		self.extra_headers = Some(headers);
+		self
+	}
 
-    /// Set available tools
-    /// Set the tool definitions for this request.
-    ///
-    /// Parameter schemas are normalized to scalar `"type"` keywords first — see
-    /// [`crate::llm::utils::normalize_tool_schema`] for why every provider
-    /// needs this.
-    pub fn with_tools(mut self, mut tools: Vec<FunctionDefinition>) -> Self {
-        for tool in tools.iter_mut() {
-            crate::llm::utils::normalize_tool_schema(&mut tool.parameters);
-        }
-        self.tools = Some(tools);
-        self
-    }
+	/// Set maximum retry attempts
+	pub fn with_max_retries(mut self, max_retries: u32) -> Self {
+		self.max_retries = max_retries;
+		self
+	}
 
-    /// Set structured output format
-    pub fn with_structured_output(mut self, response_format: StructuredOutputRequest) -> Self {
-        self.response_format = Some(response_format);
-        self
-    }
+	/// Set retry timeout
+	pub fn with_retry_timeout(mut self, timeout: std::time::Duration) -> Self {
+		self.retry_timeout = timeout;
+		self
+	}
 
-    /// Set previous response ID for multi-turn conversations (OpenAI Responses API)
-    pub fn with_previous_id(mut self, id: &str) -> Self {
-        self.previous_id = Some(id.to_string());
-        self
-    }
+	/// Set the total deadline per HTTP or ChatGPT WebSocket attempt.
+	/// OctoHub WebSocket instead bounds the whole operation, including session waits
+	/// and retry backoff. `None` disables the deadline except for OctoHub WebSocket,
+	/// which uses 600 seconds.
+	pub fn with_request_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+		self.request_timeout = timeout;
+		self
+	}
 
-    /// Set reasoning effort. Has no effect on models without thinking support.
-    pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
-        self.reasoning_effort = Some(effort);
-        self
-    }
+	/// Set the SSE/ChatGPT WebSocket response inactivity limit. `None` disables it.
+	/// Does not apply to OctoHub's buffered HTTP or WebSocket envelope.
+	pub fn with_stream_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+		self.stream_timeout = timeout;
+		self
+	}
+
+	/// Set cancellation token
+	pub fn with_cancellation_token(mut self, token: tokio::sync::watch::Receiver<bool>) -> Self {
+		self.cancellation_token = Some(token);
+		self
+	}
+
+	/// Observe retries of this call (see [`crate::llm::retry::RetryObserver`]).
+	pub fn with_retry_observer(mut self, observer: crate::llm::retry::RetryObserver) -> Self {
+		self.retry_observer = Some(observer);
+		self
+	}
+
+	/// Set available tools
+	/// Set the tool definitions for this request.
+	///
+	/// Parameter schemas are normalized to scalar `"type"` keywords first — see
+	/// [`crate::llm::utils::normalize_tool_schema`] for why every provider
+	/// needs this.
+	pub fn with_tools(mut self, mut tools: Vec<FunctionDefinition>) -> Self {
+		for tool in tools.iter_mut() {
+			crate::llm::utils::normalize_tool_schema(&mut tool.parameters);
+		}
+		self.tools = Some(tools);
+		self
+	}
+
+	/// Set structured output format
+	pub fn with_structured_output(mut self, response_format: StructuredOutputRequest) -> Self {
+		self.response_format = Some(response_format);
+		self
+	}
+
+	/// Set previous response ID for multi-turn conversations (OpenAI Responses API)
+	pub fn with_previous_id(mut self, id: &str) -> Self {
+		self.previous_id = Some(id.to_string());
+		self
+	}
+
+	/// Set reasoning effort. Has no effect on models without thinking support.
+	pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+		self.reasoning_effort = Some(effort);
+		self
+	}
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_message_constructors() {
-        let user_msg = Message::user("Hello");
-        assert_eq!(user_msg.role, "user");
-        assert_eq!(user_msg.content, "Hello");
-        assert!(!user_msg.cached);
-        assert!(user_msg.tool_call_id.is_none());
-        assert!(user_msg.images.is_none());
-
-        let assistant_msg = Message::assistant("Hi there");
-        assert_eq!(assistant_msg.role, "assistant");
-        assert_eq!(assistant_msg.content, "Hi there");
-
-        let system_msg = Message::system("You are helpful");
-        assert_eq!(system_msg.role, "system");
-        assert_eq!(system_msg.content, "You are helpful");
-
-        let tool_msg = Message::tool("Result", "call_123", "test_tool");
-        assert_eq!(tool_msg.role, "tool");
-        assert_eq!(tool_msg.content, "Result");
-        assert_eq!(tool_msg.tool_call_id, Some("call_123".to_string()));
-        assert_eq!(tool_msg.name, Some("test_tool".to_string()));
-    }
-
-    #[test]
-    fn test_message_with_cache_marker() {
-        let msg = Message::user("Test").with_cache_marker();
-        assert!(msg.cached);
-    }
-
-    #[test]
-    fn test_chat_completion_params() {
-        let messages = vec![Message::user("Hello")];
-        let params = ChatCompletionParams::new(&messages, "openai:gpt-4o", 0.7, 1.0, 50, 1000);
-
-        assert_eq!(params.model, "openai:gpt-4o");
-        assert_eq!(params.temperature, 0.7);
-        assert_eq!(params.top_p, 1.0);
-        assert_eq!(params.top_k, 50);
-        assert_eq!(params.max_tokens, 1000);
-        assert_eq!(params.max_retries, 3); // Default
-        assert!(params.cancellation_token.is_none());
-        assert!(params.tools.is_none()); // Default
-
-        let params_with_retries = params.with_max_retries(5);
-        assert_eq!(params_with_retries.max_retries, 5);
-
-        // Test with tools
-        let tools = vec![FunctionDefinition {
-            name: "test_function".to_string(),
-            description: "A test function".to_string(),
-            parameters: serde_json::json!({"type": "object", "properties": {}}),
-            cache_control: None,
-        }];
-        let params_with_tools = params_with_retries.with_tools(tools.clone());
-        assert!(params_with_tools.tools.is_some());
-        assert_eq!(params_with_tools.tools.unwrap().len(), 1);
-    }
-
-    #[test]
-    fn test_token_usage() {
-        let usage = TokenUsage {
-            input_tokens: 100,
-            cache_read_tokens: 50,
-            cache_write_tokens: 25,
-            output_tokens: 50,
-            reasoning_tokens: 30,
-            total_tokens: 255, // 100 + 50 + 25 + 50 + 30 (if provider includes reasoning)
-            cost: Some(0.01),
-            request_time_ms: Some(1500),
-        };
-
-        assert_eq!(usage.input_tokens, 100);
-        assert_eq!(usage.cache_read_tokens, 50);
-        assert_eq!(usage.cache_write_tokens, 25);
-        assert_eq!(usage.output_tokens, 50);
-        assert_eq!(usage.reasoning_tokens, 30);
-        assert_eq!(usage.total_tokens, 255);
-        assert_eq!(usage.cost, Some(0.01));
-        assert_eq!(usage.request_time_ms, Some(1500));
-    }
-
-    #[test]
-    fn test_provider_exchange() {
-        let request = serde_json::json!({"model": "test", "messages": []});
-        let response = serde_json::json!({"choices": []});
-        let usage = TokenUsage {
-            input_tokens: 10,
-            cache_read_tokens: 5,
-            cache_write_tokens: 0,
-            output_tokens: 5,
-            reasoning_tokens: 3,
-            total_tokens: 23,
-            cost: None,
-            request_time_ms: None,
-        };
-
-        let exchange = ProviderExchange::new(
-            request.clone(),
-            response.clone(),
-            Some(usage.clone()),
-            "test_provider",
-        );
-
-        assert_eq!(exchange.request, request);
-        assert_eq!(exchange.response, response);
-        assert_eq!(exchange.provider, "test_provider");
-        assert!(exchange.usage.is_some());
-        assert!(exchange.timestamp > 0);
-    }
-
-    #[test]
-    fn test_tool_call() {
-        let tool_call = ToolCall {
-            id: "call_123".to_string(),
-            name: "test_function".to_string(),
-            arguments: serde_json::json!({"param": "value"}),
-        };
-
-        assert_eq!(tool_call.id, "call_123");
-        assert_eq!(tool_call.name, "test_function");
-        assert_eq!(tool_call.arguments["param"], "value");
-    }
-
-    #[test]
-    fn test_function_definition() {
-        let func_def = FunctionDefinition {
-            name: "test_function".to_string(),
-            description: "A test function for demonstration".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "param1": {"type": "string", "description": "First parameter"}
-                },
-                "required": ["param1"]
-            }),
-            cache_control: None,
-        };
-
-        assert_eq!(func_def.name, "test_function");
-        assert_eq!(func_def.description, "A test function for demonstration");
-        assert_eq!(func_def.parameters["type"], "object");
-        assert!(func_def.parameters["properties"]["param1"].is_object());
-        assert!(func_def.cache_control.is_none());
-
-        // Test with cache control
-        let func_def_with_cache = FunctionDefinition {
-            name: "cached_function".to_string(),
-            description: "A cached function".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
-            cache_control: Some(serde_json::json!({
-                "type": "ephemeral",
-                "ttl": "5m"
-            })),
-        };
-
-        assert!(func_def_with_cache.cache_control.is_some());
-        assert_eq!(
-            func_def_with_cache.cache_control.unwrap()["type"],
-            "ephemeral"
-        );
-    }
-
-    #[test]
-    fn test_image_attachment() {
-        let attachment = ImageAttachment {
-            data: ImageData::Base64("base64data".to_string()),
-            media_type: "image/png".to_string(),
-            source_type: SourceType::File(std::path::PathBuf::from("/path/to/image.png")),
-            dimensions: Some((800, 600)),
-            size_bytes: Some(1024),
-        };
-
-        match &attachment.data {
-            ImageData::Base64(data) => assert_eq!(data, "base64data"),
-            _ => panic!("Expected Base64 data"),
-        }
-
-        assert_eq!(attachment.media_type, "image/png");
-        assert_eq!(attachment.dimensions, Some((800, 600)));
-        assert_eq!(attachment.size_bytes, Some(1024));
-
-        match &attachment.source_type {
-            SourceType::File(path) => {
-                assert_eq!(path, &std::path::PathBuf::from("/path/to/image.png"))
-            }
-            _ => panic!("Expected File source type"),
-        }
-    }
-
-    #[test]
-    fn test_thinking_block() {
-        let thinking = ThinkingBlock::new("Let me solve this step by step...");
-        assert_eq!(thinking.content, "Let me solve this step by step...");
-        assert_eq!(thinking.tokens, 0);
-
-        let thinking_with_tokens = ThinkingBlock::with_tokens("Reasoning...", 42);
-        assert_eq!(thinking_with_tokens.content, "Reasoning...");
-        assert_eq!(thinking_with_tokens.tokens, 42);
-    }
-
-    #[test]
-    fn test_message_with_thinking() {
-        let thinking = ThinkingBlock::with_tokens("Let me solve this step by step...", 50);
-        let msg = Message::assistant("The answer is 42.").with_thinking(thinking);
-
-        assert!(msg.thinking.is_some());
-        assert_eq!(
-            msg.thinking.as_ref().unwrap().content,
-            "Let me solve this step by step..."
-        );
-        assert_eq!(msg.thinking.as_ref().unwrap().tokens, 50);
-        assert_eq!(msg.content, "The answer is 42.");
-    }
-
-    #[test]
-    fn test_message_builder_with_thinking() {
-        let thinking = ThinkingBlock::new("First, I'll analyze the problem...");
-        let msg = Message::builder()
-            .role("assistant")
-            .content("The answer is 42.")
-            .thinking(thinking)
-            .build()
-            .unwrap();
-
-        assert!(msg.thinking.is_some());
-        assert_eq!(
-            msg.thinking.unwrap().content,
-            "First, I'll analyze the problem..."
-        );
-    }
-
-    #[test]
-    fn test_sampling_support_all() {
-        let sp = SamplingSupport::ALL;
-        assert!(sp.temperature);
-        assert!(sp.top_p);
-        assert!(sp.top_k);
-    }
-
-    #[test]
-    fn test_sampling_support_none() {
-        let sp = SamplingSupport::NONE;
-        assert!(!sp.temperature);
-        assert!(!sp.top_p);
-        assert!(!sp.top_k);
-    }
-
-    #[test]
-    fn test_sampling_support_default() {
-        let sp = SamplingSupport::default();
-        assert!(sp.temperature);
-        assert!(sp.top_p);
-        assert!(sp.top_k);
-    }
-
-    #[test]
-    fn test_effective_sampling_params() {
-        // All supported — user values pass through
-        let sp = SamplingSupport::ALL.effective(0.3, 0.8, 10);
-        assert_eq!(sp.temperature, Some(0.3));
-        assert_eq!(sp.top_p, Some(0.8));
-        assert_eq!(sp.top_k, Some(10));
-
-        // None supported — user values are ignored
-        let sp = SamplingSupport::NONE.effective(0.3, 0.8, 10);
-        assert_eq!(sp.temperature, None);
-        assert_eq!(sp.top_p, None);
-        assert_eq!(sp.top_k, None);
-
-        // Partial support — only supported params pass through
-        let sp = SamplingSupport {
-            temperature: true,
-            top_p: false,
-            top_k: true,
-        }
-        .effective(0.5, 0.9, 20);
-        assert_eq!(sp.temperature, Some(0.5));
-        assert_eq!(sp.top_p, None);
-        assert_eq!(sp.top_k, Some(20));
-    }
-}
+#[path = "types_tests.rs"]
+mod tests;

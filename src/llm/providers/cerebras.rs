@@ -22,13 +22,11 @@
 //! - `CEREBRAS_API_URL`: Optional endpoint override
 
 use crate::llm::providers::openai_compat::{
-    chat_completion as openai_compat_chat_completion, get_api_url, OpenAiCompatConfig,
+	chat_completion as openai_compat_chat_completion, get_api_url, OpenAiCompatConfig,
 };
 use crate::llm::traits::AiProvider;
 use crate::llm::types::{ChatCompletionParams, ProviderResponse};
-use crate::llm::utils::{
-    calculate_cost_from_pricing_table, get_model_pricing, normalize_model_name, PricingTuple,
-};
+use crate::llm::utils::{calculate_cost_from_pricing_table, get_model_pricing, normalize_model_name, PricingTuple};
 use anyhow::Result;
 use std::env;
 
@@ -37,178 +35,142 @@ use std::env;
 pub struct CerebrasProvider;
 
 impl Default for CerebrasProvider {
-    fn default() -> Self {
-        Self::new()
-    }
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 impl CerebrasProvider {
-    pub fn new() -> Self {
-        Self
-    }
+	pub fn new() -> Self {
+		Self
+	}
 }
 
-const CEREBRAS_API_KEY_ENV: &str = "CEREBRAS_API_KEY";
+pub(crate) const CEREBRAS_API_KEY_ENV: &str = "CEREBRAS_API_KEY";
 const CEREBRAS_API_URL_ENV: &str = "CEREBRAS_API_URL";
 const CEREBRAS_API_URL: &str = "https://api.cerebras.ai/v1/chat/completions";
 
-/// Cerebras supported model IDs (Mar 2026 docs)
+/// Cerebras supported model IDs (Sep 2026 docs)
 /// Source: https://inference-docs.cerebras.ai/models/overview
-const SUPPORTED_MODELS: &[&str] = &[
-    // Production models
-    "gpt-oss-120b",
-    "llama-3.1-8b",
-    // Preview models
-    "gemma-4-31b",
-    "qwen-3-235b-a22b-instruct-2507",
-    "zai-glm-4.7",
+pub(crate) const SUPPORTED_MODELS: &[&str] = &[
+	// Shared-tier production models
+	"gpt-oss-120b",
+	"qwen-3.8-27b",
 ];
 
 /// Cerebras model pricing (per 1M tokens in USD)
 /// Format: (model, input, output, cache_write, cache_read)
 ///
-/// Source: https://www.cerebras.ai/pricing (checked Mar 31, 2026)
+/// Source: https://www.cerebras.ai/pricing (gpt-oss-120b, checked Mar 31,
+/// 2026) and https://inference-docs.cerebras.ai/models/qwen-3.8-27b
+/// (checked Sep 13, 2026). No separate cache rates are published, so
+/// cache fields mirror input.
 const PRICING: &[PricingTuple] = &[
-    ("gemma-4-31b", 0.99, 1.49, 0.99, 0.99),
-    ("zai-glm-4.7", 2.25, 2.75, 2.25, 2.25),
-    ("qwen-3-235b-a22b-instruct-2507", 0.60, 1.20, 0.60, 0.60),
-    ("gpt-oss-120b", 0.35, 0.75, 0.35, 0.35),
-    ("llama-3.1-8b", 0.10, 0.10, 0.10, 0.10),
+	("qwen-3.8-27b", 0.99, 1.49, 0.99, 0.99),
+	("gpt-oss-120b", 0.35, 0.75, 0.35, 0.35),
 ];
 
-fn calculate_cost(
-    model: &str,
-    input_tokens: u64,
-    cache_read_tokens: u64,
-    output_tokens: u64,
-) -> Option<f64> {
-    calculate_cost_from_pricing_table(
-        model,
-        PRICING,
-        input_tokens,
-        0,
-        cache_read_tokens,
-        output_tokens,
-    )
+fn calculate_cost(model: &str, input_tokens: u64, cache_read_tokens: u64, output_tokens: u64) -> Option<f64> {
+	calculate_cost_from_pricing_table(model, PRICING, input_tokens, 0, cache_read_tokens, output_tokens)
 }
 
 #[async_trait::async_trait]
 impl AiProvider for CerebrasProvider {
-    fn name(&self) -> &str {
-        "cerebras"
-    }
+	fn name(&self) -> &str {
+		"cerebras"
+	}
 
-    fn supports_model(&self, model: &str) -> bool {
-        let model_norm = normalize_model_name(model);
-        SUPPORTED_MODELS
-            .iter()
-            .any(|m| normalize_model_name(m) == model_norm)
-    }
+	fn supports_model(&self, model: &str) -> bool {
+		let model_norm = normalize_model_name(model);
+		SUPPORTED_MODELS.iter().any(|m| normalize_model_name(m) == model_norm)
+	}
 
-    fn get_api_key(&self) -> Result<String> {
-        env::var(CEREBRAS_API_KEY_ENV).map_err(|_| {
-            anyhow::anyhow!(
-                "Cerebras API key not found in environment variable: {}",
-                CEREBRAS_API_KEY_ENV
-            )
-        })
-    }
+	fn get_api_key(&self) -> Result<String> {
+		env::var(CEREBRAS_API_KEY_ENV)
+			.map_err(|_| crate::errors::missing_api_key("cerebras", CEREBRAS_API_KEY_ENV).into())
+	}
 
-    fn supports_caching(&self, _model: &str) -> bool {
-        false
-    }
+	fn supports_caching(&self, _model: &str) -> bool {
+		false
+	}
 
-    // supports_vision, supports_video, get_max_input_tokens
-    // are resolved via reference capabilities (trait defaults)
+	// supports_vision is resolved via reference capabilities (trait default)
 
-    fn supports_structured_output(&self, _model: &str) -> bool {
-        true
-    }
+	fn supports_video(&self, model: &str) -> bool {
+		// The Cerebras qwen-3.8-27b endpoint accepts text and base64-encoded
+		// PNG/JPEG images only, unlike the native route that also takes video.
+		if normalize_model_name(model) == "qwen-3.8-27b" {
+			return false;
+		}
+		crate::llm::reference_models::get_reference_capabilities(model)
+			.map(|c| c.video)
+			.unwrap_or(false)
+	}
 
-    fn enforces_response_schema(&self, _model: &str) -> bool {
-        true
-    }
+	fn get_max_input_tokens(&self, model: &str) -> usize {
+		// Cerebras serves Qwen 3.8 27B at 128K (131,072) on paid tiers —
+		// below the 262K native context in the reference tables.
+		if normalize_model_name(model) == "qwen-3.8-27b" {
+			return 131_072;
+		}
+		crate::llm::reference_models::get_reference_capabilities(model)
+			.map(|c| c.max_input_tokens)
+			.unwrap_or(262_144)
+	}
 
-    fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
-        let (input_price, output_price, cache_write_price, cache_read_price) =
-            get_model_pricing(model, PRICING)?;
-        Some(crate::llm::types::ModelPricing::new(
-            input_price,
-            output_price,
-            cache_write_price,
-            cache_read_price,
-        ))
-    }
+	fn supports_structured_output(&self, _model: &str) -> bool {
+		true
+	}
 
-    async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
-        let api_key = self.get_api_key()?;
-        let api_url = get_api_url(CEREBRAS_API_URL_ENV, CEREBRAS_API_URL);
-        let model = params.model.clone();
+	fn enforces_response_schema(&self, _model: &str) -> bool {
+		true
+	}
 
-        let mut response = openai_compat_chat_completion(
-            OpenAiCompatConfig {
-                provider_name: "cerebras",
-                usage_fallback_cost: None,
-                use_response_cost: true,
-            },
-            api_key,
-            api_url,
-            params,
-        )
-        .await?;
+	fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
+		let (input_price, output_price, cache_write_price, cache_read_price) = get_model_pricing(model, PRICING)?;
+		Some(crate::llm::types::ModelPricing::new(
+			input_price,
+			output_price,
+			cache_write_price,
+			cache_read_price,
+		))
+	}
 
-        if let Some(ref mut usage) = response.exchange.usage {
-            if usage.cost.is_none() {
-                usage.cost = calculate_cost(
-                    &model,
-                    usage.input_tokens,
-                    usage.cache_read_tokens,
-                    usage.billable_output_tokens(),
-                );
-            }
-        }
+	async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
+		let api_key = super::shared::resolve_api_key(self, &params)?;
+		let api_url = get_api_url(CEREBRAS_API_URL_ENV, CEREBRAS_API_URL);
+		let model = params.model.clone();
 
-        Ok(response)
-    }
+		let mut response = openai_compat_chat_completion(
+			OpenAiCompatConfig {
+				provider_name: "cerebras",
+				usage_fallback_cost: None,
+				use_response_cost: true,
+				enforces_response_schema: true,
+				supports_required_tool_choice: false,
+				supports_parallel_tool_calls: true,
+			},
+			api_key,
+			api_url,
+			params,
+		)
+		.await?;
+
+		if let Some(ref mut usage) = response.exchange.usage {
+			if usage.cost.is_none() {
+				usage.cost = calculate_cost(
+					&model,
+					usage.input_tokens,
+					usage.cache_read_tokens,
+					usage.billable_output_tokens(),
+				);
+			}
+		}
+
+		Ok(response)
+	}
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_supports_model() {
-        let provider = CerebrasProvider::new();
-        assert!(provider.supports_model("gpt-oss-120b"));
-        assert!(provider.supports_model("llama-3.1-8b"));
-        assert!(provider.supports_model("QWEN-3-235B-A22B-INSTRUCT-2507"));
-        assert!(provider.supports_model("zai-glm-4.7"));
-        assert!(!provider.supports_model(""));
-        assert!(!provider.supports_model("random-model"));
-    }
-
-    #[test]
-    fn test_default_capabilities() {
-        let provider = CerebrasProvider::new();
-        assert_eq!(provider.name(), "cerebras");
-        assert!(!provider.supports_caching("any-model"));
-        assert!(!provider.supports_vision("llama-3.1-8b"));
-        assert!(provider.supports_structured_output("any-model"));
-        assert_eq!(provider.get_max_input_tokens("llama-3.1-8b"), 131_072);
-    }
-
-    #[test]
-    fn test_pricing_support_partial() {
-        let provider = CerebrasProvider::new();
-        assert!(provider.get_model_pricing("llama-3.1-8b").is_some());
-        assert!(provider.get_model_pricing("gpt-oss-120b").is_some());
-        assert!(provider.get_model_pricing("zai-glm-4.7").is_some());
-        assert!(provider
-            .get_model_pricing("qwen-3-235b-a22b-instruct-2507")
-            .is_some());
-        assert!(crate::llm::utils::is_model_in_pricing_table(
-            "LLAMA-3.1-8B",
-            PRICING
-        ));
-    }
-}
+#[path = "cerebras_tests.rs"]
+mod tests;

@@ -33,24 +33,25 @@ pub mod utils;
 
 // Re-export main types and traits for easy access
 pub use config::{CacheConfig, CacheTTL, CacheType};
-pub use factory::ProviderFactory;
+pub use factory::{ProviderFactory, ProviderSetupInfo};
 pub use reference_models::{ModelCapabilities, ModelProperties};
+pub use retry::{RetryEvent, RetryObserver};
 pub use schema_enforcement::chat_completion_enforced;
 pub use strategies::{ModelLimits, ProviderStrategy, StrategyFactory, ToolResult};
 pub use tool_calls::{GenericToolCall, ProviderToolCalls};
 pub use traits::{AiProvider, KeepalivePolicy};
 pub use types::{
-    ChatCompletionParams, EffectiveSamplingParams, FunctionDefinition, ImageAttachment, ImageData,
-    Message, MessageBuilder, ModelPricing, OutputFormat, ProviderExchange, ProviderResponse,
-    ReasoningEffort, ResponseMode, SamplingSupport, SourceType, StructuredOutputRequest,
-    ThinkingBlock, TokenUsage, ToolCall, VideoAttachment, VideoData,
+	ChatCompletionParams, ChatGptTransport, FunctionDefinition, ImageAttachment, ImageData, Message, MessageBuilder,
+	ModelPricing, OctoHubTransport, OutputFormat, ProviderExchange, ProviderResponse, ReasoningEffort, ResponseMode,
+	SourceType, StructuredOutputRequest, ThinkingBlock, TokenUsage, ToolCall, ToolChoice, VideoAttachment, VideoData,
 };
 
 // Re-export all provider implementations
+pub use providers::set_user_agent;
 pub use providers::{
-    AlibabaProvider, AmazonBedrockProvider, AnthropicProvider, BytePlusProvider, CerebrasProvider,
-    CliProvider, CloudflareWorkersAiProvider, DeepSeekProvider, FireworksProvider,
-    GoogleStudioProvider, GoogleVertexProvider, GroqProvider, LocalProvider, MinimaxProvider,
-    MoonshotProvider, OctoHubProvider, OllamaProvider, OpenAiProvider, OpenRouterProvider,
-    TogetherProvider, XaiProvider, ZaiProvider,
+	AlibabaProvider, AmazonBedrockProvider, AnthropicProvider, BytePlusProvider, CerebrasProvider, CliProvider,
+	CloudflareWorkersAiProvider, DeepSeekProvider, FireworksProvider, GoogleStudioProvider, GoogleVertexProvider,
+	GroqProvider, IsoquantProvider, LocalProvider, MetaProvider, MinimaxProvider, MoonshotProvider, OctoHubProvider,
+	OllamaProvider, OpenAiProvider, OpenRouterProvider, ReflectionProvider, TogetherProvider, WebWrightProvider,
+	XaiProvider, ZaiProvider,
 };

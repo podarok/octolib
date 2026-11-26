@@ -15,60 +15,87 @@
 //! MiniMax provider implementation (Anthropic-compatible API)
 
 use super::shared;
-use crate::errors::ProviderError;
 use crate::llm::retry;
 use crate::llm::traits::AiProvider;
 use crate::llm::types::{
-    ChatCompletionParams, ImageData, Message, ProviderExchange, ProviderResponse, SamplingSupport,
-    ThinkingBlock, TokenUsage, ToolCall, VideoData,
+	ChatCompletionParams, ImageData, Message, ProviderExchange, ProviderResponse, ReasoningEffort, ThinkingBlock,
+	TokenUsage, ToolCall, VideoData,
 };
-use crate::llm::utils::{
-    get_model_pricing, is_model_in_pricing_table, normalize_model_name, PricingTuple,
-};
+use crate::llm::utils::{get_model_pricing, is_model_in_pricing_table, normalize_model_name, PricingTuple};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::env;
 
 /// MiniMax pricing constants (per 1M tokens in USD)
-/// Source: https://www.minimax.io/platform/price (M3 verified Jun 1, 2026)
+/// Source: https://platform.minimax.io/docs/guides/pricing-paygo (verified Sep 22, 2026)
 /// Format: (model, input, output, cache_write, cache_read)
-const PRICING: &[PricingTuple] = &[
-    // MiniMax M3 (latest generation, natively multimodal — image + video input)
-    // Standard rate; a permanent 50% off applies to ≤512K input tokens (0.30/1.20).
-    // Cache writes are free (no cache-write column in official pricing).
-    ("MiniMax-M3-highspeed", 0.30, 1.20, 0.0, 0.06),
-    ("MiniMax-M3", 0.30, 1.20, 0.0, 0.06),
-    // MiniMax M2.7
-    ("MiniMax-M2.7-highspeed", 0.60, 2.40, 0.375, 0.06),
-    ("MiniMax-M2.7", 0.30, 1.20, 0.375, 0.06),
-    // MiniMax M2.5
-    ("MiniMax-M2.5-highspeed", 0.60, 2.40, 0.375, 0.03),
-    ("MiniMax-M2.5-lightning", 0.60, 2.40, 0.375, 0.03), // backward-compatible alias
-    ("MiniMax-M2.5", 0.30, 1.20, 0.375, 0.03),
-    // M2-her (no caching)
-    ("M2-her", 0.30, 1.20, 0.0, 0.0),
-    // Legacy entries kept for compatibility
-    ("MiniMax-M2.1-lightning", 0.60, 2.40, 0.375, 0.03),
-    ("MiniMax-M2.1", 0.30, 1.20, 0.375, 0.03),
-    ("MiniMax-M2", 0.30, 1.20, 0.375, 0.03),
+pub(crate) const PRICING: &[PricingTuple] = &[
+	// MiniMax M3.1 Flash Preview: Token Plan / MiniMax Code only, no pay-as-you-go
+	// rate published (verified Oct 5, 2026), so requests carry no per-token cost.
+	// Superseded by the GA ID below; must precede it (substring match, first wins).
+	("MiniMax-M3.1-Flash-Preview", 0.0, 0.0, 0.0, 0.0),
+	// MiniMax M3.1 Flash (GA Oct 19, 2026; single tier, no cache-write column)
+	// Source: https://platform.minimax.io/docs/guides/pricing (verified Oct 20, 2026)
+	// Must precede MiniMax-M3 (substring match, first wins).
+	("MiniMax-M3.1-Flash", 0.15, 0.60, 0.0, 0.015),
+	// MiniMax M3 (latest generation, natively multimodal — image + video input)
+	// ≤512k input tokens: 0.30 / 1.20 / cache read 0.06; >512k input tokens:
+	// 0.60 / 2.40 / cache read 0.12 (tier applied in `calculate_cost_with_cache`).
+	// Cache writes are free (no cache-write column in official pricing).
+	("MiniMax-M3", 0.30, 1.20, 0.0, 0.06),
+	// MiniMax M2.7
+	("MiniMax-M2.7-highspeed", 0.60, 2.40, 0.375, 0.06),
+	("MiniMax-M2.7", 0.30, 1.20, 0.375, 0.06),
+	// Legacy models (still listed and priced on the official page)
+	("MiniMax-M2.5-highspeed", 0.60, 2.40, 0.375, 0.03),
+	("MiniMax-M2.5", 0.30, 1.20, 0.375, 0.03),
+	// highspeed must precede the base M2.1 entry (substring match, first wins)
+	("MiniMax-M2.1-highspeed", 0.60, 2.40, 0.375, 0.03),
+	("MiniMax-M2.1", 0.30, 1.20, 0.375, 0.03),
+	("MiniMax-M2", 0.30, 1.20, 0.375, 0.03),
 ];
 
-/// MiniMax M3: the permanent 50% discount applies only to ≤512K input tokens.
-/// Above 512K, the standard (2x) rate applies to input, output, and cache read.
+/// MiniMax M3: the permanent 50% discount applies only to ≤512k input tokens.
+/// Above 512k, the standard (2x) rate applies to input, output, and cache read.
 const M3_DISCOUNT_MAX_INPUT: u64 = 512_000;
 
 fn is_m3_model(model: &str) -> bool {
-    let m = normalize_model_name(model);
-    m == "minimax-m3" || m == "minimax-m3-highspeed"
+	normalize_model_name(model) == "minimax-m3"
+}
+
+/// MiniMax-M3.1-Flash (and its Preview ID) takes `output_config.effort` (defaults to
+/// `max` when omitted). Thinking cannot be disabled, so an explicit `None` runs at `low`.
+fn effort_value(model: &str, effort: ReasoningEffort) -> Option<&'static str> {
+	if !matches!(
+		normalize_model_name(model).as_str(),
+		"minimax-m3.1-flash" | "minimax-m3.1-flash-preview"
+	) {
+		return None;
+	}
+	Some(match effort {
+		ReasoningEffort::None | ReasoningEffort::Low => "low",
+		ReasoningEffort::Medium => "medium",
+		ReasoningEffort::High => "high",
+		ReasoningEffort::XHigh => "xhigh",
+		ReasoningEffort::Max => "max",
+	})
+}
+
+/// MiniMax-M3 thinks only when `thinking: {"type": "adaptive"}` is sent (off when
+/// omitted) and documents no `output_config.effort`, so any level except `None`
+/// enables it (platform.minimax.io/docs/api-reference/text-anthropic-api, verified
+/// Oct 2026).
+fn thinking_value(model: &str, effort: ReasoningEffort) -> Option<serde_json::Value> {
+	(is_m3_model(model) && effort != ReasoningEffort::None).then(|| serde_json::json!({ "type": "adaptive" }))
 }
 
 /// Token usage breakdown for cache-aware pricing
 struct CacheTokenUsage {
-    regular_input_tokens: u64,
-    cache_creation_tokens: u64,
-    cache_read_tokens: u64,
-    output_tokens: u64,
+	regular_input_tokens: u64,
+	cache_creation_tokens: u64,
+	cache_read_tokens: u64,
+	output_tokens: u64,
 }
 
 /// Calculate cost for MiniMax models with cache-aware pricing (case-insensitive)
@@ -77,810 +104,620 @@ struct CacheTokenUsage {
 /// - regular_input_tokens: charged at normal price
 /// - output_tokens: charged at normal price
 fn calculate_cost_with_cache(model: &str, usage: CacheTokenUsage) -> Option<f64> {
-    let (mut input_price, mut output_price, cache_write_price, mut cache_read_price) =
-        get_model_pricing(model, PRICING)?;
+	let (mut input_price, mut output_price, cache_write_price, mut cache_read_price) =
+		get_model_pricing(model, PRICING)?;
 
-    // MiniMax M3: the 50% discount applies only to ≤512K input tokens.
-    // Above that, the standard (2x) rate applies to input, output, and cache read.
-    if is_m3_model(model) {
-        let total_input = usage
-            .regular_input_tokens
-            .saturating_add(usage.cache_creation_tokens)
-            .saturating_add(usage.cache_read_tokens);
-        if total_input > M3_DISCOUNT_MAX_INPUT {
-            input_price *= 2.0;
-            output_price *= 2.0;
-            cache_read_price *= 2.0;
-        }
-    }
+	// MiniMax M3: the 50% discount applies only to ≤512k input tokens.
+	// Above that, the standard (2x) rate applies to input, output, and cache read.
+	if is_m3_model(model) {
+		let total_input = usage
+			.regular_input_tokens
+			.saturating_add(usage.cache_creation_tokens)
+			.saturating_add(usage.cache_read_tokens);
+		if total_input > M3_DISCOUNT_MAX_INPUT {
+			input_price *= 2.0;
+			output_price *= 2.0;
+			cache_read_price *= 2.0;
+		}
+	}
 
-    // Regular input tokens at normal price
-    let regular_input_cost = (usage.regular_input_tokens as f64 / 1_000_000.0) * input_price;
+	// Regular input tokens at normal price
+	let regular_input_cost = (usage.regular_input_tokens as f64 / 1_000_000.0) * input_price;
 
-    // Cache creation tokens at cache_write_price
-    let cache_creation_cost =
-        (usage.cache_creation_tokens as f64 / 1_000_000.0) * cache_write_price;
+	// Cache creation tokens at cache_write_price
+	let cache_creation_cost = (usage.cache_creation_tokens as f64 / 1_000_000.0) * cache_write_price;
 
-    // Cache read tokens at cache_read_price
-    let cache_read_cost = (usage.cache_read_tokens as f64 / 1_000_000.0) * cache_read_price;
+	// Cache read tokens at cache_read_price
+	let cache_read_cost = (usage.cache_read_tokens as f64 / 1_000_000.0) * cache_read_price;
 
-    // Output tokens at normal price
-    let output_cost = (usage.output_tokens as f64 / 1_000_000.0) * output_price;
+	// Output tokens at normal price
+	let output_cost = (usage.output_tokens as f64 / 1_000_000.0) * output_price;
 
-    Some(regular_input_cost + cache_creation_cost + cache_read_cost + output_cost)
+	Some(regular_input_cost + cache_creation_cost + cache_read_cost + output_cost)
 }
 
 /// Helper function to calculate cost for MiniMax models
 /// This is used by the helper function for individual token counts
 fn calculate_minimax_cost(
-    model: &str,
-    input_tokens: u32,
-    output_tokens: u32,
-    cache_creation_tokens: u32,
-    cache_read_tokens: u32,
+	model: &str,
+	input_tokens: u32,
+	output_tokens: u32,
+	cache_creation_tokens: u32,
+	cache_read_tokens: u32,
 ) -> Option<f64> {
-    // input_tokens from API is ALREADY clean (non-cached regular tokens)
-    let regular_input_tokens = input_tokens;
+	// input_tokens from API is ALREADY clean (non-cached regular tokens)
+	let regular_input_tokens = input_tokens;
 
-    let usage = CacheTokenUsage {
-        regular_input_tokens: regular_input_tokens as u64,
-        cache_creation_tokens: cache_creation_tokens as u64,
-        cache_read_tokens: cache_read_tokens as u64,
-        output_tokens: output_tokens as u64,
-    };
+	let usage = CacheTokenUsage {
+		regular_input_tokens: regular_input_tokens as u64,
+		cache_creation_tokens: cache_creation_tokens as u64,
+		cache_read_tokens: cache_read_tokens as u64,
+		output_tokens: output_tokens as u64,
+	};
 
-    calculate_cost_with_cache(model, usage)
+	calculate_cost_with_cache(model, usage)
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct MinimaxProvider;
 
 impl MinimaxProvider {
-    pub fn new() -> Self {
-        Self
-    }
+	pub fn new() -> Self {
+		Self
+	}
 }
 
 // Constants
-const MINIMAX_API_KEY_ENV: &str = "MINIMAX_API_KEY";
+pub(crate) const MINIMAX_API_KEY_ENV: &str = "MINIMAX_API_KEY";
 const MINIMAX_API_URL_ENV: &str = "MINIMAX_API_URL";
 const MINIMAX_API_URL: &str = "https://api.minimax.io/anthropic/v1/messages";
 
 #[async_trait]
 impl AiProvider for MinimaxProvider {
-    fn name(&self) -> &str {
-        "minimax"
-    }
-    fn supports_model(&self, model: &str) -> bool {
-        // MiniMax models - check against pricing table (strict)
-        is_model_in_pricing_table(model, PRICING)
-    }
+	fn name(&self) -> &str {
+		"minimax"
+	}
+	fn supports_model(&self, model: &str) -> bool {
+		// MiniMax models - check against pricing table (strict)
+		is_model_in_pricing_table(model, PRICING)
+	}
 
-    fn supported_sampling_params(&self, _model: &str) -> SamplingSupport {
-        // MiniMax supports temperature and top_p, not top_k
-        SamplingSupport::TEMPERATURE_AND_TOP_P
-    }
+	fn get_api_key(&self) -> Result<String> {
+		env::var(MINIMAX_API_KEY_ENV).map_err(|_| crate::errors::missing_api_key("minimax", MINIMAX_API_KEY_ENV).into())
+	}
 
-    fn get_api_key(&self) -> Result<String> {
-        env::var(MINIMAX_API_KEY_ENV)
-            .map_err(|_| anyhow::anyhow!("MINIMAX_API_KEY not found in environment"))
-    }
+	/// Automatic prefix cache for prompts of 512+ tokens; the docs state no TTL.
+	/// Measured 2026-11-07 on MiniMax-M3 (default Anthropic endpoint): unique
+	/// ~6.9k-token prompts re-sent once after an idle delay hit on only 8 of 14
+	/// calls, misses from 5s on and hits up to 6m, so hits depend on routing and
+	/// no expiry time can be read off. Do not count on a hit after any gap.
+	fn supports_caching(&self, _model: &str) -> bool {
+		true
+	}
 
-    fn supports_caching(&self, _model: &str) -> bool {
-        true // MiniMax supports prompt caching
-    }
+	fn supports_vision(&self, model: &str) -> bool {
+		// Only MiniMax-M3 is natively multimodal; earlier M2.x models are text-only
+		normalize_model_name(model).contains("minimax-m3")
+	}
 
-    fn supports_vision(&self, model: &str) -> bool {
-        // Only MiniMax-M3 is natively multimodal; earlier M2.x models are text-only
-        normalize_model_name(model).contains("minimax-m3")
-    }
+	fn supports_video(&self, model: &str) -> bool {
+		// MiniMax-M3 accepts native video input on the Anthropic-compatible endpoint
+		normalize_model_name(model).contains("minimax-m3")
+	}
 
-    fn supports_video(&self, model: &str) -> bool {
-        // MiniMax-M3 accepts native video input on the Anthropic-compatible endpoint
-        normalize_model_name(model).contains("minimax-m3")
-    }
+	fn supports_structured_output(&self, _model: &str) -> bool {
+		false // MiniMax uses Anthropic-compat endpoint which ignores response_format
+	}
 
-    fn supports_structured_output(&self, _model: &str) -> bool {
-        false // MiniMax uses Anthropic-compat endpoint which ignores response_format
-    }
+	fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
+		let (input_price, output_price, cache_write_price, cache_read_price) = get_model_pricing(model, PRICING)?;
 
-    fn get_model_pricing(&self, model: &str) -> Option<crate::llm::types::ModelPricing> {
-        let (input_price, output_price, cache_write_price, cache_read_price) =
-            get_model_pricing(model, PRICING)?;
+		Some(crate::llm::types::ModelPricing::new(
+			input_price,
+			output_price,
+			cache_write_price,
+			cache_read_price,
+		))
+	}
 
-        Some(crate::llm::types::ModelPricing::new(
-            input_price,
-            output_price,
-            cache_write_price,
-            cache_read_price,
-        ))
-    }
+	fn get_max_input_tokens(&self, model: &str) -> usize {
+		// MiniMax model context window limits (case-insensitive), per the
+		// Anthropic API model table (verified Oct 2, 2026)
+		let model_lower = normalize_model_name(model);
+		if model_lower.contains("minimax-m3") {
+			1_000_000 // 1M context window
+		} else if model_lower.contains("minimax-m2") {
+			204_800 // M2, M2.1, M2.5, M2.7 and their highspeed variants
+		} else {
+			128_000 // Default fallback
+		}
+	}
 
-    fn get_max_input_tokens(&self, model: &str) -> usize {
-        // MiniMax model context window limits (case-insensitive)
-        let model_lower = normalize_model_name(model);
-        if model_lower.contains("minimax-m3")
-            || model_lower.contains("minimax-m2.1")
-            || model_lower.contains("minimax-m2")
-        {
-            1_000_000 // 1M context window
-        } else {
-            128_000 // Default fallback
-        }
-    }
+	async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
+		let api_key = super::shared::resolve_api_key(self, &params)?;
 
-    async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ProviderResponse> {
-        let api_key = self.get_api_key()?;
+		// Convert messages to Anthropic format (MiniMax uses same format)
+		let minimax_messages = convert_messages(&params.messages);
 
-        // Convert messages to Anthropic format (MiniMax uses same format)
-        let minimax_messages = convert_messages(&params.messages);
+		// Extract system message if present
+		let system_message = params
+			.messages
+			.iter()
+			.find(|m| m.role == "system")
+			.map(|m| m.content.clone())
+			.unwrap_or_else(|| "You are a helpful assistant.".to_string());
 
-        // Extract system message if present
-        let system_message = params
-            .messages
-            .iter()
-            .find(|m| m.role == "system")
-            .map(|m| m.content.clone())
-            .unwrap_or_else(|| "You are a helpful assistant.".to_string());
+		let system_cached = params.messages.iter().any(|m| m.role == "system" && m.cached);
 
-        let system_cached = params
-            .messages
-            .iter()
-            .any(|m| m.role == "system" && m.cached);
+		// Create the request body
+		let mut request_body = serde_json::json!({
+			"stream": true,
+			"model": params.model,
+			"messages": minimax_messages,
+		});
+		// Add max_tokens if specified (0 means don't include it in request)
+		if params.max_tokens > 0 {
+			request_body["max_tokens"] = serde_json::json!(params.max_tokens);
+		}
 
-        // Validate temperature range (MiniMax requires 0.0 < temperature <= 1.0)
-        let sampling = self.effective_sampling_params(&params);
-        if let Some(temp) = sampling.temperature {
-            if temp <= 0.0 || temp > 1.0 {
-                return Err(anyhow::anyhow!(
-                    "MiniMax requires temperature in range (0.0, 1.0], got {}",
-                    temp
-                ));
-            }
-        }
+		if let Some(effort) = params
+			.reasoning_effort
+			.and_then(|effort| effort_value(&params.model, effort))
+		{
+			request_body["output_config"] = serde_json::json!({ "effort": effort });
+		}
 
-        // Create the request body
-        let mut request_body = serde_json::json!({
-            "model": params.model,
-            "messages": minimax_messages,
-        });
-        if let Some(temp) = sampling.temperature {
-            request_body["temperature"] = serde_json::json!(temp);
-        }
-        if let Some(top_p) = sampling.top_p {
-            request_body["top_p"] = serde_json::json!(top_p);
-        }
+		if let Some(thinking) = params
+			.reasoning_effort
+			.and_then(|effort| thinking_value(&params.model, effort))
+		{
+			request_body["thinking"] = thinking;
+		}
 
-        // Add max_tokens if specified (0 means don't include it in request)
-        if params.max_tokens > 0 {
-            request_body["max_tokens"] = serde_json::json!(params.max_tokens);
-        }
+		// Add system message with cache control if needed
+		if system_cached {
+			request_body["system"] = serde_json::json!([{
+				"type": "text",
+				"text": system_message,
+				"cache_control": {
+					"type": "ephemeral"
+				}
+			}]);
+		} else {
+			request_body["system"] = serde_json::json!(system_message);
+		}
 
-        // Add system message with cache control if needed
-        if system_cached {
-            request_body["system"] = serde_json::json!([{
-                "type": "text",
-                "text": system_message,
-                "cache_control": {
-                    "type": "ephemeral"
-                }
-            }]);
-        } else {
-            request_body["system"] = serde_json::json!(system_message);
-        }
+		// Add tools if available (Anthropic format)
+		if let Some(tools) = &params.tools {
+			if !tools.is_empty() {
+				// Sort tools by name for consistent ordering
+				let mut sorted_tools = tools.clone();
+				sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
 
-        // Add structured output format if specified
-        if let Some(response_format) = &params.response_format {
-            match &response_format.format {
-                crate::llm::types::OutputFormat::Json => {
-                    request_body["response_format"] = serde_json::json!({
-                        "type": "json_object"
-                    });
-                }
-                crate::llm::types::OutputFormat::JsonSchema => {
-                    if let Some(schema) = &response_format.schema {
-                        // Strict structured outputs need additionalProperties:false on
-                        // every nested object (no-op unless mode is Strict).
-                        let schema = crate::llm::utils::normalize_strict_schema(
-                            schema,
-                            response_format.mode,
-                        );
+				let minimax_tools = sorted_tools
+					.iter()
+					.map(|f| {
+						let mut tool = serde_json::json!({
+							"name": f.name,
+							"description": f.description,
+							"input_schema": f.parameters
+						});
 
-                        let mut format_obj = serde_json::json!({
-                            "type": "json_schema",
-                            "json_schema": {
-                                "schema": schema
-                            }
-                        });
+						// Add cache control if present
+						if let Some(ref cache_control) = f.cache_control {
+							tool["cache_control"] = cache_control.clone();
+						}
 
-                        // Add strict mode if specified
-                        if matches!(
-                            response_format.mode,
-                            crate::llm::types::ResponseMode::Strict
-                        ) {
-                            format_obj["json_schema"]["strict"] = serde_json::json!(true);
-                        }
+						tool
+					})
+					.collect::<Vec<_>>();
 
-                        request_body["response_format"] = format_obj;
-                    }
-                }
-            }
-        }
+				request_body["tools"] = serde_json::json!(minimax_tools);
+			}
+		}
 
-        // Add tools if available (Anthropic format)
-        if let Some(tools) = &params.tools {
-            if !tools.is_empty() {
-                // Sort tools by name for consistent ordering
-                let mut sorted_tools = tools.clone();
-                sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
+		// Execute the request with retry logic
+		let api_url = env::var(MINIMAX_API_URL_ENV).unwrap_or_else(|_| MINIMAX_API_URL.to_string());
 
-                let minimax_tools = sorted_tools
-                    .iter()
-                    .map(|f| {
-                        let mut tool = serde_json::json!({
-                            "name": f.name,
-                            "description": f.description,
-                            "input_schema": f.parameters
-                        });
+		let response = execute_minimax_request(
+			api_key,
+			api_url,
+			request_body,
+			params.max_retries,
+			params.retry_timeout,
+			params.request_timeout,
+			params.stream_timeout,
+			params.cancellation_token.as_ref(),
+			params.extra_headers.clone(),
+			params.api_key.as_ref(),
+			params.retry_observer.as_ref(),
+		)
+		.await?;
 
-                        // Add cache control if present
-                        if let Some(ref cache_control) = f.cache_control {
-                            tool["cache_control"] = cache_control.clone();
-                        }
-
-                        tool
-                    })
-                    .collect::<Vec<_>>();
-
-                request_body["tools"] = serde_json::json!(minimax_tools);
-            }
-        }
-
-        // Execute the request with retry logic
-        let api_url = env::var(MINIMAX_API_URL_ENV).unwrap_or_else(|_| MINIMAX_API_URL.to_string());
-
-        let response = execute_minimax_request(
-            api_key,
-            api_url,
-            request_body,
-            params.max_retries,
-            params.retry_timeout,
-            params.request_timeout,
-            params.cancellation_token.as_ref(),
-            params.extra_headers.clone(),
-        )
-        .await?;
-
-        Ok(response)
-    }
+		Ok(response)
+	}
 }
 
 // MiniMax API structures (same as Anthropic)
 #[derive(Serialize, Deserialize, Debug)]
 struct MinimaxMessage {
-    role: String,
-    content: Vec<MinimaxContent>,
+	role: String,
+	content: Vec<MinimaxContent>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
 enum MinimaxContent {
-    #[serde(rename = "text")]
-    Text {
-        text: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<serde_json::Value>,
-    },
-    #[serde(rename = "image")]
-    Image { source: serde_json::Value },
-    #[serde(rename = "video")]
-    Video { source: serde_json::Value },
-    #[serde(rename = "tool_result")]
-    ToolResult {
-        tool_use_id: String,
-        content: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<serde_json::Value>,
-    },
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
+	#[serde(rename = "text")]
+	Text {
+		text: String,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		cache_control: Option<serde_json::Value>,
+	},
+	#[serde(rename = "image")]
+	Image { source: serde_json::Value },
+	#[serde(rename = "video")]
+	Video { source: serde_json::Value },
+	#[serde(rename = "tool_result")]
+	ToolResult {
+		tool_use_id: String,
+		content: serde_json::Value,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		cache_control: Option<serde_json::Value>,
+	},
+	#[serde(rename = "tool_use")]
+	ToolUse {
+		id: String,
+		name: String,
+		input: serde_json::Value,
+	},
 }
 
 #[derive(Deserialize, Debug)]
 struct MinimaxResponse {
-    id: String,
-    content: Vec<MinimaxResponseContent>,
-    usage: MinimaxUsage,
-    #[serde(default)]
-    stop_reason: Option<String>,
+	id: String,
+	content: Vec<MinimaxResponseContent>,
+	usage: MinimaxUsage,
+	#[serde(default)]
+	stop_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type")]
 enum MinimaxResponseContent {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "thinking")]
-    Thinking { thinking: String },
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
+	#[serde(rename = "text")]
+	Text { text: String },
+	#[serde(rename = "thinking")]
+	Thinking { thinking: String },
+	#[serde(rename = "tool_use")]
+	ToolUse {
+		id: String,
+		name: String,
+		input: serde_json::Value,
+	},
 }
 
 #[derive(Deserialize, Debug)]
 struct MinimaxUsage {
-    input_tokens: u64,
-    output_tokens: u64,
-    #[serde(default)]
-    cache_creation_input_tokens: Option<u64>,
-    #[serde(default)]
-    cache_read_input_tokens: Option<u64>,
+	input_tokens: u64,
+	output_tokens: u64,
+	#[serde(default)]
+	cache_creation_input_tokens: Option<u64>,
+	#[serde(default)]
+	cache_read_input_tokens: Option<u64>,
 }
 
 // Convert our session messages to MiniMax format (same as Anthropic)
 fn convert_messages(messages: &[Message]) -> Vec<MinimaxMessage> {
-    let mut result = Vec::new();
-    let mut index = 0;
+	let mut result = Vec::new();
+	let mut index = 0;
 
-    while index < messages.len() {
-        let message = &messages[index];
+	while index < messages.len() {
+		let message = &messages[index];
 
-        // Skip system messages - they're handled separately
-        if message.role == "system" {
-            index += 1;
-            continue;
-        }
+		// Skip system messages - they're handled separately
+		if message.role == "system" {
+			index += 1;
+			continue;
+		}
 
-        match message.role.as_str() {
-            "tool" => {
-                let mut content = Vec::new();
+		match message.role.as_str() {
+			"tool" => {
+				let mut content = Vec::new();
 
-                while index < messages.len() && messages[index].role == "tool" {
-                    let tool_message = &messages[index];
-                    let tool_call_id = tool_message.tool_call_id.as_deref().unwrap_or("");
+				while index < messages.len() && messages[index].role == "tool" {
+					let tool_message = &messages[index];
+					let tool_call_id = tool_message.tool_call_id.as_deref().unwrap_or("");
 
-                    content.push(MinimaxContent::ToolResult {
-                        tool_use_id: tool_call_id.to_string(),
-                        content: tool_message.content.clone(),
-                        cache_control: shared::maybe_ephemeral_cache_control(tool_message.cached),
-                    });
-                    index += 1;
-                }
+					content.push(MinimaxContent::ToolResult {
+						tool_use_id: tool_call_id.to_string(),
+						content: shared::anthropic_tool_content(tool_message),
+						cache_control: shared::maybe_ephemeral_cache_control(tool_message.cached),
+					});
+					index += 1;
+				}
 
-                if index < messages.len() && messages[index].role == "user" {
-                    append_regular_content(&messages[index], &mut content);
-                    index += 1;
-                }
+				if index < messages.len() && messages[index].role == "user" {
+					append_regular_content(&messages[index], &mut content);
+					index += 1;
+				}
 
-                result.push(MinimaxMessage {
-                    role: "user".to_string(),
-                    content,
-                });
-            }
-            "assistant" if message.tool_calls.is_some() => {
-                // Assistant message with tool calls - reconstruct tool_use blocks
-                let mut content = Vec::new();
+				result.push(MinimaxMessage {
+					role: "user".to_string(),
+					content,
+				});
+			}
+			"assistant" if message.tool_calls.is_some() => {
+				// Assistant message with tool calls - reconstruct tool_use blocks
+				let mut content = Vec::new();
 
-                // Add text content if not empty
-                if !message.content.trim().is_empty() {
-                    content.push(MinimaxContent::Text {
-                        text: message.content.clone(),
-                        cache_control: shared::maybe_ephemeral_cache_control(message.cached),
-                    });
-                }
+				// Add text content if not empty
+				if !message.content.trim().is_empty() {
+					content.push(MinimaxContent::Text {
+						text: message.content.clone(),
+						cache_control: shared::maybe_ephemeral_cache_control(message.cached),
+					});
+				}
 
-                // Add tool_use blocks from stored tool_calls in unified GenericToolCall format
-                for call in
-                    shared::parse_generic_tool_calls_lossy(message.tool_calls.as_ref(), "minimax")
-                {
-                    content.push(MinimaxContent::ToolUse {
-                        id: call.id,
-                        name: call.name,
-                        input: call.arguments,
-                    });
-                }
+				// Add tool_use blocks from stored tool_calls in unified GenericToolCall format
+				for call in shared::parse_generic_tool_calls_lossy(message.tool_calls.as_ref(), "minimax") {
+					content.push(MinimaxContent::ToolUse {
+						id: call.id,
+						name: call.name,
+						input: call.arguments,
+					});
+				}
 
-                result.push(MinimaxMessage {
-                    role: message.role.clone(),
-                    content,
-                });
-                index += 1;
-            }
-            _ => {
-                // Handle regular user and assistant messages
-                let mut content = Vec::new();
-                append_regular_content(message, &mut content);
+				result.push(MinimaxMessage {
+					role: message.role.clone(),
+					content,
+				});
+				index += 1;
+			}
+			_ => {
+				// Handle regular user and assistant messages
+				let mut content = Vec::new();
+				append_regular_content(message, &mut content);
 
-                // Skip messages with no content blocks — an empty array is invalid
-                if !content.is_empty() {
-                    result.push(MinimaxMessage {
-                        role: message.role.clone(),
-                        content,
-                    });
-                }
-                index += 1;
-            }
-        }
-    }
+				// Skip messages with no content blocks — an empty array is invalid
+				if !content.is_empty() {
+					result.push(MinimaxMessage {
+						role: message.role.clone(),
+						content,
+					});
+				}
+				index += 1;
+			}
+		}
+	}
 
-    result
+	result
 }
 
 fn append_regular_content(message: &Message, content: &mut Vec<MinimaxContent>) {
-    // Skip empty text blocks — Anthropic-compatible APIs reject them
-    if !message.content.trim().is_empty() {
-        content.push(MinimaxContent::Text {
-            text: message.content.clone(),
-            cache_control: shared::maybe_ephemeral_cache_control(message.cached),
-        });
-    }
+	// Skip empty text blocks — Anthropic-compatible APIs reject them
+	if !message.content.trim().is_empty() {
+		content.push(MinimaxContent::Text {
+			text: message.content.clone(),
+			cache_control: shared::maybe_ephemeral_cache_control(message.cached),
+		});
+	}
 
-    // Add image attachments (MiniMax-M3 multimodal)
-    if let Some(images) = &message.images {
-        for image in images {
-            let source = match &image.data {
-                ImageData::Base64(data) => serde_json::json!({
-                    "type": "base64",
-                    "media_type": image.media_type,
-                    "data": data,
-                }),
-                ImageData::Url(url) => serde_json::json!({
-                    "type": "url",
-                    "url": url,
-                }),
-            };
-            content.push(MinimaxContent::Image { source });
-        }
-    }
+	// Add image attachments (MiniMax-M3 multimodal)
+	if let Some(images) = &message.images {
+		for image in images {
+			let source = match &image.data {
+				ImageData::Base64(data) => serde_json::json!({
+					"type": "base64",
+					"media_type": image.media_type,
+					"data": data,
+				}),
+				ImageData::Url(url) => serde_json::json!({
+					"type": "url",
+					"url": url,
+				}),
+			};
+			content.push(MinimaxContent::Image { source });
+		}
+	}
 
-    // Add video attachments (MiniMax-M3 multimodal)
-    if let Some(videos) = &message.videos {
-        for video in videos {
-            let source = match &video.data {
-                VideoData::Base64(data) => serde_json::json!({
-                    "type": "base64",
-                    "media_type": video.media_type,
-                    "data": data,
-                }),
-                VideoData::Url(url) => serde_json::json!({
-                    "type": "url",
-                    "url": url,
-                }),
-            };
-            content.push(MinimaxContent::Video { source });
-        }
-    }
+	// Add video attachments (MiniMax-M3 multimodal)
+	if let Some(videos) = &message.videos {
+		for video in videos {
+			let source = match &video.data {
+				VideoData::Base64(data) => serde_json::json!({
+					"type": "base64",
+					"media_type": video.media_type,
+					"data": data,
+				}),
+				VideoData::Url(url) => serde_json::json!({
+					"type": "url",
+					"url": url,
+				}),
+			};
+			content.push(MinimaxContent::Video { source });
+		}
+	}
 }
 
 // Execute a single MiniMax HTTP request with smart retry delay calculation
 #[allow(clippy::too_many_arguments)]
 async fn execute_minimax_request(
-    api_key: String,
-    api_url: String,
-    request_body: serde_json::Value,
-    max_retries: u32,
-    base_timeout: std::time::Duration,
-    request_timeout: Option<std::time::Duration>,
-    cancellation_token: Option<&tokio::sync::watch::Receiver<bool>>,
-    extra_headers: Option<std::collections::HashMap<String, String>>,
+	api_key: String,
+	api_url: String,
+	request_body: serde_json::Value,
+	max_retries: u32,
+	base_timeout: std::time::Duration,
+	request_timeout: Option<std::time::Duration>,
+	stream_timeout: Option<std::time::Duration>,
+	cancellation_token: Option<&tokio::sync::watch::Receiver<bool>>,
+	extra_headers: Option<std::collections::HashMap<String, String>>,
+	per_call_api_key: Option<&crate::llm::types::PerCallApiKey>,
+	retry_observer: Option<&crate::llm::retry::RetryObserver>,
 ) -> Result<ProviderResponse> {
-    let start_time = std::time::Instant::now();
+	let start_time = std::time::Instant::now();
 
-    let response = retry::retry_with_exponential_backoff(
-        || {
-            let client = shared::http_client();
-            let extra_headers = extra_headers.clone();
-            let api_key = api_key.clone();
-            let api_url = api_url.clone();
-            let request_body = request_body.clone();
-            Box::pin(async move {
-                let req = client
-                    .post(&api_url)
-                    .header("Content-Type", "application/json")
-                    .header("Authorization", format!("Bearer {}", api_key))
-                    .header("anthropic-version", "2023-06-01")
-                    .json(&request_body);
+	let response = retry::retry_provider_request(
+		|| {
+			let client = shared::http_client();
+			let extra_headers = extra_headers.clone();
+			let api_key = api_key.clone();
+			let api_url = api_url.clone();
+			let request_body = request_body.clone();
+			Box::pin(async move {
+				let req = client
+					.post(&api_url)
+					.header("Content-Type", "application/json")
+					.bearer_auth(&api_key)
+					.header("anthropic-version", "2023-06-01")
+					.json(&request_body);
 
-                let captured =
-                    shared::send_and_read(req, request_timeout, extra_headers.as_ref()).await?;
+				let captured = super::streaming::send_and_read(
+					req,
+					request_timeout,
+					stream_timeout,
+					extra_headers.as_ref(),
+					super::streaming::Format::Messages,
+				)
+				.await?;
 
-                // Return Err for retryable HTTP errors so the retry loop catches them
-                if retry::is_retryable_status(captured.status.as_u16()) {
-                    return Err(anyhow::anyhow!(
-                        "MiniMax API error {}: {}",
-                        captured.status,
-                        captured.body
-                    ));
-                }
+				// Return Err for retryable HTTP errors so the retry loop catches them
+				if retry::is_retryable_status(captured.status.as_u16()) {
+					return Err(retry::retryable_status_error(
+						&captured,
+						format!("MiniMax API error {}: {}", captured.status, captured.body),
+					));
+				}
 
-                Ok(captured)
-            })
-        },
-        max_retries,
-        base_timeout,
-        cancellation_token,
-        || ProviderError::Cancelled.into(),
-        |e| {
-            matches!(
-                e.downcast_ref::<ProviderError>(),
-                Some(ProviderError::Cancelled)
-            )
-        },
-        |e: &anyhow::Error| shared::is_connection_error(e),
-    )
-    .await?;
+				Ok(captured)
+			})
+		},
+		max_retries,
+		base_timeout,
+		cancellation_token,
+		per_call_api_key,
+		retry_observer,
+	)
+	.await?;
 
-    let request_time_ms = start_time.elapsed().as_millis() as u64;
+	let request_time_ms = start_time.elapsed().as_millis() as u64;
 
-    if !response.status.is_success() {
-        return Err(anyhow::anyhow!(
-            "MiniMax API error {}: {}",
-            response.status,
-            response.body
-        ));
-    }
+	if !response.status.is_success() {
+		return Err(anyhow::anyhow!(
+			"MiniMax API error {}: {}",
+			response.status,
+			response.body
+		));
+	}
 
-    let response_text = response.body;
-    let minimax_response: MinimaxResponse = serde_json::from_str(&response_text)?;
+	let minimax_response: MinimaxResponse = shared::parse_response(&response.body, per_call_api_key)?;
 
-    // Extract content, thinking blocks, and tool calls
-    let mut content_parts = Vec::new();
-    let mut thinking_parts = Vec::new();
-    let mut tool_calls = Vec::new();
+	// Extract content, thinking blocks, and tool calls
+	let mut content_parts = Vec::new();
+	let mut thinking_parts = Vec::new();
+	let mut tool_calls = Vec::new();
 
-    for content in minimax_response.content {
-        match content {
-            MinimaxResponseContent::Text { text } => {
-                content_parts.push(text);
-            }
-            MinimaxResponseContent::Thinking { thinking } => {
-                thinking_parts.push(thinking);
-            }
-            MinimaxResponseContent::ToolUse { id, name, input } => {
-                // Create generic ToolCall for processing
-                tool_calls.push(ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    arguments: input,
-                });
-            }
-        }
-    }
+	for content in minimax_response.content {
+		match content {
+			MinimaxResponseContent::Text { text } => {
+				content_parts.push(text);
+			}
+			MinimaxResponseContent::Thinking { thinking } => {
+				thinking_parts.push(thinking);
+			}
+			MinimaxResponseContent::ToolUse { id, name, input } => {
+				// Create generic ToolCall for processing
+				tool_calls.push(ToolCall {
+					id: id.clone(),
+					name: name.clone(),
+					arguments: input,
+				});
+			}
+		}
+	}
 
-    // Final content is only the text parts (thinking is separate)
-    let final_content = content_parts.join("\n");
+	// Final content is only the text parts (thinking is separate)
+	let final_content = content_parts.join("\n");
 
-    // Extract thinking as a separate ThinkingBlock
-    let (thinking, reasoning_tokens) = if thinking_parts.is_empty() {
-        (None, 0)
-    } else {
-        let thinking_content = thinking_parts.join("\n\n");
-        // Estimate reasoning tokens from content length (4 chars per token)
-        let estimated = (thinking_content.len() / 4) as u64;
-        (
-            Some(ThinkingBlock {
-                content: thinking_content,
-                tokens: estimated,
-            }),
-            estimated,
-        )
-    };
+	// Extract thinking as a separate ThinkingBlock
+	let (thinking, reasoning_tokens) = if thinking_parts.is_empty() {
+		(None, 0)
+	} else {
+		let thinking_content = thinking_parts.join("\n\n");
+		// Estimate reasoning tokens from content length (4 chars per token)
+		let estimated = (thinking_content.len() / 4) as u64;
+		(
+			Some(ThinkingBlock {
+				content: thinking_content,
+				tokens: estimated,
+			}),
+			estimated,
+		)
+	};
 
-    // Calculate cost with proper cache pricing
-    let cache_read_tokens = minimax_response.usage.cache_read_input_tokens.unwrap_or(0);
+	// Calculate cost with proper cache pricing
+	let cache_read_tokens = minimax_response.usage.cache_read_input_tokens.unwrap_or(0);
 
-    let cache_creation_tokens = minimax_response
-        .usage
-        .cache_creation_input_tokens
-        .unwrap_or(0);
+	let cache_creation_tokens = minimax_response.usage.cache_creation_input_tokens.unwrap_or(0);
 
-    // CRITICAL: input_tokens from API is ALREADY clean (non-cached)
-    // According to Anthropic/MiniMax docs:
-    // - input_tokens = regular non-cached tokens only
-    // - cache_creation_input_tokens = tokens written to cache (separate)
-    // - cache_read_input_tokens = tokens read from cache (separate)
-    let input_tokens_clean = minimax_response.usage.input_tokens;
+	// CRITICAL: input_tokens from API is ALREADY clean (non-cached)
+	// According to Anthropic/MiniMax docs:
+	// - input_tokens = regular non-cached tokens only
+	// - cache_creation_input_tokens = tokens written to cache (separate)
+	// - cache_read_input_tokens = tokens read from cache (separate)
+	let input_tokens_clean = minimax_response.usage.input_tokens;
 
-    let cost = calculate_minimax_cost(
-        request_body["model"].as_str().unwrap_or(""),
-        minimax_response.usage.input_tokens as u32,
-        minimax_response.usage.output_tokens as u32,
-        cache_creation_tokens as u32,
-        cache_read_tokens as u32,
-    );
+	let cost = calculate_minimax_cost(
+		request_body["model"].as_str().unwrap_or(""),
+		minimax_response.usage.input_tokens as u32,
+		minimax_response.usage.output_tokens as u32,
+		cache_creation_tokens as u32,
+		cache_read_tokens as u32,
+	);
 
-    // MiniMax bills thinking inside output_tokens and exposes no reasoning field,
-    // so the estimate is carved out of output rather than reported alongside it.
-    let (output_tokens, reasoning_tokens) =
-        TokenUsage::split_output(minimax_response.usage.output_tokens, reasoning_tokens);
+	// MiniMax bills thinking inside output_tokens and exposes no reasoning field,
+	// so the estimate is carved out of output rather than reported alongside it.
+	let (output_tokens, reasoning_tokens) =
+		TokenUsage::split_output(minimax_response.usage.output_tokens, reasoning_tokens);
 
-    let usage = TokenUsage {
-        input_tokens: input_tokens_clean,          // CLEAN input (no cache)
-        cache_read_tokens,                         // Tokens read from cache
-        cache_write_tokens: cache_creation_tokens, // Tokens written to cache
-        output_tokens,
-        reasoning_tokens, // Estimated from thinking content
-        // input_tokens is already cache-free, so cache reads and writes are their
-        // own terms in the total.
-        total_tokens: input_tokens_clean
-            + cache_read_tokens
-            + cache_creation_tokens
-            + minimax_response.usage.output_tokens,
-        cost,
-        request_time_ms: Some(request_time_ms),
-    };
+	let usage = TokenUsage {
+		input_tokens: input_tokens_clean,          // CLEAN input (no cache)
+		cache_read_tokens,                         // Tokens read from cache
+		cache_write_tokens: cache_creation_tokens, // Tokens written to cache
+		output_tokens,
+		reasoning_tokens, // Estimated from thinking content
+		// input_tokens is already cache-free, so cache reads and writes are their
+		// own terms in the total.
+		total_tokens: input_tokens_clean
+			+ cache_read_tokens
+			+ cache_creation_tokens
+			+ minimax_response.usage.output_tokens,
+		cost,
+		request_time_ms: Some(request_time_ms),
+	};
 
-    // Create response JSON that stores tool_calls in unified GenericToolCall format
-    let mut response_json: serde_json::Value = serde_json::from_str(&response_text)?;
+	// Create response JSON that stores tool_calls in unified GenericToolCall format
+	let mut response_json: serde_json::Value = shared::parse_response(&response.body, per_call_api_key)?;
 
-    // Store tool_calls in unified GenericToolCall format for conversation history
-    shared::set_response_tool_calls(&mut response_json, &tool_calls, None);
+	// Store tool_calls in unified GenericToolCall format for conversation history
+	shared::set_response_tool_calls(&mut response_json, &tool_calls, None);
 
-    let exchange = ProviderExchange::new(request_body, response_json, Some(usage), "minimax");
+	let exchange = ProviderExchange::new(request_body, response_json, Some(usage), "minimax");
 
-    // Try to parse structured output if it was requested
-    let structured_output = shared::parse_structured_output_from_text(&final_content);
+	// Try to parse structured output if it was requested
+	let structured_output = shared::parse_structured_output_from_text(&final_content);
 
-    Ok(ProviderResponse {
-        content: final_content,
-        thinking, // Extract thinking separately
-        exchange,
-        tool_calls: if tool_calls.is_empty() {
-            None
-        } else {
-            Some(tool_calls)
-        },
-        finish_reason: minimax_response.stop_reason,
-        structured_output,
-        id: Some(minimax_response.id),
-    })
+	Ok(ProviderResponse {
+		content: final_content,
+		thinking, // Extract thinking separately
+		exchange,
+		tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+		finish_reason: minimax_response.stop_reason,
+		structured_output,
+		id: Some(minimax_response.id),
+	})
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_model_support() {
-        let provider = MinimaxProvider::new();
-        assert!(provider.supports_model("MiniMax-M3"));
-        assert!(provider.supports_model("MiniMax-M3-highspeed"));
-        assert!(provider.supports_model("MiniMax-M2.5"));
-        assert!(provider.supports_model("MiniMax-M2.5-highspeed"));
-        assert!(provider.supports_model("MiniMax-M2.5-lightning"));
-        assert!(provider.supports_model("MiniMax-M2.1"));
-        assert!(provider.supports_model("MiniMax-M2.1-lightning"));
-        assert!(provider.supports_model("MiniMax-M2"));
-        assert!(!provider.supports_model("gpt-4"));
-        assert!(!provider.supports_model("claude-3"));
-    }
-
-    #[test]
-    fn test_model_support_case_insensitive() {
-        let provider = MinimaxProvider::new();
-        // Test lowercase
-        assert!(provider.supports_model("minimax-m2.5"));
-        assert!(provider.supports_model("minimax-m2.5-highspeed"));
-        assert!(provider.supports_model("minimax-m2.5-lightning"));
-        assert!(provider.supports_model("minimax-m2.1"));
-        assert!(provider.supports_model("minimax-m2.1-lightning"));
-        assert!(provider.supports_model("minimax-m2"));
-        // Test uppercase
-        assert!(provider.supports_model("MINIMAX-M2.5"));
-        assert!(provider.supports_model("MINIMAX-M2.1"));
-        assert!(provider.supports_model("MINIMAX-M2"));
-        // Test mixed case
-        assert!(provider.supports_model("Minimax-M2.5"));
-        assert!(provider.supports_model("MINIMAX-m2.1"));
-    }
-
-    #[test]
-    fn test_cost_calculation() {
-        // Test MiniMax-M3: $0.30 input, $1.20 output (permanent 50% off ≤512K)
-        let cost = calculate_minimax_cost("MiniMax-M3", 500_000, 1_000_000, 0, 0);
-        assert!((cost.unwrap() - 1.35).abs() < 1e-9); // 0.15 (0.30 × 0.5M) + 1.20
-
-        // Test MiniMax-M3 above 512K: standard rate $0.60 input, $2.40 output
-        let cost = calculate_minimax_cost("MiniMax-M3", 1_000_000, 1_000_000, 0, 0);
-        assert_eq!(cost, Some(3.00)); // 0.60 + 2.40
-
-        // Test MiniMax-M3-highspeed: same rate
-        let cost = calculate_minimax_cost("MiniMax-M3-highspeed", 500_000, 1_000_000, 0, 0);
-        assert!((cost.unwrap() - 1.35).abs() < 1e-9); // 0.15 (0.30 × 0.5M) + 1.20
-
-        // Test MiniMax-M2.5: $0.30 input, $1.20 output (Feb 2026)
-        let cost = calculate_minimax_cost("MiniMax-M2.5", 1_000_000, 1_000_000, 0, 0);
-        assert_eq!(cost, Some(1.50)); // 0.30 + 1.20
-
-        // Test MiniMax-M2.5-highspeed: $0.60 input, $2.40 output (Feb 2026)
-        let cost = calculate_minimax_cost("MiniMax-M2.5-highspeed", 1_000_000, 1_000_000, 0, 0);
-        assert_eq!(cost, Some(3.00)); // 0.60 + 2.40
-
-        // Test MiniMax-M2.5-lightning alias: same as highspeed
-        let cost = calculate_minimax_cost("MiniMax-M2.5-lightning", 1_000_000, 1_000_000, 0, 0);
-        assert_eq!(cost, Some(3.00)); // 0.60 + 2.40
-
-        // Test MiniMax-M2.1: $0.30 input, $1.20 output
-        let cost = calculate_minimax_cost("MiniMax-M2.1", 1_000_000, 1_000_000, 0, 0);
-        assert_eq!(cost, Some(1.50)); // 0.30 + 1.20
-
-        // Test MiniMax-M2.1-lightning: $0.60 input, $2.40 output
-        let cost = calculate_minimax_cost("MiniMax-M2.1-lightning", 1_000_000, 1_000_000, 0, 0);
-        assert_eq!(cost, Some(3.00)); // 0.60 + 2.40
-
-        // Test MiniMax-M2: $0.30 input, $1.20 output
-        let cost = calculate_minimax_cost("MiniMax-M2", 1_000_000, 1_000_000, 0, 0);
-        assert_eq!(cost, Some(1.50)); // 0.30 + 1.20
-    }
-
-    #[test]
-    fn test_provider_capabilities() {
-        let provider = MinimaxProvider::new();
-        assert!(provider.supports_caching("MiniMax-M2.1"));
-        assert!(!provider.supports_vision("MiniMax-M2.1"));
-        assert!(!provider.supports_video("MiniMax-M2.1"));
-        assert!(!provider.supports_structured_output("MiniMax-M2.1"));
-
-        // MiniMax-M3 is natively multimodal (image + video)
-        assert!(provider.supports_vision("MiniMax-M3"));
-        assert!(provider.supports_vision("MiniMax-M3-highspeed"));
-        assert!(provider.supports_video("MiniMax-M3"));
-        assert!(provider.supports_caching("MiniMax-M3"));
-    }
-
-    #[test]
-    fn parallel_tool_results_share_one_user_message() {
-        let mut assistant = Message::assistant("");
-        assistant.tool_calls = Some(serde_json::json!([
-            {"id": "toolu_a", "name": "first", "arguments": {}, "meta": null},
-            {"id": "toolu_b", "name": "second", "arguments": {}, "meta": null}
-        ]));
-
-        let messages = vec![
-            assistant,
-            Message::tool("result A", "toolu_a", "first"),
-            Message::tool("result B", "toolu_b", "second"),
-        ];
-
-        let converted = convert_messages(&messages);
-        assert_eq!(converted.len(), 2);
-        assert_eq!(converted[0].role, "assistant");
-        assert_eq!(converted[1].role, "user");
-
-        let user_content = serde_json::to_value(&converted[1].content).unwrap();
-        let blocks = user_content.as_array().unwrap();
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0]["type"], "tool_result");
-        assert_eq!(blocks[0]["tool_use_id"], "toolu_a");
-        assert_eq!(blocks[1]["type"], "tool_result");
-        assert_eq!(blocks[1]["tool_use_id"], "toolu_b");
-    }
-
-    #[test]
-    fn tool_results_merge_following_user_hint() {
-        let messages = vec![
-            Message::tool("result A", "toolu_a", "first"),
-            Message::tool("result B", "toolu_b", "second"),
-            Message::user("Please use those results."),
-        ];
-
-        let converted = convert_messages(&messages);
-        assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].role, "user");
-
-        let content = serde_json::to_value(&converted[0].content).unwrap();
-        let blocks = content.as_array().unwrap();
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0]["tool_use_id"], "toolu_a");
-        assert_eq!(blocks[1]["tool_use_id"], "toolu_b");
-        assert_eq!(blocks[2]["type"], "text");
-        assert_eq!(blocks[2]["text"], "Please use those results.");
-    }
-}
+#[path = "minimax_tests.rs"]
+mod tests;
