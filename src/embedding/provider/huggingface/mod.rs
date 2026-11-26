@@ -43,6 +43,7 @@
 
 mod jina_code_bert;
 mod mpnet;
+mod xlm_roberta;
 
 #[cfg(feature = "huggingface")]
 use anyhow::{Context, Result};
@@ -61,13 +62,15 @@ use candle_transformers::models::qwen2::{Config as Qwen2Config, Model as Qwen2Mo
 #[cfg(feature = "huggingface")]
 use candle_transformers::models::qwen3::{Config as Qwen3Config, Model as Qwen3Model};
 #[cfg(feature = "huggingface")]
-use candle_transformers::models::xlm_roberta::{Config as XLMRobertaConfig, XLMRobertaModel};
+use candle_transformers::models::xlm_roberta::Config as XLMRobertaConfig;
 #[cfg(feature = "huggingface")]
 use hf_hub::{api::tokio::ApiBuilder, Repo, RepoType};
 #[cfg(feature = "huggingface")]
 use jina_code_bert::JinaCodeBertModel;
 #[cfg(feature = "huggingface")]
 use mpnet::{MPNetConfig, MPNetModel};
+#[cfg(feature = "huggingface")]
+use xlm_roberta::XLMRobertaEncoder;
 #[cfg(feature = "huggingface")]
 use serde::Deserialize;
 #[cfg(feature = "huggingface")]
@@ -215,7 +218,7 @@ impl ModelArchitecture {
 #[cfg(feature = "huggingface")]
 enum Backend {
 	Bert(BertModel),
-	Roberta(XLMRobertaModel),
+	Roberta(XLMRobertaEncoder),
 	JinaBert(JinaBertModel),
 	// Qwen2Model::forward takes &mut self, so wrap in Mutex for shared access
 	Qwen2(std::sync::Mutex<Qwen2Model>),
@@ -456,7 +459,7 @@ impl HuggingFaceModel {
 				let config: XLMRobertaConfig = serde_json::from_str(&config_content)
 					.with_context(|| "Failed to parse config.json as RoBERTa config")?;
 				let model =
-					XLMRobertaModel::new(&config, var_builder).with_context(|| "Failed to load RoBERTa model")?;
+					XLMRobertaEncoder::new(&config, var_builder).with_context(|| "Failed to load RoBERTa model")?;
 				Backend::Roberta(model)
 			}
 			ModelArchitecture::JinaBert => {
@@ -540,19 +543,7 @@ impl HuggingFaceModel {
 					let output = model.forward(&token_ids, &token_type_ids, Some(&attention_mask))?;
 					Self::mean_pool_and_normalize(&output, &attention_mask)?
 				}
-				Backend::Roberta(model) => {
-					let encoding = tokenizer
-						.encode(text.as_str(), true)
-						.map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
-					let tokens = encoding.get_ids();
-					let token_ids = Tensor::new(tokens, device)?.unsqueeze(0)?;
-					let token_type_ids = Tensor::zeros_like(&token_ids)?;
-					let attention_mask = Tensor::ones((1, tokens.len()), DType::F32, device)?;
-					// XLMRobertaModel.forward: (input_ids, attention_mask, token_type_ids, ...)
-					let output = model.forward(&token_ids, &attention_mask, &token_type_ids, None, None, None)?;
-					let attention_mask_u8 = Tensor::ones((1, tokens.len()), DType::U8, device)?;
-					Self::mean_pool_and_normalize(&output, &attention_mask_u8)?
-				}
+				Backend::Roberta(_) => unreachable!("encode_batch_roberta handles XLM-R"),
 				Backend::JinaBert(model) => {
 					let encoding = tokenizer
 						.encode(text.as_str(), true)
@@ -620,7 +611,7 @@ impl HuggingFaceModel {
 	/// device sync per batch instead of per text. Pad tokens carry the padding id so position ids
 	/// skip them, and the mask excludes them from attention and pooling, so each vector matches the
 	/// one-text-at-a-time result.
-	fn encode_batch_roberta(&self, model: &XLMRobertaModel, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+	fn encode_batch_roberta(&self, model: &XLMRobertaEncoder, texts: &[String]) -> Result<Vec<Vec<f32>>> {
 		const BATCH_TOKENS: usize = 16_384;
 		let encodings = self
 			.tokenizer
@@ -647,15 +638,7 @@ impl HuggingFaceModel {
 			}
 			let token_ids = Tensor::from_vec(ids, (rows.len(), len), &self.device)?;
 			let mask_u8 = Tensor::from_vec(mask, (rows.len(), len), &self.device)?;
-			let token_type_ids = Tensor::zeros_like(&token_ids)?;
-			let output = model.forward(
-				&token_ids,
-				&mask_u8.to_dtype(DType::F32)?,
-				&token_type_ids,
-				None,
-				None,
-				None,
-			)?;
+			let output = model.forward(&token_ids, &mask_u8)?;
 			for (v, &k) in Self::mean_pool_batch(&output, &mask_u8)?.into_iter().zip(rows) {
 				out[k] = v;
 			}
