@@ -519,6 +519,9 @@ impl HuggingFaceModel {
 
 	/// Generate embeddings for multiple texts
 	pub fn encode_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+		if let Backend::Roberta(model) = &self.backend {
+			return self.encode_batch_roberta(model, texts);
+		}
 		let mut all_embeddings = Vec::new();
 		let tokenizer = &*self.tokenizer;
 		let device = &self.device;
@@ -613,8 +616,61 @@ impl HuggingFaceModel {
 		Ok(all_embeddings)
 	}
 
+	/// XLM-R in padded, length-sorted batches under a token budget: one forward pass and one
+	/// device sync per batch instead of per text. Pad tokens carry the padding id so position ids
+	/// skip them, and the mask excludes them from attention and pooling, so each vector matches the
+	/// one-text-at-a-time result.
+	fn encode_batch_roberta(&self, model: &XLMRobertaModel, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+		const BATCH_TOKENS: usize = 16_384;
+		let encodings = self
+			.tokenizer
+			.encode_batch(texts.to_vec(), true)
+			.map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
+		let pad = self.tokenizer.token_to_id("<pad>").unwrap_or(1);
+		let mut order: Vec<usize> = (0..encodings.len()).collect();
+		order.sort_by_key(|&i| encodings[i].get_ids().len());
+		let mut out = vec![Vec::new(); encodings.len()];
+		let mut i = 0;
+		while i < order.len() {
+			let mut j = i + 1;
+			while j < order.len() && (j - i + 1) * encodings[order[j]].get_ids().len() <= BATCH_TOKENS {
+				j += 1;
+			}
+			let rows = &order[i..j];
+			let len = encodings[order[j - 1]].get_ids().len();
+			let mut ids = vec![pad; rows.len() * len];
+			let mut mask = vec![0u8; rows.len() * len];
+			for (r, &k) in rows.iter().enumerate() {
+				let t = encodings[k].get_ids();
+				ids[r * len..r * len + t.len()].copy_from_slice(t);
+				mask[r * len..r * len + t.len()].fill(1);
+			}
+			let token_ids = Tensor::from_vec(ids, (rows.len(), len), &self.device)?;
+			let mask_u8 = Tensor::from_vec(mask, (rows.len(), len), &self.device)?;
+			let token_type_ids = Tensor::zeros_like(&token_ids)?;
+			let output = model.forward(
+				&token_ids,
+				&mask_u8.to_dtype(DType::F32)?,
+				&token_type_ids,
+				None,
+				None,
+				None,
+			)?;
+			for (v, &k) in Self::mean_pool_batch(&output, &mask_u8)?.into_iter().zip(rows) {
+				out[k] = v;
+			}
+			i = j;
+		}
+		Ok(out)
+	}
+
 	/// Mean pooling + L2 normalization to produce a sentence embedding
 	fn mean_pool_and_normalize(hidden_states: &Tensor, attention_mask: &Tensor) -> Result<Vec<f32>> {
+		Ok(Self::mean_pool_batch(hidden_states, attention_mask)?.remove(0))
+	}
+
+	/// Mean pooling + L2 normalization, one vector per batch row
+	fn mean_pool_batch(hidden_states: &Tensor, attention_mask: &Tensor) -> Result<Vec<Vec<f32>>> {
 		// Convert attention mask to f32.
 		// candle's mul requires exact shape match (no implicit broadcasting), so we expand the mask
 		// to (batch, seq_len, hidden_size) before multiplying with hidden_states.
@@ -635,7 +691,7 @@ impl HuggingFaceModel {
 		let norm = mean_pooled.sqr()?.sum_keepdim(1)?.sqrt()?;
 		let normalized = mean_pooled.broadcast_div(&norm)?;
 
-		Ok(normalized.squeeze(0)?.to_vec1::<f32>()?)
+		Ok(normalized.to_vec2::<f32>()?)
 	}
 
 	/// Qwen3 Embedding uses the final hidden state, followed by L2 normalization.
