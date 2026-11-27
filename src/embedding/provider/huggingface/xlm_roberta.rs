@@ -93,8 +93,6 @@ impl Layer {
 	}
 }
 
-/// (b, heads, l, d) -> (b, l, heads*d). On Metal per text a cat of contiguous head blocks (copy2d
-/// kernel) is ~1.8x faster than candle's strided 4-D transpose copy (measured, xlmr_op_profile).
 fn merge_heads(ctx: &Tensor) -> Result<Tensor> {
 	let (b, heads, l, d) = ctx.dims4()?;
 	if !ctx.device().is_metal() || !ctx.is_contiguous() {
