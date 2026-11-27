@@ -252,7 +252,7 @@ const MM2D_SRC: &str = r#"
 using namespace metal;
 using namespace mpp::tensor_ops;
 kernel void mm2d(device half* x [[buffer(0)]], device half* w [[buffer(1)]], device half* out [[buffer(2)]],
-                 constant uint3& dims [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]]) {
+                 constant packed_uint3& dims [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]]) {
     int K = dims.x, N = dims.y, M = dims.z;
     tensor<device half, dextents<int32_t, 2>, tensor_inline> A(x, dextents<int32_t, 2>(K, M));
     tensor<device half, dextents<int32_t, 2>, tensor_inline> B(w, dextents<int32_t, 2>(K, N));
@@ -273,6 +273,10 @@ fn mm2d_pipeline(device: &candle_core::MetalDevice) -> Option<&'static ComputePi
 		if std::env::var("OCTOLIB_XLMR_MM2D").is_ok_and(|v| v == "0") {
 			return Err("disabled by OCTOLIB_XLMR_MM2D=0".to_string());
 		}
+		let major = std::process::Command::new("sw_vers").arg("-productVersion").output().ok().and_then(|o| String::from_utf8_lossy(&o.stdout).split('.').next()?.trim().parse::<u32>().ok()).unwrap_or(0);
+		if major < 26 {
+			return Err(format!("Metal 4 needs macOS 26, found {major}"));
+		}
 		let dev = device.metal_device();
 		let opts = objc2_metal::MTLCompileOptions::new();
 		opts.setLanguageVersion(objc2_metal::MTLLanguageVersion::Version4_0);
@@ -281,6 +285,10 @@ fn mm2d_pipeline(device: &candle_core::MetalDevice) -> Option<&'static ComputePi
 		dev.new_compute_pipeline_state_with_function(&f).map_err(|e| e.to_string())
 	})
 	.as_ref()
+	.map_err(|e| {
+		static WARNED: std::sync::Once = std::sync::Once::new();
+		WARNED.call_once(|| eprintln!("octolib: mm2d unavailable, using candle GEMM: {e}"));
+	})
 	.ok()
 }
 
@@ -321,11 +329,11 @@ pub fn matmul_nt(x: &Tensor, w: &Tensor) -> Option<Result<Tensor>> {
 	}
 	static KNOBS: std::sync::OnceLock<(usize, Option<Vec<String>>)> = std::sync::OnceLock::new();
 	let (max_m, shapes) = KNOBS.get_or_init(|| {
-		let max_m = std::env::var("OCTOLIB_XLMR_MM2D_MAX_M").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+		let max_m = std::env::var("OCTOLIB_XLMR_MM2D_MAX_M").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
 		let shapes = std::env::var("OCTOLIB_XLMR_MM2D_SHAPES").ok().map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
 		(max_m, shapes)
 	});
-	if x.dim(0).ok()? > *max_m {
+	if x.dim(0).ok()? > *max_m || x.layout().start_offset() % 8 != 0 || w.layout().start_offset() % 8 != 0 {
 		return None;
 	}
 	if let Some(list) = shapes {
@@ -346,12 +354,27 @@ mod tests {
 	fn mm2d_matches_candle_or_falls_back() -> candle_core::Result<()> {
 		let Ok(dev) = Device::new_metal(0) else { return Ok(()) };
 		let w = Tensor::randn(0f32, 0.1, (96, 70), &dev)?.to_dtype(DType::F16)?;
-		for m in [1usize, 25, 600] {
+		let probe = Tensor::zeros((2, 70), DType::F16, &dev)?;
+		if super::matmul_nt(&probe, &w).is_none() {
+			return Ok(());
+		}
+		let bulk = Tensor::zeros((600, 70), DType::F16, &dev)?;
+		assert!(super::matmul_nt(&bulk, &w).is_none(), "M above the default threshold 256 must use candle");
+		for m in [1usize, 25, 256] {
 			let x = Tensor::randn(0f32, 1.0, (m, 70), &dev)?.to_dtype(DType::F16)?;
 			let Some(got) = super::matmul_nt(&x, &w) else { return Ok(()) };
 			let d = (got?.to_dtype(DType::F32)? - x.matmul(&w.t()?)?.to_dtype(DType::F32)?)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
 			assert!(d <= 0.05, "mm2d m={m} max|diff|={d}");
 		}
+		for (n, k, m) in [(1024usize, 1024usize, 25usize), (1024, 4096, 25), (4096, 1024, 256), (64, 1, 3), (64, 15, 31), (64, 33, 33)] {
+			let w = Tensor::randn(0f32, 0.1, (n, k), &dev)?.to_dtype(DType::F16)?;
+			let x = Tensor::randn(0f32, 1.0, (m, k), &dev)?.to_dtype(DType::F16)?;
+			let Some(got) = super::matmul_nt(&x, &w) else { return Ok(()) };
+			let d = (got?.to_dtype(DType::F32)? - x.matmul(&w.t()?)?.to_dtype(DType::F32)?)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+			assert!(d <= 0.05 * (k as f32).sqrt().max(1.0), "mm2d {n}x{k} m={m} max|diff|={d}");
+		}
+		let shifted = Tensor::randn(0f32, 1.0, (4, 64), &dev)?.to_dtype(DType::F16)?.reshape(256)?.narrow(0, 4, 128)?.reshape((2, 64))?;
+		assert!(super::matmul_nt(&shifted, &Tensor::zeros((32, 64), DType::F16, &dev)?).is_none(), "start_offset not a multiple of 8 must fall back");
 		let odd = Tensor::randn(0f32, 0.1, (90, 70), &dev)?.to_dtype(DType::F16)?;
 		assert!(super::matmul_nt(&Tensor::zeros((4, 70), DType::F16, &dev)?, &odd).is_none(), "N not a multiple of 32 must fall back");
 		Ok(())
