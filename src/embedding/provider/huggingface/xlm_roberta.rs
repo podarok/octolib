@@ -71,16 +71,22 @@ impl Layer {
 		})
 	}
 
+	/// Metal SDPA reads the transposed view directly (exact, measured); only the matmul path needs a copy.
 	fn split_heads(&self, x: &Tensor) -> Result<Tensor> {
 		let (b, l, _) = x.dims3()?;
-		x.reshape((b, l, self.heads, self.head_dim))?.transpose(1, 2)?.contiguous()
+		let v = x.reshape((b, l, self.heads, self.head_dim))?.transpose(1, 2)?;
+		if x.device().is_metal() {
+			Ok(v)
+		} else {
+			v.contiguous()
+		}
 	}
 
 	fn forward(&self, x: &Tensor, bias: &Tensor) -> Result<Tensor> {
 		let (b, l, h) = x.dims3()?;
-		let q = self.split_heads(&self.query.forward(x)?)?;
-		let k = self.split_heads(&self.key.forward(x)?)?;
-		let v = self.split_heads(&self.value.forward(x)?)?;
+		let q = self.split_heads(&lin(&self.query, x)?)?;
+		let k = self.split_heads(&lin(&self.key, x)?)?;
+		let v = self.split_heads(&lin(&self.value, x)?)?;
 		let scale = 1.0 / (self.head_dim as f64).sqrt();
 		let ctx = if x.device().is_metal() {
 			let mask = bias.broadcast_as((b, self.heads, l, l))?;
@@ -90,10 +96,22 @@ impl Layer {
 			candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?
 		};
 		let ctx = ctx.transpose(1, 2)?.reshape((b, l, h))?;
-		let a = self.attn_norm.forward(&(self.attn_out.forward(&ctx)? + x)?)?;
-		let i = self.act.forward(&self.inter.forward(&a)?)?;
-		self.out_norm.forward(&(self.out.forward(&i)? + &a)?)
+		let a = self.attn_norm.forward(&(lin(&self.attn_out, &ctx)? + x)?)?;
+		let i = self.act.forward(&lin(&self.inter, &a)?)?;
+		self.out_norm.forward(&(lin(&self.out, &i)? + &a)?)
 	}
+}
+
+/// `Linear::forward` with the bias expanded to a contiguous tensor before the add: candle's Metal
+/// broadcast add is ~6x slower than a contiguous add plus the expand copy (same bits).
+fn lin(l: &Linear, x: &Tensor) -> Result<Tensor> {
+	let (b, s, k) = x.dims3()?;
+	let y = x.reshape((b * s, k))?.matmul(&l.weight().t()?)?;
+	let y = match l.bias() {
+		Some(bias) => (&y + bias.broadcast_as(y.shape())?.contiguous()?)?,
+		None => y,
+	};
+	y.reshape((b, s, ()))
 }
 
 pub struct XLMRobertaEncoder {
