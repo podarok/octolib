@@ -65,6 +65,18 @@ fn main() -> candle_core::Result<()> {
         ),
         ("split heads copy", time(&dev, iters, &|| x.reshape((b, l, heads, h / heads))?.transpose(1, 2)?.contiguous())?, 0.0),
         ("softmax-free sum check", time(&dev, iters, &|| x.sum_keepdim(D::Minus1))?, 0.0),
+        ("merge copy 4d", time(&dev, iters, &|| q.transpose(1, 2)?.contiguous())?, 0.0),
+        ("merge cat heads", time(&dev, iters, &|| Tensor::cat(&(0..heads).map(|i| q.narrow(1, i, 1)?.squeeze(1)).collect::<candle_core::Result<Vec<_>>>()?, 2))?, 0.0),
+        ("merge per-batch 3d", time(&dev, iters, &|| Tensor::stack(&(0..b).map(|i| q.get(i)?.transpose(0, 1)?.contiguous()).collect::<candle_core::Result<Vec<_>>>()?, 0))?, 0.0),
+        ("merge per-batch cat (copy2d)", time(&dev, iters, &|| {
+            let per: Vec<Tensor> = (0..b)
+                .map(|i| {
+                    let qi = q.get(i)?;
+                    Tensor::cat(&(0..heads).map(|hh| qi.get(hh)).collect::<candle_core::Result<Vec<_>>>()?, 1)
+                })
+                .collect::<candle_core::Result<_>>()?;
+            Tensor::stack(&per, 0)
+        })?, 0.0),
         ("add same-shape contiguous", time(&dev, iters, &|| &x + &x)?, 0.0),
         ("bias pre-broadcast contig", time(&dev, iters, &|| &x + &bias_full)?, 0.0),
         ("bias via broadcast_as", time(&dev, iters, &|| &x + &bias_h.broadcast_as(x.shape())?)?, 0.0),

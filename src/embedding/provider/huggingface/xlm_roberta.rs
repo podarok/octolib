@@ -74,7 +74,7 @@ impl Layer {
 	}
 
 	fn forward(&self, x: &Tensor, bias: &Tensor) -> Result<Tensor> {
-		let (b, l, h) = x.dims3()?;
+		let (b, l, _) = x.dims3()?;
 		let q = self.split_heads(&lin(&self.query, x)?)?;
 		let k = self.split_heads(&lin(&self.key, x)?)?;
 		let v = self.split_heads(&lin(&self.value, x)?)?;
@@ -86,11 +86,27 @@ impl Layer {
 			let scores = (q.matmul(&k.t()?)? * scale)?.broadcast_add(bias)?;
 			candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?
 		};
-		let ctx = ctx.transpose(1, 2)?.reshape((b, l, h))?;
+		let ctx = merge_heads(&ctx)?;
 		let a = self.attn_norm.forward(&(lin(&self.attn_out, &ctx)? + x)?)?;
 		let i = self.act.forward(&lin(&self.inter, &a)?)?;
 		self.out_norm.forward(&(lin(&self.out, &i)? + &a)?)
 	}
+}
+
+/// (b, heads, l, d) -> (b, l, heads*d). On Metal per text a cat of contiguous head blocks (copy2d
+/// kernel) is ~1.8x faster than candle's strided 4-D transpose copy (measured, xlmr_op_profile).
+fn merge_heads(ctx: &Tensor) -> Result<Tensor> {
+	let (b, heads, l, d) = ctx.dims4()?;
+	if !ctx.device().is_metal() || !ctx.is_contiguous() {
+		return ctx.transpose(1, 2)?.reshape((b, l, heads * d));
+	}
+	let per = (0..b)
+		.map(|i| {
+			let c = ctx.get(i)?;
+			Tensor::cat(&(0..heads).map(|hh| c.get(hh)).collect::<Result<Vec<_>>>()?, 1)
+		})
+		.collect::<Result<Vec<_>>>()?;
+	Tensor::stack(&per, 0)
 }
 
 fn lin(l: &Linear, x: &Tensor) -> Result<Tensor> {
