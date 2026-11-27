@@ -141,7 +141,6 @@ pub fn bias_gelu(y: &Tensor, bias: &Tensor) -> Option<Result<Tensor>> {
 	fused(y, bias, None, 2)
 }
 
-/// What every kernel here assumes: Metal f16, contiguous, non-empty, start on a half4 (8-byte) boundary.
 pub fn fits(t: &Tensor) -> bool {
 	t.dtype() == DType::F16 && t.device().is_metal() && t.is_contiguous() && t.elem_count() > 0 && t.layout().start_offset() % 4 == 0
 }
