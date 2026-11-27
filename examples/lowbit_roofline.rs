@@ -11,9 +11,30 @@ const M_QUERY: usize = 25;
 const M_BULK: usize = 600;
 const LAYERS: usize = 24;
 
+static CONTROL_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+fn tool_rev() -> &'static str {
+    static REV: OnceLock<String> = OnceLock::new();
+    REV.get_or_init(|| {
+        let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(env!("CARGO_MANIFEST_DIR")).args(args).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        let rev = git(&["rev-parse", "--short", "HEAD"]);
+        let dirty = !git(&["status", "--porcelain", "--", "examples/lowbit_roofline.rs", "src"]).is_empty();
+        format!("{rev}{}", if dirty { "-dirty" } else { "" })
+    })
+}
+
+fn control(name: &str, value: f64, lo: f64, hi: f64) {
+    let ok = value >= lo && value <= hi;
+    if !ok {
+        CONTROL_OK.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    log(if ok { "info" } else { "warn" }, if ok { "control" } else { "gate" }, &format!("{}control={name} value={value:.3} expected={lo}..{hi}", if ok { "" } else { "reason=control_failed " }));
+}
+
 fn log(level: &str, event: &str, fields: &str) {
     let ts = std::process::Command::new("date").arg("+%FT%T").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
-    let line = format!("ts={ts} level={level} run=lowbit-roofline event={event} {fields}");
+    let rev = if event == "phase_start" || event == "result" { format!(" tool_rev={}", tool_rev()) } else { String::new() };
+    let line = format!("ts={ts} level={level} run=lowbit-roofline event={event}{rev} {fields}");
     eprintln!("{line}");
     if let Some(home) = std::env::var_os("HOME") {
         let p = std::path::Path::new(&home).join("Library/Application Support/ec-chats/eval/logs/lowbit-roofline.log");
@@ -269,6 +290,7 @@ fn main() -> Result<()> {
     let ms = time(&dev, 10, &|_| big.apply_op1_no_bwd(&bw))?;
     let gbs = 512.0 * 1024.0 * 1024.0 / (ms / 1e3) / 1e9;
     log("info", "phase_end", &format!("phase=bandwidth read_512mb_ms={ms:.3} gb_s={gbs:.1}"));
+    control("dram_bandwidth_gb_s_vs_150_spec", gbs, 100.0, 165.0);
     drop(big);
 
     let shapes = [(1024usize, 1024usize, 4usize), (4096, 1024, 1), (1024, 4096, 1)];
@@ -288,6 +310,13 @@ fn main() -> Result<()> {
             let bytes = (n * k * 2) as f64;
             log("info", "row", &format!("m={m} {label} n={n} k={k} scheme=f16-candle ms={t:.4} weight_mb={:.2} weight_read_ms_at_bw={:.4} eff_gb_s={:.1} tflops={:.2}", bytes / 1e6, bytes / (gbs * 1e9) * 1e3, bytes / (t / 1e3) / 1e9, 2.0 * (m * n * k) as f64 / t / 1e9));
             totals[0][mi] += t * (count * LAYERS) as f64;
+            if (n, k, m) == (1024, 4096, M_BULK) {
+                control("candle_f16_tflops_m600_1024x4096_vs_profile_5.2", 2.0 * (m * n * k) as f64 / t / 1e9, 4.4, 5.8);
+            }
+            if (n, k, m) == (1024, 4096, M_QUERY) {
+                let hot = time(&dev, 60, &|_| x.matmul(&sets_t[0]))?;
+                log("info", "cache_state", &format!("shape={n}x{k} m={m} hot_same_matrix_ms={hot:.4} rotating_{copies}_matrices_ms={t:.4} ratio={:.2} reading=ratio_near_1_means_time_is_not_dram_bound", t / hot));
+            }
         }
         drop(sets_t);
         drop(sets);
@@ -332,9 +361,7 @@ fn main() -> Result<()> {
                         worst = worst.max((got[mm * n + j] - want).abs() / (want.abs() + 1.0));
                     }
                 }
-                if worst > 0.03 {
-                    log("warn", "gate", &format!("reason=kernel_mismatch scheme={name} m={m} n={n} k={k} rel_err={worst:.4}"));
-                }
+                control(&format!("kernel_vs_cpu_reference_{name}_m{m}_{n}x{k}_rel_err"), worst as f64, 0.0, 0.03);
                 let t = time(&dev, 60, &|i| run(&x, i))?;
                 let bytes = if kind == 3 { (n * k * 2) as f64 } else { (n * k * bits / 8 + n * (k / 64) * 2) as f64 };
                 log("info", "row", &format!("m={m} {label} n={n} k={k} scheme={name} ms={t:.4} weight_mb={:.3} weight_read_ms_at_bw={:.4} eff_gb_s={:.1} tflops={:.2} rel_err={worst:.4}", bytes / 1e6, bytes / (gbs * 1e9) * 1e3, bytes / (t / 1e3) / 1e9, 2.0 * (m * n * k) as f64 / t / 1e9));
@@ -352,6 +379,10 @@ fn main() -> Result<()> {
             &format!("scheme={name} query_m{M_QUERY}_gemm_ms_24_layers={:.2} vs_candle_f16={:+.2} bulk_m{M_BULK}_gemm_ms_24_layers={:.1} vs_candle_f16={:+.1}", totals[i][0], totals[i][0] - totals[0][0], totals[i][1], totals[i][1] - totals[0][1]),
         );
     }
-    log("info", "result", &format!("bandwidth_gb_s={gbs:.1} measured_query_encode_ms=13.6 seconds={:.0}", t_all.elapsed().as_secs_f64()));
+    let ok = CONTROL_OK.load(std::sync::atomic::Ordering::Relaxed);
+    log(if ok { "info" } else { "warn" }, "result", &format!("controls={} bandwidth_gb_s={gbs:.1} measured_query_encode_ms=13.6 seconds={:.0}", if ok { "ok" } else { "failed_numbers_not_results" }, t_all.elapsed().as_secs_f64()));
+    if !ok {
+        std::process::exit(2);
+    }
     Ok(())
 }
