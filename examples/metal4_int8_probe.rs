@@ -133,11 +133,17 @@ fn main() -> Result<()> {
     let dev = Device::new_metal(0)?;
     let t_all = Instant::now();
     log("info", "phase_start", "phase=probe");
-    let cases: [(&str, &str, &str, &str, DType); 3] = [
+    let cases: [(&str, &str, &str, &str, DType); 4] = [
         ("half x half -> half (control)", "half", "half", "half", DType::F16),
-        ("int8 x int8 -> int32", "char", "char", "int", DType::U32),
-        ("half x int8 -> half", "half", "char", "half", DType::F16),
+        ("int8 x int8 -> int32", "int8_t", "int8_t", "int32_t", DType::U32),
+        ("half x int8 -> half", "half", "int8_t", "half", DType::F16),
+        ("half x int4b -> half (layout unvalidated)", "half", "metal::int4b_format", "half", DType::F16),
     ];
+    let wcols = |b: &str, k: usize| match b {
+        "metal::int4b_format" => k / 2,
+        "metal::int2b_format" => k / 4,
+        _ => k,
+    };
     let (n, k) = (1024usize, 4096usize);
     let mut ok_cases = Vec::new();
     for (name, a, b, c, odt) in cases {
@@ -152,16 +158,16 @@ fn main() -> Result<()> {
                 Tensor::from_vec(v, (rows, cols), &dev)
             }
         };
-        let w = mk(n, k, wdt)?;
+        let w = mk(n, wcols(b, k), wdt)?;
         let m_check = 25;
         let x = mk(m_check, k, xdt)?;
         match x.apply_op2_no_bwd(&w, &op) {
             Err(e) => {
-                log("warn", "case_failed", &format!("case={} reason=compile_or_run error={:?}", name.replace(' ', "_"), e.to_string().chars().take(300).collect::<String>()));
+                log("warn", "case_failed", &format!("case={} reason=compile_or_run error={:?}", name.replace(' ', "_"), e.to_string().lines().filter(|l| l.contains("error")).take(4).collect::<Vec<_>>().join(" | ")));
                 continue;
             }
             Ok(got) => {
-                if a == "char" && b == "char" {
+                if a == "int8_t" && b == "int8_t" {
                     let xv: Vec<u8> = x.flatten_all()?.to_vec1()?;
                     let wv: Vec<u8> = w.flatten_all()?.to_vec1()?;
                     let gv: Vec<u32> = got.flatten_all()?.to_vec1()?;
@@ -179,9 +185,20 @@ fn main() -> Result<()> {
                     let want = x.matmul(&w.t()?)?;
                     let d = (got.to_dtype(DType::F32)? - want.to_dtype(DType::F32)?)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
                     control("half_vs_candle_max_abs_diff", d as f64, 0.0, 0.1);
+                } else if b == "int8_t" {
+                    let xv: Vec<f32> = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+                    let wv: Vec<u8> = w.flatten_all()?.to_vec1()?;
+                    let gv: Vec<f32> = got.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+                    let mut worst = 0f32;
+                    for mm in 0..3 {
+                        for j in 0..16 {
+                            let want: f32 = (0..k).map(|kk| xv[mm * k + kk] * (wv[j * k + kk] as i8 as f32)).sum();
+                            worst = worst.max((gv[mm * n + j] - want).abs() / (want.abs() + 1.0));
+                        }
+                    }
+                    control("half_x_int8_vs_cpu_reference_rel_err", worst as f64, 0.0, 0.01);
                 } else {
-                    let wf = w.to_dtype(DType::F32)?;
-                    let _ = wf;
+                    log("warn", "unvalidated", &format!("case={} reason=packed_layout_unknown numbers_are_not_results", name.replace(' ', "_")));
                 }
             }
         }
@@ -189,6 +206,15 @@ fn main() -> Result<()> {
         log("info", "case_ok", &format!("case={}", name.replace(' ', "_")));
     }
     log("info", "phase_end", &format!("phase=probe cases_ok={}", ok_cases.len()));
+    if let Some((_, op, xdt, wdt)) = ok_cases.first() {
+        let warm_x = Tensor::randn(0f32, 0.5, (600, 4096), &dev)?.to_dtype(DType::F16)?;
+        let warm_w = Tensor::randn(0f32, 0.5, (1024, 4096), &dev)?.to_dtype(DType::F16)?;
+        let _ = (xdt, wdt);
+        for _ in 0..1500 {
+            warm_x.apply_op2_no_bwd(&warm_w, op)?;
+        }
+        dev.synchronize()?;
+    }
     for (name, op, xdt, wdt) in &ok_cases {
         for (n, k) in [(1024usize, 1024usize), (1024, 4096), (4096, 1024)] {
             let mk = |rows: usize, cols: usize, dt: DType| -> Result<Tensor> {
@@ -198,7 +224,8 @@ fn main() -> Result<()> {
                     Tensor::from_vec((0..rows * cols).map(|i| ((i >> 3) % 5) as u8).collect::<Vec<u8>>(), (rows, cols), &dev)
                 }
             };
-            let w = mk(n, k, *wdt)?;
+            let bty = cases.iter().find(|c| c.0 == *name).map_or("half", |c| c.2);
+            let w = mk(n, wcols(bty, k), *wdt)?;
             for (m, label) in [(25usize, "query"), (256, "mid"), (600, "bulk")] {
                 let x = mk(m, k, *xdt)?;
                 let t = time(&dev, 60, &|| x.apply_op2_no_bwd(&w, op))?;
