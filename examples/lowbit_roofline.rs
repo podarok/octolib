@@ -1,15 +1,3 @@
-//! Measured roofline of weight-only low-bit GEMM on the M3 Pro (epic-20 P20.47, E20-D66).
-//!
-//! 1. DRAM bandwidth: an own streaming-read kernel over a 512 MB buffer (candle's sum_all is not a bandwidth probe);
-//! 2. the layer GEMMs (N,K) = (1024,1024) x4, (4096,1024), (1024,4096) per layer, 24 layers, for M = 25 (query) and M = 600
-//!    (bulk), each call on a DIFFERENT weight matrix from a set larger than the system cache (the model streams 600 MB of
-//!    weights per query), so a call pays the DRAM read like the model does;
-//! 3. candle f16 matmul vs an own simdgroup_matrix kernel (32x32 tile, weights unpacked to half in registers / threadgroup
-//!    memory): f16 (kernel-quality control), int8, int4, int2, ternary (2-bit store), 1-bit; scale per group of 64;
-//!    every kernel is checked against a CPU reference;
-//! 4. per-model totals (24 layers) for query and bulk, next to the measured 13.6 ms query encode.
-//! Log: <eval>/logs/lowbit-roofline.log (logfmt, PKB tools policy).
-//! Run: cargo run --release --features huggingface --example lowbit_roofline
 use std::io::Write;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -254,7 +242,6 @@ fn quantise(w: &[f32], n: usize, k: usize, bits: usize, kind: usize) -> Packed {
     Packed { words, scales, codes }
 }
 
-/// median over 5 rounds of `iters` calls; call i uses weight set i % copies (cold cache when the set exceeds the cache)
 fn time(dev: &Device, iters: usize, f: &dyn Fn(usize) -> Result<Tensor>) -> Result<f64> {
     for i in 0..8 {
         f(i)?;
@@ -284,10 +271,8 @@ fn main() -> Result<()> {
     log("info", "phase_end", &format!("phase=bandwidth read_512mb_ms={ms:.3} gb_s={gbs:.1}"));
     drop(big);
 
-    // (n, k, matrices per layer)
     let shapes = [(1024usize, 1024usize, 4usize), (4096, 1024, 1), (1024, 4096, 1)];
     let schemes: [(&str, usize, usize); 6] = [("own-f16", 16, 3), ("int8", 8, 0), ("int4", 4, 0), ("int2", 2, 0), ("ternary(2-bit)", 2, 2), ("1-bit", 1, 1)];
-    // totals[scheme][query|bulk] in ms per model; index 0 = candle f16
     let mut totals = vec![[0.0f64; 2]; schemes.len() + 1];
     let mut state = 0x9E3779B97F4A7C15u64;
     for &(n, k, count) in &shapes {
@@ -331,7 +316,6 @@ fn main() -> Result<()> {
             let run = |x: &Tensor, i: usize| -> Result<Tensor> {
                 let (w, s) = &wsets[i % copies];
                 if kind == 3 {
-                    // f16 weights as raw u32 words: reinterpret through a U32 tensor of the same bytes
                     x.apply_op3_no_bwd(&w.reshape((n, k))?, s, &op)
                 } else {
                     x.apply_op3_no_bwd(w, s, &op)
