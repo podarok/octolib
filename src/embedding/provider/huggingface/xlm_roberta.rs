@@ -58,6 +58,32 @@ impl ResNorm {
 	}
 }
 
+fn mix(a: &Tensor, b: &Tensor, t: f64) -> Result<Tensor> {
+	(a.to_dtype(DType::F32)? * (1.0 - t))? + (b.to_dtype(DType::F32)? * t)?
+}
+
+fn mix_linear(a: &Linear, b: &Linear, t: f64) -> Result<Linear> {
+	let dt = a.weight().dtype();
+	let bias = match (a.bias(), b.bias()) {
+		(Some(x), Some(y)) => Some(mix(x, y, t)?.to_dtype(dt)?),
+		_ => None,
+	};
+	Ok(Linear::new(mix(a.weight(), b.weight(), t)?.to_dtype(dt)?, bias))
+}
+
+fn mix_norm(a: &LayerNorm, b: &LayerNorm, eps: f64, t: f64) -> Result<LayerNorm> {
+	let dt = a.weight().dtype();
+	let bias = match (a.bias(), b.bias()) {
+		(Some(x), Some(y)) => mix(x, y, t)?.to_dtype(dt)?,
+		_ => bail_no_bias()?,
+	};
+	Ok(LayerNorm::new(mix(a.weight(), b.weight(), t)?.to_dtype(dt)?, bias, eps))
+}
+
+fn bail_no_bias() -> Result<Tensor> {
+	Err(candle_core::Error::Msg("layer merge needs LayerNorm biases".into()))
+}
+
 struct Layer {
 	query: Linear,
 	key: Linear,
@@ -92,6 +118,28 @@ impl Layer {
 			)?,
 			heads: cfg.num_attention_heads,
 			head_dim: h / cfg.num_attention_heads,
+		})
+	}
+
+	fn merged_with(&self, other: &Layer, eps: f64, t: f64) -> Result<Layer> {
+		Ok(Layer {
+			query: mix_linear(&self.query, &other.query, t)?,
+			key: mix_linear(&self.key, &other.key, t)?,
+			value: mix_linear(&self.value, &other.value, t)?,
+			attn: ResNorm::new(
+				mix_linear(&self.attn.linear, &other.attn.linear, t)?,
+				mix_norm(&self.attn.norm, &other.attn.norm, eps, t)?,
+				eps,
+			)?,
+			inter: mix_linear(&self.inter, &other.inter, t)?,
+			act: self.act,
+			out: ResNorm::new(
+				mix_linear(&self.out.linear, &other.out.linear, t)?,
+				mix_norm(&self.out.norm, &other.out.norm, eps, t)?,
+				eps,
+			)?,
+			heads: self.heads,
+			head_dim: self.head_dim,
 		})
 	}
 
@@ -195,10 +243,21 @@ pub struct XLMRobertaEncoder {
 
 impl XLMRobertaEncoder {
 	pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-		let layers = (0..cfg.num_hidden_layers)
+		let mut layers = (0..cfg.num_hidden_layers)
 			.map(|i| Layer::load(cfg, vb.pp(format!("encoder.layer.{i}"))))
 			.collect::<Result<Vec<_>>>()?;
 		let mut skip = vec![false; layers.len()];
+		if let Ok(spec) = std::env::var("OCTOLIB_XLMR_MERGE_LAYERS") {
+			for pair in spec.split(',') {
+				let mut it = pair.split(':').filter_map(|s| s.trim().parse::<usize>().ok());
+				if let (Some(a), Some(b)) = (it.next(), it.next()) {
+					if a != b && (1..=layers.len()).contains(&a) && (1..=layers.len()).contains(&b) {
+						layers[a - 1] = layers[a - 1].merged_with(&layers[b - 1], cfg.layer_norm_eps, 0.5)?;
+						skip[b - 1] = true;
+					}
+				}
+			}
+		}
 		if let Ok(list) = std::env::var("OCTOLIB_XLMR_SKIP_LAYERS") {
 			for n in list.split(',').filter_map(|s| s.trim().parse::<usize>().ok()) {
 				if (1..=skip.len()).contains(&n) {
