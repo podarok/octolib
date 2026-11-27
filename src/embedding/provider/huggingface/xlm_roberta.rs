@@ -30,16 +30,42 @@ impl Embeddings {
 	}
 }
 
+struct ResNorm {
+	linear: Linear,
+	norm: LayerNorm,
+	params: Option<Tensor>,
+	eps: f32,
+}
+
+impl ResNorm {
+	fn new(linear: Linear, norm: LayerNorm, eps: f64) -> Result<Self> {
+		let params = match (linear.bias(), norm.bias()) {
+			(Some(b), Some(nb)) => Some(Tensor::cat(&[b, norm.weight(), nb], 0)?),
+			_ => None,
+		};
+		Ok(Self { linear, norm, params, eps: eps as f32 })
+	}
+
+	fn forward(&self, x: &Tensor, res: &Tensor) -> Result<Tensor> {
+		let y = matmul(&self.linear, x)?;
+		#[cfg(target_os = "macos")]
+		if let Some(p) = &self.params {
+			if let Some(out) = super::metal_ops::bias_res_layer_norm(&y, res, p, self.eps) {
+				return out;
+			}
+		}
+		self.norm.forward(&epilogue(&self.linear, y, Some(res))?)
+	}
+}
+
 struct Layer {
 	query: Linear,
 	key: Linear,
 	value: Linear,
-	attn_out: Linear,
-	attn_norm: LayerNorm,
+	attn: ResNorm,
 	inter: Linear,
 	act: Activation,
-	out: Linear,
-	out_norm: LayerNorm,
+	out: ResNorm,
 	heads: usize,
 	head_dim: usize,
 }
@@ -52,12 +78,18 @@ impl Layer {
 			query: linear(h, h, sa.pp("query"))?,
 			key: linear(h, h, sa.pp("key"))?,
 			value: linear(h, h, sa.pp("value"))?,
-			attn_out: linear(h, h, ao.pp("dense"))?,
-			attn_norm: layer_norm(h, cfg.layer_norm_eps, ao.pp("LayerNorm"))?,
+			attn: ResNorm::new(
+				linear(h, h, ao.pp("dense"))?,
+				layer_norm(h, cfg.layer_norm_eps, ao.pp("LayerNorm"))?,
+				cfg.layer_norm_eps,
+			)?,
 			inter: linear(h, cfg.intermediate_size, vb.pp("intermediate").pp("dense"))?,
 			act: cfg.hidden_act,
-			out: linear(cfg.intermediate_size, h, vb.pp("output").pp("dense"))?,
-			out_norm: layer_norm(h, cfg.layer_norm_eps, vb.pp("output").pp("LayerNorm"))?,
+			out: ResNorm::new(
+				linear(cfg.intermediate_size, h, vb.pp("output").pp("dense"))?,
+				layer_norm(h, cfg.layer_norm_eps, vb.pp("output").pp("LayerNorm"))?,
+				cfg.layer_norm_eps,
+			)?,
 			heads: cfg.num_attention_heads,
 			head_dim: h / cfg.num_attention_heads,
 		})
@@ -87,9 +119,9 @@ impl Layer {
 			candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?
 		};
 		let ctx = merge_heads(&ctx)?;
-		let a = self.attn_norm.forward(&lin_res(&self.attn_out, &ctx, Some(x))?)?;
+		let a = self.attn.forward(&ctx, x)?;
 		let i = self.inter_act(&a)?;
-		self.out_norm.forward(&lin_res(&self.out, &i, Some(&a))?)
+		self.out.forward(&i, &a)
 	}
 
 	fn inter_act(&self, a: &Tensor) -> Result<Tensor> {
@@ -129,8 +161,15 @@ fn lin(l: &Linear, x: &Tensor) -> Result<Tensor> {
 }
 
 fn lin_res(l: &Linear, x: &Tensor, res: Option<&Tensor>) -> Result<Tensor> {
+	epilogue(l, matmul(l, x)?, res)
+}
+
+fn matmul(l: &Linear, x: &Tensor) -> Result<Tensor> {
 	let (b, s, k) = x.dims3()?;
-	let y = x.reshape((b * s, k))?.matmul(&l.weight().t()?)?.reshape((b, s, ()))?;
+	x.reshape((b * s, k))?.matmul(&l.weight().t()?)?.reshape((b, s, ()))
+}
+
+fn epilogue(l: &Linear, y: Tensor, res: Option<&Tensor>) -> Result<Tensor> {
 	let Some(bias) = l.bias() else {
 		return match res {
 			Some(r) => y + r,

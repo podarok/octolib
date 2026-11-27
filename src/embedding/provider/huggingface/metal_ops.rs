@@ -31,11 +31,40 @@ kernel void bias_add_half4(device const half4* y [[buffer(0)]], device const hal
     }
     dst[gid] = half4(v);
 }
+kernel void bias_res_ln_half4(device const half4* y [[buffer(0)]], device const half4* res [[buffer(1)]],
+                              device const half4* params [[buffer(2)]], device half4* dst [[buffer(3)]],
+                              constant float& eps [[buffer(4)]], constant uint& cols4 [[buffer(5)]],
+                              uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+                              uint tpg [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                              uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float part[32];
+    bool act = tid < cols4;
+    float4 v = float4(0);
+    if (act) v = float4(y[row * cols4 + tid]) + float4(params[tid]) + float4(res[row * cols4 + tid]);
+    float s = simd_sum(act ? (v.x + v.y + v.z + v.w) : 0.0f);
+    if (lane == 0) part[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint nsg = (tpg + 31) / 32;
+    float tot = 0.0f;
+    for (uint i = 0; i < nsg; i++) tot += part[i];
+    float n = float(cols4 * 4);
+    float mean = tot / n;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float4 d = act ? v - mean : float4(0);
+    float q = simd_sum(d.x * d.x + d.y * d.y + d.z * d.z + d.w * d.w);
+    if (lane == 0) part[sg] = q;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float var = 0.0f;
+    for (uint i = 0; i < nsg; i++) var += part[i];
+    float inv = rsqrt(var / n + eps);
+    if (act) dst[row * cols4 + tid] = half4(d * inv * float4(params[cols4 + tid]) + float4(params[2 * cols4 + tid]));
+}
 "#;
 
 type Cell = std::sync::OnceLock<std::result::Result<ComputePipeline, String>>;
 static MERGE: Cell = Cell::new();
 static BIAS: Cell = Cell::new();
+static RESLN: Cell = Cell::new();
 
 fn pipeline<'a>(cell: &'a Cell, device: &candle_core::MetalDevice, name: &str) -> Result<&'a ComputePipeline> {
 	cell.get_or_init(|| {
@@ -158,6 +187,64 @@ pub fn merge_heads(ctx: &Tensor) -> Result<Tensor> {
 	ctx.apply_op1_no_bwd(&MergeHeads)?.reshape((b, l, h * d))
 }
 
+struct BiasResLayerNorm {
+	eps: f32,
+}
+
+impl CustomOp3 for BiasResLayerNorm {
+	fn name(&self) -> &'static str {
+		"bias-res-layer-norm"
+	}
+
+	fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+		bail!("bias-res-layer-norm: Metal only")
+	}
+
+	fn metal_fwd(
+		&self,
+		y: &MetalStorage,
+		ly: &Layout,
+		res: &MetalStorage,
+		lr: &Layout,
+		params: &MetalStorage,
+		lp: &Layout,
+	) -> Result<(MetalStorage, Shape)> {
+		let n = ly.shape().elem_count();
+		let cols = *ly.dims().last().unwrap_or(&0);
+		if cols == 0 || cols % 4 != 0 || cols / 4 > 1024 || lp.shape().elem_count() != 3 * cols || lr.shape() != ly.shape() {
+			bail!("bias-res-layer-norm: cols % 4 == 0, cols <= 4096, params = [bias, gamma, beta]");
+		}
+		let device = y.device();
+		let pipeline = pipeline(&RESLN, device, "bias_res_ln_half4")?;
+		let out = device.new_buffer_builder().with_size_for(n, DType::F16).with_label("bias-res-ln").build()?;
+		let guard = device.command_encoder()?;
+		let enc: &candle_metal_kernels::metal::ComputeCommandEncoder = guard.as_ref();
+		enc.set_compute_pipeline_state(pipeline);
+		enc.set_input_buffer(0, Some(y.buffer()), ly.start_offset() * 2);
+		enc.set_input_buffer(1, Some(res.buffer()), lr.start_offset() * 2);
+		enc.set_input_buffer(2, Some(params.buffer()), lp.start_offset() * 2);
+		enc.set_output_buffer(3, Some(&out), 0);
+		enc.set_bytes(4, &self.eps);
+		let cols4 = (cols / 4) as u32;
+		enc.set_bytes(5, &cols4);
+		let tpg = (cols / 4).div_ceil(32) * 32;
+		enc.dispatch_thread_groups(
+			MTLSize { width: n / cols, height: 1, depth: 1 },
+			MTLSize { width: tpg, height: 1, depth: 1 },
+		);
+		drop(guard);
+		Ok((MetalStorage::new(out, device.clone(), n, DType::F16), ly.shape().clone()))
+	}
+}
+
+pub fn bias_res_layer_norm(y: &Tensor, res: &Tensor, params: &Tensor, eps: f32) -> Option<Result<Tensor>> {
+	let cols = *y.dims().last()?;
+	if !fits(y) || !fits(res) || !fits(params) || params.rank() != 1 || params.elem_count() != 3 * cols || res.shape() != y.shape() || cols % 4 != 0 || cols / 4 > 1024 {
+		return None;
+	}
+	Some(y.apply_op3_no_bwd(res, params, &BiasResLayerNorm { eps }))
+}
+
 #[cfg(test)]
 mod tests {
 	use candle_core::{DType, Device, Tensor};
@@ -208,6 +295,21 @@ mod tests {
 		assert!(super::bias_add(&z, &bias.reshape((4, 256))?, None).is_none(), "2-D bias must fall back");
 		let empty = Tensor::zeros((0, 1024), DType::F16, &dev)?;
 		assert!(super::bias_add(&empty, &bias, None).is_none(), "empty input must fall back");
+		let gamma = Tensor::randn(1f32, 0.2, 1024, &dev)?.to_dtype(DType::F16)?;
+		let beta = Tensor::randn(0f32, 0.2, 1024, &dev)?.to_dtype(DType::F16)?;
+		let params = Tensor::cat(&[&bias, &gamma, &beta], 0)?;
+		let zz = z.reshape((4, 256, 1024))?;
+		let rr = r.reshape((4, 256, 1024))?;
+		let ln = candle_nn::LayerNorm::new(gamma.clone(), beta.clone(), 1e-5);
+		let want_ln = candle_nn::Module::forward(&ln, &(&zz + bias.broadcast_as(zz.shape())?.contiguous()? + &rr)?)?;
+		let got_ln = super::bias_res_layer_norm(&zz, &rr, &params, 1e-5).expect("fits")?;
+		let d = (want_ln.to_dtype(DType::F32)? - got_ln.to_dtype(DType::F32)?)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+		assert!(d <= 0.03, "bias-res-ln max|diff|={d}");
+		println!(
+			"bias-res-ln 4x256x1024: kernel {:.3} ms, bias+add+candle LayerNorm {:.3} ms, max|diff| {d}",
+			time(&|| super::bias_res_layer_norm(&zz, &rr, &params, 1e-5).expect("fits"))?,
+			time(&|| candle_nn::Module::forward(&ln, &(&zz + bias.broadcast_as(zz.shape())?.contiguous()? + &rr)?))?
+		);
 		let got = super::bias_gelu(&z, &bias).expect("fits")?;
 		let want = plain(false)?.gelu_erf()?;
 		let d = (want.to_dtype(DType::F32)? - got.to_dtype(DType::F32)?)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
