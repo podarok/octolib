@@ -1,12 +1,4 @@
 
-//! Encoder-only XLM-RoBERTa for embeddings.
-//!
-//! Same weights and math as `candle_transformers::models::xlm_roberta::XLMRobertaModel`, without
-//! cross-attention, KV cache or heads. The padding mask is built once per forward as a
-//! `(batch, 1, 1, seq)` additive bias in the model dtype and broadcast in every layer; candle's
-//! model builds an f32 `(batch, 1, seq, seq)` mask and casts it to the scores dtype in each of the
-//! layers.
-
 use candle_core::{DType, Result, Tensor};
 use candle_nn::{embedding, layer_norm, linear, Activation, Embedding, LayerNorm, Linear, Module, VarBuilder};
 use candle_transformers::models::xlm_roberta::Config;
@@ -71,7 +63,6 @@ impl Layer {
 		})
 	}
 
-	/// Metal SDPA reads the transposed view directly (exact, measured); only the matmul path needs a copy.
 	fn split_heads(&self, x: &Tensor) -> Result<Tensor> {
 		let (b, l, _) = x.dims3()?;
 		let v = x.reshape((b, l, self.heads, self.head_dim))?.transpose(1, 2)?;
@@ -102,8 +93,6 @@ impl Layer {
 	}
 }
 
-/// `Linear::forward` with the bias expanded to a contiguous tensor before the add: candle's Metal
-/// broadcast add is ~6x slower than a contiguous add plus the expand copy (same bits).
 fn lin(l: &Linear, x: &Tensor) -> Result<Tensor> {
 	let (b, s, k) = x.dims3()?;
 	let y = x.reshape((b * s, k))?.matmul(&l.weight().t()?)?;
@@ -127,8 +116,6 @@ impl XLMRobertaEncoder {
 		Ok(Self { embeddings: Embeddings::load(cfg, vb.pp("embeddings"))?, layers })
 	}
 
-	/// `mask` is `(batch, seq)` with 1 for real tokens and 0 for padding, any dtype.
-	/// Returns the last hidden state `(batch, seq, hidden)`.
 	pub fn forward(&self, input_ids: &Tensor, mask: &Tensor) -> Result<Tensor> {
 		let token_type_ids = input_ids.zeros_like()?;
 		let mut x = self.embeddings.forward(input_ids, &token_type_ids)?;

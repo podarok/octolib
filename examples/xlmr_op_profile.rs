@@ -1,6 +1,3 @@
-//! GPU time per op of one XLM-R large layer on Metal, f16, synthetic inputs.
-//! `cargo run --release --features huggingface --example xlmr_op_profile -- <batch> <len>`
-
 use candle_core::{DType, Device, Tensor, D};
 
 fn time(dev: &Device, iters: usize, f: &dyn Fn() -> candle_core::Result<Tensor>) -> candle_core::Result<f64> {
