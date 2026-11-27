@@ -190,6 +190,7 @@ fn epilogue(l: &Linear, y: Tensor, res: Option<&Tensor>) -> Result<Tensor> {
 pub struct XLMRobertaEncoder {
 	embeddings: Embeddings,
 	layers: Vec<Layer>,
+	skip: Vec<bool>,
 }
 
 impl XLMRobertaEncoder {
@@ -197,7 +198,15 @@ impl XLMRobertaEncoder {
 		let layers = (0..cfg.num_hidden_layers)
 			.map(|i| Layer::load(cfg, vb.pp(format!("encoder.layer.{i}"))))
 			.collect::<Result<Vec<_>>>()?;
-		Ok(Self { embeddings: Embeddings::load(cfg, vb.pp("embeddings"))?, layers })
+		let mut skip = vec![false; layers.len()];
+		if let Ok(list) = std::env::var("OCTOLIB_XLMR_SKIP_LAYERS") {
+			for n in list.split(',').filter_map(|s| s.trim().parse::<usize>().ok()) {
+				if (1..=skip.len()).contains(&n) {
+					skip[n - 1] = true;
+				}
+			}
+		}
+		Ok(Self { embeddings: Embeddings::load(cfg, vb.pp("embeddings"))?, layers, skip })
 	}
 
 	pub fn forward(&self, input_ids: &Tensor, mask: &Tensor) -> Result<Tensor> {
@@ -207,8 +216,10 @@ impl XLMRobertaEncoder {
 		let bias = ((mask.to_dtype(DType::F32)? - 1.0)? * f32::MAX as f64)?
 			.reshape((b, 1, 1, l))?
 			.to_dtype(x.dtype())?;
-		for layer in &self.layers {
-			x = layer.forward(&x, &bias)?;
+		for (layer, skip) in self.layers.iter().zip(&self.skip) {
+			if !skip {
+				x = layer.forward(&x, &bias)?;
+			}
 		}
 		Ok(x)
 	}
