@@ -1,5 +1,5 @@
 use candle_core::backend::BackendStorage;
-use candle_core::{bail, CpuStorage, CustomOp1, CustomOp3, DType, Layout, MetalStorage, Result, Shape, Tensor};
+use candle_core::{bail, CpuStorage, CustomOp1, CustomOp2, CustomOp3, DType, Layout, MetalStorage, Result, Shape, Tensor};
 use candle_metal_kernels::metal::ComputePipeline;
 use objc2_metal::MTLSize;
 
@@ -245,12 +245,106 @@ pub fn bias_res_layer_norm(y: &Tensor, res: &Tensor, params: &Tensor, eps: f32) 
 	Some(y.apply_op3_no_bwd(res, params, &BiasResLayerNorm { eps }))
 }
 
+const MM2D_SRC: &str = r#"
+#include <metal_stdlib>
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+using namespace mpp::tensor_ops;
+kernel void mm2d(device half* x [[buffer(0)]], device half* w [[buffer(1)]], device half* out [[buffer(2)]],
+                 constant uint3& dims [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]]) {
+    int K = dims.x, N = dims.y, M = dims.z;
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> A(x, dextents<int32_t, 2>(K, M));
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> B(w, dextents<int32_t, 2>(K, N));
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> C(out, dextents<int32_t, 2>(N, M));
+    constexpr auto desc = matmul2d_descriptor(32, 32, dynamic_length_v<int>, false, true);
+    matmul2d<desc, execution_simdgroups<4>> op;
+    auto mA = A.slice(0, tg.y * 32);
+    auto mB = B.slice(0, tg.x * 32);
+    auto mC = C.slice(tg.x * 32, tg.y * 32);
+    op.run(mA, mB, mC);
+}
+"#;
+
+static MM2D: Cell = Cell::new();
+
+fn mm2d_pipeline(device: &candle_core::MetalDevice) -> Option<&'static ComputePipeline> {
+	MM2D.get_or_init(|| {
+		if std::env::var("OCTOLIB_XLMR_MM2D").is_ok_and(|v| v == "0") {
+			return Err("disabled by OCTOLIB_XLMR_MM2D=0".to_string());
+		}
+		let dev = device.metal_device();
+		let opts = objc2_metal::MTLCompileOptions::new();
+		opts.setLanguageVersion(objc2_metal::MTLLanguageVersion::Version4_0);
+		let lib = dev.new_library_with_source(MM2D_SRC, Some(&opts)).map_err(|e| e.to_string())?;
+		let f = lib.get_function("mm2d", None).map_err(|e| e.to_string())?;
+		dev.new_compute_pipeline_state_with_function(&f).map_err(|e| e.to_string())
+	})
+	.as_ref()
+	.ok()
+}
+
+struct Mm2d;
+
+impl CustomOp2 for Mm2d {
+	fn name(&self) -> &'static str {
+		"mm2d"
+	}
+
+	fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+		bail!("metal only")
+	}
+
+	fn metal_fwd(&self, x: &MetalStorage, lx: &Layout, w: &MetalStorage, lw: &Layout) -> Result<(MetalStorage, Shape)> {
+		let (m, k) = lx.shape().dims2()?;
+		let n = lw.shape().dims2()?.0;
+		let device = x.device();
+		let Some(pipe) = mm2d_pipeline(device) else { bail!("mm2d unavailable") };
+		let out = device.new_buffer_builder().with_size_for(m * n, DType::F16).with_label("mm2d").build()?;
+		let guard = device.command_encoder()?;
+		let enc: &candle_metal_kernels::metal::ComputeCommandEncoder = guard.as_ref();
+		enc.set_compute_pipeline_state(pipe);
+		enc.set_input_buffer(0, Some(x.buffer()), lx.start_offset() * 2);
+		enc.set_input_buffer(1, Some(w.buffer()), lw.start_offset() * 2);
+		enc.set_output_buffer(2, Some(&out), 0);
+		enc.set_bytes(3, &[k as u32, n as u32, m as u32]);
+		enc.dispatch_thread_groups(MTLSize { width: n / 32, height: m.div_ceil(32), depth: 1 }, MTLSize { width: 128, height: 1, depth: 1 });
+		drop(guard);
+		Ok((MetalStorage::new(out, device.clone(), m * n, DType::F16), Shape::from((m, n))))
+	}
+}
+
+/// x [M, K] times w [N, K] transposed, f16, via Metal 4 matmul2d; None when unavailable so the caller keeps candle's GEMM.
+pub fn matmul_nt(x: &Tensor, w: &Tensor) -> Option<Result<Tensor>> {
+	let candle_core::Device::Metal(dev) = x.device() else { return None };
+	if !fits(x) || !fits(w) || x.rank() != 2 || w.rank() != 2 || w.dim(0).ok()? % 32 != 0 || x.dim(1).ok()? != w.dim(1).ok()? {
+		return None;
+	}
+	mm2d_pipeline(dev)?;
+	Some(x.apply_op2_no_bwd(w, &Mm2d))
+}
+
 #[cfg(test)]
 mod tests {
 	use candle_core::{DType, Device, Tensor};
 
 	#[test]
-	fn merge_heads_matches_transpose() -> candle_core::Result<()> {
+	fn mm2d_matches_candle_or_falls_back() -> candle_core::Result<()> {
+		let Ok(dev) = Device::new_metal(0) else { return Ok(()) };
+		let w = Tensor::randn(0f32, 0.1, (96, 70), &dev)?.to_dtype(DType::F16)?;
+		for m in [1usize, 25, 600] {
+			let x = Tensor::randn(0f32, 1.0, (m, 70), &dev)?.to_dtype(DType::F16)?;
+			let Some(got) = super::matmul_nt(&x, &w) else { return Ok(()) };
+			let d = (got?.to_dtype(DType::F32)? - x.matmul(&w.t()?)?.to_dtype(DType::F32)?)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+			assert!(d <= 0.05, "mm2d m={m} max|diff|={d}");
+		}
+		let odd = Tensor::randn(0f32, 0.1, (90, 70), &dev)?.to_dtype(DType::F16)?;
+		assert!(super::matmul_nt(&Tensor::zeros((4, 70), DType::F16, &dev)?, &odd).is_none(), "N not a multiple of 32 must fall back");
+		Ok(())
+	}
+
+	#[test]
+	fn merge_heads_matches_transpose()-> candle_core::Result<()> {
 		let Ok(dev) = Device::new_metal(0) else { return Ok(()) };
 		let x = Tensor::randn(0f32, 1.0, (3, 16, 37, 64), &dev)?.to_dtype(DType::F16)?;
 		let want = x.transpose(1, 2)?.reshape((3, 37, 1024))?;

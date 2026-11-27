@@ -176,7 +176,7 @@ impl Layer {
 		#[cfg(target_os = "macos")]
 		if let (true, Some(bias)) = (matches!(self.act, Activation::Gelu), self.inter.bias()) {
 			let (b, s, k) = a.dims3()?;
-			let y = a.reshape((b * s, k))?.matmul(&self.inter.weight().t()?)?.reshape((b, s, ()))?;
+			let y = gemm(&a.reshape((b * s, k))?, self.inter.weight())?.reshape((b, s, ()))?;
 			if let Some(out) = super::metal_ops::bias_gelu(&y, bias) {
 				return out;
 			}
@@ -214,7 +214,15 @@ fn lin_res(l: &Linear, x: &Tensor, res: Option<&Tensor>) -> Result<Tensor> {
 
 fn matmul(l: &Linear, x: &Tensor) -> Result<Tensor> {
 	let (b, s, k) = x.dims3()?;
-	x.reshape((b * s, k))?.matmul(&l.weight().t()?)?.reshape((b, s, ()))
+	gemm(&x.reshape((b * s, k))?, l.weight())?.reshape((b, s, ()))
+}
+
+fn gemm(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+	#[cfg(target_os = "macos")]
+	if let Some(out) = super::metal_ops::matmul_nt(x, w) {
+		return out;
+	}
+	x.matmul(&w.t()?)
 }
 
 fn epilogue(l: &Linear, y: Tensor, res: Option<&Tensor>) -> Result<Tensor> {
