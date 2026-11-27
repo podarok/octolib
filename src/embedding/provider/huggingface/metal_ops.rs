@@ -314,7 +314,6 @@ impl CustomOp2 for Mm2d {
 	}
 }
 
-/// x [M, K] times w [N, K] transposed, f16, via Metal 4 matmul2d; None when unavailable so the caller keeps candle's GEMM.
 pub fn matmul_nt(x: &Tensor, w: &Tensor) -> Option<Result<Tensor>> {
 	let candle_core::Device::Metal(dev) = x.device() else { return None };
 	if !fits(x) || !fits(w) || x.rank() != 2 || w.rank() != 2 || w.dim(0).ok()? % 32 != 0 || x.dim(1).ok()? != w.dim(1).ok()? {
