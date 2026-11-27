@@ -218,6 +218,7 @@ impl HuggingFaceModel {
 		std::env::set_var("HF_HOME", &cache_dir);
 
 		let api = ApiBuilder::new()
+			.with_cache_dir(cache_dir.join("hub"))
 			.with_progress(false)
 			.build()
 			.context("Failed to initialize HuggingFace API")?;
