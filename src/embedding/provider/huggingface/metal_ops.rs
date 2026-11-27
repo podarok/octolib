@@ -141,10 +141,14 @@ pub fn bias_gelu(y: &Tensor, bias: &Tensor) -> Option<Result<Tensor>> {
 	fused(y, bias, None, 2)
 }
 
+/// What every kernel here assumes: Metal f16, contiguous, non-empty, start on a half4 (8-byte) boundary.
+pub fn fits(t: &Tensor) -> bool {
+	t.dtype() == DType::F16 && t.device().is_metal() && t.is_contiguous() && t.elem_count() > 0 && t.layout().start_offset() % 4 == 0
+}
+
 fn fused(y: &Tensor, bias: &Tensor, res: Option<&Tensor>, mode: u32) -> Option<Result<Tensor>> {
 	let cols = bias.elem_count();
-	let fits = |t: &Tensor| t.dtype() == DType::F16 && t.is_contiguous() && t.device().is_metal();
-	if !fits(y) || !fits(bias) || cols % 4 != 0 || y.dims().last() != Some(&cols) || res.is_some_and(|r| !fits(r) || r.shape() != y.shape()) {
+	if !fits(y) || !fits(bias) || bias.rank() != 1 || cols % 4 != 0 || y.dims().last() != Some(&cols) || res.is_some_and(|r| !fits(r) || r.shape() != y.shape()) {
 		return None;
 	}
 	Some(y.apply_op3_no_bwd(bias, res.unwrap_or(y), &BiasAdd { mode }))
@@ -200,6 +204,11 @@ mod tests {
 				time(&|| plain(res))?
 			);
 		}
+		let wide = Tensor::randn(0f32, 1.0, 1028, &dev)?.to_dtype(DType::F16)?;
+		assert!(super::bias_add(&z, &wide.narrow(0, 2, 1024)?, None).is_none(), "unaligned bias must fall back");
+		assert!(super::bias_add(&z, &bias.reshape((4, 256))?, None).is_none(), "2-D bias must fall back");
+		let empty = Tensor::zeros((0, 1024), DType::F16, &dev)?;
+		assert!(super::bias_add(&empty, &bias, None).is_none(), "empty input must fall back");
 		let got = super::bias_gelu(&z, &bias).expect("fits")?;
 		let want = plain(false)?.gelu_erf()?;
 		let d = (want.to_dtype(DType::F32)? - got.to_dtype(DType::F32)?)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;

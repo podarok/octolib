@@ -108,11 +108,11 @@ impl Layer {
 
 fn merge_heads(ctx: &Tensor) -> Result<Tensor> {
 	let (b, heads, l, d) = ctx.dims4()?;
-	if !ctx.device().is_metal() || !ctx.is_contiguous() {
+	if !ctx.device().is_metal() || !ctx.is_contiguous() || ctx.elem_count() == 0 {
 		return ctx.transpose(1, 2)?.reshape((b, l, heads * d));
 	}
 	#[cfg(target_os = "macos")]
-	if ctx.dtype() == candle_core::DType::F16 && d % 4 == 0 {
+	if super::metal_ops::fits(ctx) && d % 4 == 0 {
 		return super::metal_ops::merge_heads(ctx);
 	}
 	let per = (0..b)
