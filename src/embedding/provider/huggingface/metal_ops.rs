@@ -319,6 +319,21 @@ pub fn matmul_nt(x: &Tensor, w: &Tensor) -> Option<Result<Tensor>> {
 	if !fits(x) || !fits(w) || x.rank() != 2 || w.rank() != 2 || w.dim(0).ok()? % 32 != 0 || x.dim(1).ok()? != w.dim(1).ok()? {
 		return None;
 	}
+	static KNOBS: std::sync::OnceLock<(usize, Option<Vec<String>>)> = std::sync::OnceLock::new();
+	let (max_m, shapes) = KNOBS.get_or_init(|| {
+		let max_m = std::env::var("OCTOLIB_XLMR_MM2D_MAX_M").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+		let shapes = std::env::var("OCTOLIB_XLMR_MM2D_SHAPES").ok().map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
+		(max_m, shapes)
+	});
+	if x.dim(0).ok()? > *max_m {
+		return None;
+	}
+	if let Some(list) = shapes {
+		let shape = format!("{}x{}", w.dim(0).ok()?, w.dim(1).ok()?);
+		if !list.contains(&shape) {
+			return None;
+		}
+	}
 	mm2d_pipeline(dev)?;
 	Some(x.apply_op2_no_bwd(w, &Mm2d))
 }
