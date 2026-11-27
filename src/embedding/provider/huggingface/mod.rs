@@ -1,6 +1,8 @@
 
 mod jina_code_bert;
 mod mpnet;
+#[cfg(target_os = "macos")]
+mod metal_ops;
 mod xlm_roberta;
 
 #[cfg(feature = "huggingface")]

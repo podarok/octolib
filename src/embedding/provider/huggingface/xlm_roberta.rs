@@ -87,9 +87,22 @@ impl Layer {
 			candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?
 		};
 		let ctx = merge_heads(&ctx)?;
-		let a = self.attn_norm.forward(&(lin(&self.attn_out, &ctx)? + x)?)?;
-		let i = self.act.forward(&lin(&self.inter, &a)?)?;
-		self.out_norm.forward(&(lin(&self.out, &i)? + &a)?)
+		let a = self.attn_norm.forward(&lin_res(&self.attn_out, &ctx, Some(x))?)?;
+		let i = self.inter_act(&a)?;
+		self.out_norm.forward(&lin_res(&self.out, &i, Some(&a))?)
+	}
+
+	fn inter_act(&self, a: &Tensor) -> Result<Tensor> {
+		#[cfg(target_os = "macos")]
+		if let (true, Some(bias)) = (matches!(self.act, Activation::Gelu), self.inter.bias()) {
+			let (b, s, k) = a.dims3()?;
+			let y = a.reshape((b * s, k))?.matmul(&self.inter.weight().t()?)?.reshape((b, s, ()))?;
+			if let Some(out) = super::metal_ops::bias_gelu(&y, bias) {
+				return out;
+			}
+			return self.act.forward(&(&y + bias.broadcast_as(y.shape())?.contiguous()?)?);
+		}
+		self.act.forward(&lin(&self.inter, a)?)
 	}
 }
 
@@ -97,6 +110,10 @@ fn merge_heads(ctx: &Tensor) -> Result<Tensor> {
 	let (b, heads, l, d) = ctx.dims4()?;
 	if !ctx.device().is_metal() || !ctx.is_contiguous() {
 		return ctx.transpose(1, 2)?.reshape((b, l, heads * d));
+	}
+	#[cfg(target_os = "macos")]
+	if ctx.dtype() == candle_core::DType::F16 && d % 4 == 0 {
+		return super::metal_ops::merge_heads(ctx);
 	}
 	let per = (0..b)
 		.map(|i| {
@@ -108,13 +125,28 @@ fn merge_heads(ctx: &Tensor) -> Result<Tensor> {
 }
 
 fn lin(l: &Linear, x: &Tensor) -> Result<Tensor> {
+	lin_res(l, x, None)
+}
+
+/// x W^T + bias (+ res). On Metal f16 the bias and residual go through one kernel.
+fn lin_res(l: &Linear, x: &Tensor, res: Option<&Tensor>) -> Result<Tensor> {
 	let (b, s, k) = x.dims3()?;
-	let y = x.reshape((b * s, k))?.matmul(&l.weight().t()?)?;
-	let y = match l.bias() {
-		Some(bias) => (&y + bias.broadcast_as(y.shape())?.contiguous()?)?,
-		None => y,
+	let y = x.reshape((b * s, k))?.matmul(&l.weight().t()?)?.reshape((b, s, ()))?;
+	let Some(bias) = l.bias() else {
+		return match res {
+			Some(r) => y + r,
+			None => Ok(y),
+		};
 	};
-	y.reshape((b, s, ()))
+	#[cfg(target_os = "macos")]
+	if let Some(out) = super::metal_ops::bias_add(&y, bias, res) {
+		return out;
+	}
+	let y = (&y + bias.broadcast_as(y.shape())?.contiguous()?)?;
+	match res {
+		Some(r) => y + r,
+		None => Ok(y),
+	}
 }
 
 pub struct XLMRobertaEncoder {
