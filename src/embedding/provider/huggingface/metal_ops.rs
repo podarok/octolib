@@ -1,5 +1,3 @@
-//! Own Metal kernels for the XLM-R encoder where candle's generic ones are slow.
-
 use candle_core::backend::BackendStorage;
 use candle_core::{bail, CpuStorage, CustomOp1, CustomOp3, DType, Layout, MetalStorage, Result, Shape, Tensor};
 use candle_metal_kernels::metal::ComputePipeline;
@@ -54,7 +52,6 @@ fn grid(threads: usize) -> (MTLSize, MTLSize) {
 	(MTLSize { width: threads, height: 1, depth: 1 }, MTLSize { width: 256.min(threads.max(1)), height: 1, depth: 1 })
 }
 
-/// (b, heads, l, d) contiguous f16 -> (b, l, heads, d), one launch, one read and one write per half4.
 struct MergeHeads;
 
 impl CustomOp1 for MergeHeads {
@@ -89,7 +86,6 @@ impl CustomOp1 for MergeHeads {
 	}
 }
 
-/// y (rows, cols) + bias (cols), then + res (mode 1) or gelu_erf (mode 2); f16 in, f32 math, one launch.
 struct BiasAdd {
 	mode: u32,
 }
@@ -137,12 +133,10 @@ impl CustomOp3 for BiasAdd {
 	}
 }
 
-/// y + bias (+ res), bias broadcast over rows; `None` when the inputs do not fit the kernel.
 pub fn bias_add(y: &Tensor, bias: &Tensor, res: Option<&Tensor>) -> Option<Result<Tensor>> {
 	fused(y, bias, res, if res.is_some() { 1 } else { 0 })
 }
 
-/// gelu_erf(y + bias); `None` when the inputs do not fit the kernel.
 pub fn bias_gelu(y: &Tensor, bias: &Tensor) -> Option<Result<Tensor>> {
 	fused(y, bias, None, 2)
 }
@@ -156,7 +150,6 @@ fn fused(y: &Tensor, bias: &Tensor, res: Option<&Tensor>, mode: u32) -> Option<R
 	Some(y.apply_op3_no_bwd(bias, res.unwrap_or(y), &BiasAdd { mode }))
 }
 
-/// (b, heads, l, d) -> (b, l, heads * d) through [`MergeHeads`].
 pub fn merge_heads(ctx: &Tensor) -> Result<Tensor> {
 	let (b, h, l, d) = ctx.dims4()?;
 	ctx.apply_op1_no_bwd(&MergeHeads)?.reshape((b, l, h * d))

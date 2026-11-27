@@ -128,7 +128,6 @@ fn lin(l: &Linear, x: &Tensor) -> Result<Tensor> {
 	lin_res(l, x, None)
 }
 
-/// x W^T + bias (+ res). On Metal f16 the bias and residual go through one kernel.
 fn lin_res(l: &Linear, x: &Tensor, res: Option<&Tensor>) -> Result<Tensor> {
 	let (b, s, k) = x.dims3()?;
 	let y = x.reshape((b * s, k))?.matmul(&l.weight().t()?)?.reshape((b, s, ()))?;
