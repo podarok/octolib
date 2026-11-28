@@ -12,8 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::model_load_lock;
+use super::{model_load_lock, rename_legacy_layer_norm};
 use std::sync::Arc;
+
+#[test]
+fn legacy_layer_norm_names_map_to_weight_bias() {
+	assert_eq!(
+		rename_legacy_layer_norm("encoder.layer.0.output.LayerNorm.gamma"),
+		"encoder.layer.0.output.LayerNorm.weight"
+	);
+	assert_eq!(
+		rename_legacy_layer_norm("embeddings.LayerNorm.beta"),
+		"embeddings.LayerNorm.bias"
+	);
+	assert_eq!(
+		rename_legacy_layer_norm("encoder.layer.0.attention.self.key.bias"),
+		"encoder.layer.0.attention.self.key.bias"
+	);
+}
 
 impl super::HuggingFaceProvider {
 	pub(crate) async fn get_model_for_test(model_name: &str) -> anyhow::Result<Arc<super::HuggingFaceModel>> {

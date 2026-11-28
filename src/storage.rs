@@ -28,10 +28,13 @@ use std::path::PathBuf;
 /// it would orphan gigabytes of already-downloaded weights on existing
 /// machines and force a re-download.
 pub fn get_model_cache_dir() -> anyhow::Result<PathBuf> {
-	let cache_dir = dirs::cache_dir()
-		.ok_or_else(|| anyhow::anyhow!("Could not determine cache directory"))?
-		.join("octolib")
-		.join("huggingface");
+	let cache_dir = match std::env::var_os("OCTOLIB_MODEL_CACHE_DIR") {
+		Some(dir) => PathBuf::from(dir),
+		None => dirs::cache_dir()
+			.ok_or_else(|| anyhow::anyhow!("Could not determine cache directory"))?
+			.join("octolib")
+			.join("huggingface"),
+	};
 
 	std::fs::create_dir_all(&cache_dir)?;
 	Ok(cache_dir)
